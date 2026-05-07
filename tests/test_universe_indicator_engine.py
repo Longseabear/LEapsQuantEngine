@@ -1,0 +1,99 @@
+from datetime import datetime, timedelta
+
+import pytest
+
+from leaps_quant_engine.indicators import IndicatorEngine
+from leaps_quant_engine.models import Bar, DataSlice, Symbol
+from leaps_quant_engine.universe.loader import load_universe_definition, parse_universe_definition
+
+
+def _bar(symbol: Symbol, day: int, close: float, volume: int = 10) -> Bar:
+    time = datetime(2026, 5, 1) + timedelta(days=day)
+    return Bar(symbol, time, close, close, close, close, volume)
+
+
+def test_load_universe_definition_from_file():
+    universe = load_universe_definition("configs/universes/swing_kor_core.json")
+
+    assert universe.id == "swing-kor-core"
+    assert universe.symbol_keys[:2] == ("KRX:005930", "KRX:000660")
+    assert [indicator.name for indicator in universe.indicators] == [
+        "sma_3_close",
+        "momentum_2_close",
+        "dollar_volume_2",
+    ]
+
+
+def test_indicator_engine_registers_universe_and_updates_only_active_symbols():
+    universe = parse_universe_definition(
+        {
+            "id": "test",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [
+                {"name": "sma_2_close", "type": "sma", "period": 2},
+                {"name": "momentum_1_close", "type": "momentum", "period": 1},
+            ],
+        }
+    )
+    symbol = Symbol("005930", "KRX")
+    ignored = Symbol("000660", "KRX")
+    engine = IndicatorEngine()
+    engine.register_universe("swing-kor", universe)
+
+    engine.warm_up("swing-kor", [_bar(symbol, 0, 10), _bar(ignored, 0, 100)])
+    assert engine.value("swing-kor", symbol, "sma_2_close") is None
+
+    engine.on_data(
+        DataSlice(
+            time=datetime(2026, 5, 2),
+            bars={
+                symbol.key: _bar(symbol, 1, 20),
+                ignored.key: _bar(ignored, 1, 200),
+            },
+        )
+    )
+
+    assert engine.value("swing-kor", symbol, "sma_2_close") == pytest.approx(15)
+    assert engine.value("swing-kor", symbol, "momentum_1_close") == pytest.approx(1.0)
+    assert engine.ready_values("swing-kor", symbol) == {
+        "sma_2_close": pytest.approx(15),
+        "momentum_1_close": pytest.approx(1.0),
+    }
+    assert engine.values_for("swing-kor", [symbol], ["sma_2_close"]) == {
+        "KRX:005930": {"sma_2_close": pytest.approx(15)}
+    }
+
+
+def test_indicator_engine_keeps_same_symbol_isolated_by_sleeve():
+    swing_universe = parse_universe_definition(
+        {
+            "id": "swing",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "sma_fast", "type": "sma", "period": 2}],
+        }
+    )
+    micro_universe = parse_universe_definition(
+        {
+            "id": "micro",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "sma_fast", "type": "sma", "period": 3}],
+        }
+    )
+    symbol = Symbol("005930", "KRX")
+    engine = IndicatorEngine()
+    engine.register_universe("swing-kor", swing_universe)
+    engine.register_universe("micro-kor", micro_universe)
+
+    for day, close in enumerate([10, 20, 30]):
+        engine.on_data(
+            DataSlice(
+                time=datetime(2026, 5, 1) + timedelta(days=day),
+                bars={symbol.key: _bar(symbol, day, close)},
+            )
+        )
+
+    assert engine.value("swing-kor", symbol, "sma_fast") == pytest.approx(25)
+    assert engine.value("micro-kor", symbol, "sma_fast") == pytest.approx(20)

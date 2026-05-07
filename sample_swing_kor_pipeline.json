@@ -1,0 +1,26 @@
+{
+  "engine": {
+    "mode": "backtest",
+    "timezone": "Asia/Seoul"
+  },
+  "data": {
+    "sample_prices": {
+      "005930": 70000,
+      "000660": 180000
+    }
+  },
+  "sleeves": [
+    {
+      "id": "swing-kor",
+      "cash": 10000000,
+      "algorithm": "examples.buy_and_hold:BuyAndHoldAlgorithm",
+      "market": "KRX",
+      "universe": "configs/universes/swing_kor_core.json",
+      "max_position_pct": 0.25,
+      "symbols": ["005930", "000660"],
+      "parameters": {
+        "quantity": 10
+      }
+    }
+  ]
+}

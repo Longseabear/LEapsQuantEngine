@@ -1,0 +1,24 @@
+{
+  "id": "swing-kor-core",
+  "market": "KRX",
+  "symbols": ["005930", "000660", "035420"],
+  "indicators": [
+    {
+      "name": "sma_3_close",
+      "type": "sma",
+      "period": 3,
+      "field": "close"
+    },
+    {
+      "name": "momentum_2_close",
+      "type": "momentum",
+      "period": 2,
+      "field": "close"
+    },
+    {
+      "name": "dollar_volume_2",
+      "type": "rolling_dollar_volume",
+      "period": 2
+    }
+  ]
+}
