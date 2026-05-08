@@ -6,14 +6,27 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from leaps_quant_engine.adapters.kis import KISBrokerEngineMarketDataProvider
+from leaps_quant_engine.adapters.kis import (
+    KISBrokerEngineMarketDataProvider,
+    KISCachedMarketDataProvider,
+    MarketDataEngineLiveQuoteProvider,
+)
+from leaps_quant_engine.benchmark import run_daily_indicator_benchmark
+from leaps_quant_engine.logging import configure_logging
+from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
 from leaps_quant_engine.models import OrderIntent
 from leaps_quant_engine.models import Symbol
 from leaps_quant_engine.runtime import build_indicator_engine_from_file, run_once_from_file
+from leaps_quant_engine.universe.loader import load_universe_definition
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="leapsq")
+    parser.add_argument("--log-level", default="WARNING")
+    parser.add_argument("--log-file", type=Path)
+    parser.add_argument("--log-json", action="store_true")
+    parser.add_argument("--log-max-bytes", type=int, default=10_000_000)
+    parser.add_argument("--log-backup-count", type=int, default=5)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_once = subparsers.add_parser("run-once")
@@ -35,7 +48,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     indicators_backtest.add_argument("config", type=Path)
     indicators_backtest.add_argument("--sleeve-id", required=True)
 
+    benchmark_indicators = subparsers.add_parser("benchmark-indicators-daily")
+    benchmark_indicators.add_argument("universe", type=Path)
+    benchmark_indicators.add_argument("--sleeve-id", required=True)
+    benchmark_indicators.add_argument("--start")
+    benchmark_indicators.add_argument("--end")
+    benchmark_indicators.add_argument("--source", default="kis-cache", choices=("kis-cache",))
+    benchmark_indicators.add_argument("--refresh-history", action="store_true")
+    benchmark_indicators.add_argument("--include-daily", action="store_true")
+
+    live_indicators = subparsers.add_parser("live-indicators-once")
+    live_indicators.add_argument("universe", type=Path)
+    live_indicators.add_argument("--sleeve-id", required=True)
+    live_indicators.add_argument("--source", default="market-data-engine", choices=("market-data-engine",))
+    live_indicators.add_argument("--min-success", type=int)
+    live_indicators.add_argument("--rate-limit-per-second", type=int)
+    live_indicators.add_argument("--include-failures", action="store_true")
+
     args = parser.parse_args(argv)
+    configure_logging(
+        level=args.log_level,
+        log_file=args.log_file,
+        json_logs=args.log_json,
+        max_bytes=args.log_max_bytes,
+        backup_count=args.log_backup_count,
+    )
     if args.command == "run-once":
         orders = run_once_from_file(args.config, time=datetime(2026, 5, 7, 9, 0))
         print(json.dumps([_order_to_json(order) for order in orders], ensure_ascii=False, indent=2))
@@ -78,6 +115,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         indicator_engine = build_indicator_engine_from_file(args.config)
         print(json.dumps(_indicator_values_to_json(indicator_engine, args.sleeve_id), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "benchmark-indicators-daily":
+        provider = KISCachedMarketDataProvider.from_env()
+        universe = load_universe_definition(args.universe)
+        report = run_daily_indicator_benchmark(
+            universe,
+            provider,
+            sleeve_id=args.sleeve_id,
+            start=_parse_cli_datetime(args.start),
+            end=_parse_cli_datetime(args.end),
+            refresh_history=args.refresh_history,
+            include_daily=args.include_daily,
+            source=args.source,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "live-indicators-once":
+        universe = load_universe_definition(args.universe)
+        provider = MarketDataEngineLiveQuoteProvider.from_env(
+            exchange_by_symbol=_exchange_map_from_universe(universe),
+            rate_limit_per_second=args.rate_limit_per_second,
+        )
+        report = run_live_indicator_snapshot(
+            universe,
+            provider,
+            sleeve_id=args.sleeve_id,
+            source=args.source,
+            min_success=args.min_success,
+            include_failures=args.include_failures,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     return 1
 
 
@@ -110,6 +178,16 @@ def _parse_cli_datetime(value: str | None) -> datetime | None:
     if len(text) == 8 and text.isdigit():
         return datetime.strptime(text, "%Y%m%d")
     return datetime.fromisoformat(text)
+
+
+def _exchange_map_from_universe(universe) -> dict[str, str]:
+    exchange_by_symbol: dict[str, str] = {}
+    for symbol in universe.symbols:
+        exchange = universe.properties_for(symbol).get("exchange")
+        if exchange:
+            exchange_by_symbol[symbol.key] = str(exchange).strip().upper()
+            exchange_by_symbol[symbol.ticker] = str(exchange).strip().upper()
+    return exchange_by_symbol
 
 
 if __name__ == "__main__":

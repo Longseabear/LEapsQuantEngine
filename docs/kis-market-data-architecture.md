@@ -140,11 +140,36 @@ The runtime can then batch, cache, or throttle those needs before constructing `
 
 ## New Engine Implementation Direction
 
-Current new-engine adapter:
+Current new-engine adapters and snapshot path:
 
 - `leaps_quant_engine.market_data.MarketDataProvider`
 - `leaps_quant_engine.adapters.kis.KISBrokerEngineMarketDataProvider`
+- `leaps_quant_engine.adapters.kis.KISCachedMarketDataProvider`
+- `leaps_quant_engine.adapters.kis.MarketDataEngineLiveQuoteProvider`
 - `leaps_quant_engine.backtesting.VirtualMarketDataProvider`
+- `leaps_quant_engine.market_data_snapshot.MarketDataSnapshotEngine`
+- `leaps_quant_engine.snapshots.IndicatorSnapshotStore`
+
+Live quote flow:
+
+```text
+local market-data-engine get_stock_price
+  -> MarketDataEngineLiveQuoteProvider
+  -> normalized Bar
+  -> MarketDataSnapshot
+  -> IndicatorEngine.on_data
+  -> IndicatorSnapshot
+```
+
+Historical benchmark flow:
+
+```text
+local market-data-engine get_or_cache_daily_ohlcv
+  -> KISCachedMarketDataProvider
+  -> daily Bars
+  -> daily replay DataSlice feed
+  -> IndicatorEngine.on_data benchmark
+```
 
 Keep evolving this into ports/adapters:
 
@@ -179,28 +204,52 @@ It should never depend on:
 
 ## Proposed Next Slice
 
-Build a cache-first history provider:
+The cache-first daily history benchmark path exists. The next slice is a long-running snapshot worker:
 
 ```text
-CachedHistoricalDataProvider
-  - takes an upstream MarketDataProvider
-  - reads/writes data/market-data/cache
-  - normalizes to list[Bar]
-  - supports refresh=False by default
+BackgroundSnapshotWorker
+  - reads active universe symbols
+  - uses MarketDataEngineLiveQuoteProvider with configured pacing
+  - closes MarketDataSnapshot at cycle boundaries
+  - updates IndicatorEngine
+  - publishes IndicatorSnapshot
+  - logs collection/update/failure/freshness metrics
 ```
 
 Then connect:
 
 ```text
-Universe symbols
-  -> history provider
-  -> daily DataSlice replay
-  -> alpha model
+IndicatorSnapshot
+  -> UniverseSelectionModel
+  -> AlphaModel
+  -> PortfolioConstruction
+  -> RiskManagement
+  -> ExecutionModel
 ```
 
-This gives the engine a scalable path for 300-symbol universes without spending KIS throughput on every alpha pass.
+This gives the engine a live path where strategies consume the last complete snapshot instead of directly polling broker-backed data.
 
 Indicator plans should be attached to universe definitions and registered in memory before the runtime starts consuming `DataSlice` events.
+
+## Logging And Debugging
+
+The market-data adapter and snapshot runtime emit structured logs.
+
+Recommended command:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live-snapshot.jsonl live-indicators-once configs/universes/us_live_smoke.json --sleeve-id us-live --min-success 3 --rate-limit-per-second 20
+```
+
+Important events:
+
+- `market_data_engine.call.rate_limited`
+- `market_data_engine.call.failed`
+- `market_data_snapshot.collect.symbol_failed`
+- `market_data_snapshot.collect.complete`
+- `indicator_snapshot.publish`
+- `live_indicator_snapshot.complete`
 
 ## Operating Rules
 

@@ -24,6 +24,24 @@ def test_load_universe_definition_from_file():
     ]
 
 
+def test_parse_universe_definition_accepts_symbol_metadata_for_mixed_exchanges():
+    universe = parse_universe_definition(
+        {
+            "id": "us-live",
+            "market": "US",
+            "symbols": [
+                {"ticker": "NVDA", "exchange": "NAS"},
+                {"symbol": "IBM", "exchange": "NYS"},
+            ],
+            "indicators": [{"name": "close", "type": "close", "period": 1}],
+        }
+    )
+
+    assert universe.symbol_keys == ("US:NVDA", "US:IBM")
+    assert universe.properties_for("US:NVDA")["exchange"] == "NAS"
+    assert universe.properties_for(universe.symbols[1])["exchange"] == "NYS"
+
+
 def test_indicator_engine_registers_universe_and_updates_only_active_symbols():
     universe = parse_universe_definition(
         {

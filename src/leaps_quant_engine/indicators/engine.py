@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from uuid import uuid4
 
 from leaps_quant_engine.indicators.factory import create_indicator
 from leaps_quant_engine.indicators.registry import IndicatorRegistry
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
+from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
 from leaps_quant_engine.universe.definition import UniverseDefinition
 
 
@@ -98,6 +100,39 @@ class IndicatorEngine:
             result[symbol.key] = values
         return result
 
+    def snapshot(
+        self,
+        sleeve_id: str,
+        *,
+        universe_id: str | None = None,
+        source_snapshot_id: str | None = None,
+        as_of: datetime | None = None,
+        created_at: datetime | None = None,
+    ) -> IndicatorSnapshot:
+        registry = self._registry(sleeve_id)
+        symbols = self.symbols_for_sleeve(sleeve_id)
+        values: dict[str, dict[str, IndicatorValue]] = {}
+        for symbol in symbols:
+            values[symbol.key] = {}
+            for name, indicator in registry.indicators_for(symbol).items():
+                values[symbol.key][name] = IndicatorValue(
+                    name=name,
+                    value=indicator.current.value if indicator.current is not None else None,
+                    is_ready=indicator.is_ready,
+                    samples=indicator.samples,
+                    time=indicator.current.time if indicator.current is not None else None,
+                )
+        return IndicatorSnapshot(
+            snapshot_id=f"indicator-{uuid4()}",
+            sleeve_id=sleeve_id,
+            universe_id=universe_id,
+            source_snapshot_id=source_snapshot_id,
+            as_of=as_of or _latest_indicator_time(values) or datetime.now(),
+            created_at=created_at or datetime.now(),
+            symbols=tuple(symbol.key for symbol in symbols),
+            values=values,
+        )
+
     def symbols_for_sleeve(self, sleeve_id: str) -> list[Symbol]:
         self._registry(sleeve_id)
         return [_symbol_from_key(key) for key in sorted(self.active_symbols_by_sleeve.get(sleeve_id, set()))]
@@ -115,3 +150,13 @@ class IndicatorEngine:
 def _symbol_from_key(key: str) -> Symbol:
     market, ticker = key.split(":", 1)
     return Symbol(ticker=ticker, market=market)
+
+
+def _latest_indicator_time(values: dict[str, dict[str, IndicatorValue]]) -> datetime | None:
+    times = [
+        indicator_value.time
+        for symbol_values in values.values()
+        for indicator_value in symbol_values.values()
+        if indicator_value.time is not None
+    ]
+    return max(times, default=None)

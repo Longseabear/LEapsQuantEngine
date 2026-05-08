@@ -1,0 +1,44 @@
+{
+  "id": "us-live-smoke",
+  "market": "US",
+  "symbols": [
+    {
+      "ticker": "NVDA",
+      "exchange": "NAS"
+    },
+    {
+      "ticker": "MSFT",
+      "exchange": "NAS"
+    },
+    {
+      "ticker": "AAPL",
+      "exchange": "NAS"
+    },
+    {
+      "ticker": "IBM",
+      "exchange": "NYS"
+    }
+  ],
+  "indicators": [
+    {
+      "name": "close",
+      "type": "close",
+      "period": 1
+    },
+    {
+      "name": "volume",
+      "type": "volume",
+      "period": 1
+    },
+    {
+      "name": "dollar_volume_1",
+      "type": "dollar_volume",
+      "period": 1
+    },
+    {
+      "name": "vwap_1",
+      "type": "vwap",
+      "period": 1
+    }
+  ]
+}

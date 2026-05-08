@@ -4,12 +4,16 @@ from leaps_quant_engine.indicators.factory import create_indicator, supported_in
 from leaps_quant_engine.indicators.price import Momentum, SimpleMovingAverage
 from leaps_quant_engine.indicators.registry import IndicatorRegistry
 from leaps_quant_engine.indicators.volume import RollingDollarVolume
+from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorSnapshotStore, IndicatorValue
 
 __all__ = [
     "Indicator",
     "IndicatorDataPoint",
     "IndicatorEngine",
     "IndicatorRegistry",
+    "IndicatorSnapshot",
+    "IndicatorSnapshotStore",
+    "IndicatorValue",
     "Momentum",
     "RollingDollarVolume",
     "RollingWindow",

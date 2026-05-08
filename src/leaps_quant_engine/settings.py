@@ -21,7 +21,9 @@ class KISSettings:
     account_product_code: str | None = None
     mock: bool = False
     rate_limit_per_second: int = 15
+    market_data_engine_rate_limit_per_second: int = 15
     broker_engine_base_url: str = "http://127.0.0.1:8755"
+    market_data_engine_base_url: str = "http://127.0.0.1:8765"
     default_domestic_symbol: str = "005930"
     default_overseas_symbol: str = "AAPL"
     default_overseas_exchange: str = "NAS"
@@ -48,7 +50,15 @@ def load_kis_settings(env_file: str | Path = ".env", *, override: bool = False) 
         account_product_code=os.getenv("KIS_ACNT_PRDT_CD", "").strip() or None,
         mock=_parse_bool(os.getenv("KIS_MOCK"), default=False),
         rate_limit_per_second=_parse_positive_int("KIS_API_RATE_LIMIT_PER_SECOND", default=15),
+        market_data_engine_rate_limit_per_second=_parse_positive_int(
+            "MARKET_DATA_ENGINE_RATE_LIMIT_PER_SECOND",
+            default=15,
+        ),
         broker_engine_base_url=os.getenv("BROKER_ENGINE_BASE_URL", "http://127.0.0.1:8755").strip().rstrip("/"),
+        market_data_engine_base_url=os.getenv(
+            "MARKET_DATA_ENGINE_BASE_URL",
+            "http://127.0.0.1:8765",
+        ).strip().rstrip("/"),
         default_domestic_symbol=os.getenv("DEFAULT_DOMESTIC_SYMBOL", "005930").strip() or "005930",
         default_overseas_symbol=os.getenv("DEFAULT_OVERSEAS_SYMBOL", "AAPL").strip() or "AAPL",
         default_overseas_exchange=os.getenv("DEFAULT_OVERSEAS_EXCHANGE", "NAS").strip() or "NAS",

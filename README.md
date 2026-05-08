@@ -6,6 +6,8 @@ The new engine is being built from a clean root. The previous StockProgram stack
 
 See [docs/agent-artifact-runtime.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/agent-artifact-runtime.md) for the long-running engine, external agent artifacts, validation, safe reload, and isolated backtesting architecture.
 
+See [docs/current-status.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/current-status.md) for the latest implemented slices, benchmark results, logging events, and next development priorities.
+
 ## Shape
 
 - `Algorithm`: user strategy logic, similar to LEAN's algorithm surface.
@@ -14,11 +16,19 @@ See [docs/agent-artifact-runtime.md](C:/Users/leap1/Documents/LEapsQuantEngine/d
 - `Portfolio`: shared state for cash, holdings, and sleeve allocations.
 - `Execution`: converts sleeve-approved targets into order intents.
 - `Runtime`: wires config, algorithms, data, and execution together.
+- `IndicatorEngine`: sleeve-namespaced incremental indicator state.
+- `MarketDataSnapshot` / `IndicatorSnapshot`: stable read models for live/replay consumers.
 
 ## Smoke Test
 
 ```powershell
 py -3 -m pytest -q
+```
+
+Current expected result:
+
+```text
+52 passed
 ```
 
 ## Run Sample
@@ -69,6 +79,8 @@ provider = VirtualMarketDataProvider.from_bars([
 ])
 ```
 
+`run_backtest(...)` returns report-ready metrics: CAGR, Sharpe, MDD, turnover, average holding days, average exposure, win rate, trade count, and order count. Metrics are available at both aggregate and sleeve levels through `result.metrics` and `result.metrics_by_sleeve`.
+
 ## Indicators
 
 Indicators follow a LEAN-like incremental interface:
@@ -105,3 +117,47 @@ py -3 -m leaps_quant_engine.cli indicators-backtest-once sample_swing_kor_pipeli
 ```
 
 `indicators-kis-once` pulls latest bars through broker-engine/KIS. `indicators-backtest-once` verifies the configured sleeve universe can be loaded without touching KIS; deterministic backtest updates are covered through `VirtualMarketDataProvider`.
+
+Daily indicator cycle benchmark:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli benchmark-indicators-daily configs/universes/benchmark_kor_200.json --sleeve-id benchmark-kor
+```
+
+The benchmark replays cached KIS daily history for the configured universe and measures only `IndicatorEngine.on_data(DataSlice)` latency. History loading and replay-feed build time are reported separately.
+It expects the local StockProgram `market-data-engine` cache bridge at `MARKET_DATA_ENGINE_BASE_URL` (default `http://127.0.0.1:8765`).
+
+Live snapshot indicator check:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli live-indicators-once configs/universes/us_live_smoke.json --sleeve-id us-live --min-success 3 --rate-limit-per-second 20
+```
+
+Server/debug logging can be enabled without changing the JSON report on stdout:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live-snapshot.jsonl live-indicators-once configs/universes/us_live_smoke.json --sleeve-id us-live --min-success 3
+```
+
+For mixed overseas exchanges, universe symbols may include metadata:
+
+```json
+{
+  "id": "us-live-smoke",
+  "market": "US",
+  "symbols": [
+    {"ticker": "NVDA", "exchange": "NAS"},
+    {"ticker": "IBM", "exchange": "NYS"}
+  ],
+  "indicators": [
+    {"name": "close", "type": "close", "period": 1}
+  ]
+}
+```
+
+`live-indicators-once` collects quote bars through the local `market-data-engine`, closes a `MarketDataSnapshot`, updates `IndicatorEngine`, and publishes an `IndicatorSnapshot`. Symbol failures are reported instead of killing the entire snapshot when `--min-success` is satisfied. The default live quote pace comes from `MARKET_DATA_ENGINE_RATE_LIMIT_PER_SECOND` and can be overridden per run with `--rate-limit-per-second`; the KIS-backed adapter clamps this to 20/s.
+Useful log events include `market_data_snapshot.collect.start`, `market_data_snapshot.collect.symbol_failed`, `market_data_snapshot.collect.complete`, `indicator_snapshot.publish`, and `live_indicator_snapshot.complete`.
+File logs rotate by default at 10 MB with 5 backups; tune with `--log-max-bytes` and `--log-backup-count`.
