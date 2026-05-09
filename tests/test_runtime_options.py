@@ -28,6 +28,7 @@ def _runtime_payload():
             "history_provider": "kis-cache",
             "rate_limit_per_second": 20,
         },
+        "journal_path": "data/cycle-journal/live-us-main.jsonl",
         "sleeves": [
             {
                 "sleeve_id": "us-live",
@@ -82,6 +83,7 @@ def test_runtime_config_keeps_logic_as_module_references():
     sleeve = config.sleeve("us-live")
 
     assert config.runtime_id == "live-us-main"
+    assert config.journal_path == Path("data/cycle-journal/live-us-main.jsonl")
     assert config.market_data.provider == "market-data-engine"
     assert sleeve.workspace_path == Path("sleeves/us-live")
     assert sleeve.cash == 100_000
@@ -100,6 +102,79 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.portfolio.rebalance.min_quantity_delta == 2
     assert sleeve.worker.cycle_interval_seconds == 60
     assert sleeve.indicators.min_ready_ratio == 0.9
+
+
+def test_runtime_config_routes_sleeves_to_broker_account_profiles():
+    payload = _runtime_payload()
+    payload["broker_accounts"] = [
+        {
+            "account_id": "kis-domestic",
+            "market_scope": "domestic",
+            "account_store_path": "data/virtual-accounts/kis-domestic.json",
+            "order_store_path": "data/order-runtime/kis-domestic.jsonl",
+        },
+        {
+            "account_id": "kis-overseas",
+            "market_scope": "overseas",
+            "account_store_path": "data/virtual-accounts/kis-overseas.json",
+            "order_store_path": "data/order-runtime/kis-overseas.jsonl",
+            "broker_gateway": "paper",
+            "metadata": {"account_kind": "us"},
+        },
+    ]
+    payload["sleeves"][0]["broker_account_id"] = "kis-overseas"
+    payload["sleeves"][0]["broker_account_routes"] = {
+        "domestic": "kis-domestic",
+        "overseas": "kis-overseas",
+    }
+
+    config = parse_runtime_config(payload)
+    account = config.broker_account("kis-overseas")
+
+    assert config.sleeve("us-live").broker_account_id == "kis-overseas"
+    assert dict(config.sleeve("us-live").broker_account_routes) == {
+        "domestic": "kis-domestic",
+        "overseas": "kis-overseas",
+    }
+    assert account.market_scope == "overseas"
+    assert account.currency == "USD"
+    assert account.account_store_path == Path("data/virtual-accounts/kis-overseas.json")
+    assert account.order_store_path == Path("data/order-runtime/kis-overseas.jsonl")
+    assert account.broker_gateway == "paper"
+    assert dict(account.metadata) == {"account_kind": "us"}
+    assert config.to_dict()["broker_accounts"][1]["market_scope"] == "overseas"
+    assert config.to_dict()["broker_accounts"][1]["currency"] == "USD"
+    assert config.to_dict()["journal_path"] == "data/cycle-journal/live-us-main.jsonl"
+
+
+def test_runtime_config_rejects_unknown_sleeve_broker_account():
+    payload = _runtime_payload()
+    payload["broker_accounts"] = [
+        {
+            "account_id": "kis-domestic",
+            "market_scope": "domestic",
+            "account_store_path": "data/virtual-accounts/kis-domestic.json",
+        }
+    ]
+    payload["sleeves"][0]["broker_account_id"] = "kis-overseas"
+
+    with pytest.raises(ConfigurationValidationError):
+        parse_runtime_config(payload)
+
+
+def test_runtime_config_rejects_unknown_market_route_broker_account():
+    payload = _runtime_payload()
+    payload["broker_accounts"] = [
+        {
+            "account_id": "kis-domestic",
+            "market_scope": "domestic",
+            "account_store_path": "data/virtual-accounts/kis-domestic.json",
+        }
+    ]
+    payload["sleeves"][0]["broker_account_routes"] = {"overseas": "kis-overseas"}
+
+    with pytest.raises(ConfigurationValidationError):
+        parse_runtime_config(payload)
 
 
 def test_runtime_config_validation_rejects_invalid_operational_settings():

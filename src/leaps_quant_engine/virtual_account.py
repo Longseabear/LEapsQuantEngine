@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+from leaps_quant_engine.broker_routing import currency_for_market_scope, currency_for_symbol
 from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.orders import OrderEvent, OrderTicket
 from leaps_quant_engine.portfolio import Holding, Portfolio, PortfolioProvider
 
 
@@ -165,6 +167,7 @@ class AccountCashSnapshot:
     account_id: str
     cash_balance: float
     synced_at: datetime
+    currency: str = "KRW"
     deposit_total_amount: float | None = None
     previous_settlement_amount: float | None = None
     next_day_settlement_amount: float | None = None
@@ -176,6 +179,7 @@ class AccountCashSnapshot:
             "account_id": self.account_id,
             "cash_balance": self.cash_balance,
             "synced_at": self.synced_at.isoformat(),
+            "currency": _currency_code(self.currency),
             "deposit_total_amount": self.deposit_total_amount,
             "previous_settlement_amount": self.previous_settlement_amount,
             "next_day_settlement_amount": self.next_day_settlement_amount,
@@ -189,6 +193,7 @@ class AccountCashSnapshot:
             account_id=str(payload.get("account_id") or DEFAULT_ACCOUNT_ID),
             cash_balance=float(payload.get("cash_balance") or 0.0),
             synced_at=datetime.fromisoformat(str(payload["synced_at"])),
+            currency=_currency_code(str(payload.get("currency") or "KRW")),
             deposit_total_amount=_float_or_none(payload.get("deposit_total_amount")),
             previous_settlement_amount=_float_or_none(payload.get("previous_settlement_amount")),
             next_day_settlement_amount=_float_or_none(payload.get("next_day_settlement_amount")),
@@ -202,12 +207,14 @@ class AccountCashSnapshot:
         payload: dict[str, Any],
         *,
         account_id: str = DEFAULT_ACCOUNT_ID,
+        currency: str = "KRW",
         synced_at: datetime | None = None,
     ) -> "AccountCashSnapshot":
         return cls(
             account_id=account_id,
             cash_balance=float(payload.get("cash_balance") or 0.0),
             synced_at=synced_at or datetime.now().astimezone(),
+            currency=_currency_code(str(payload.get("currency") or currency)),
             deposit_total_amount=_float_or_none(payload.get("deposit_total_amount")),
             previous_settlement_amount=_float_or_none(payload.get("previous_settlement_amount")),
             next_day_settlement_amount=_float_or_none(payload.get("next_day_settlement_amount")),
@@ -224,6 +231,7 @@ class CashTransfer:
     amount: float
     occurred_at: datetime
     account_id: str = DEFAULT_ACCOUNT_ID
+    currency: str = "KRW"
     reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -234,6 +242,7 @@ class CashTransfer:
             "amount": self.amount,
             "occurred_at": self.occurred_at.isoformat(),
             "account_id": self.account_id,
+            "currency": _currency_code(self.currency),
             "reason": self.reason,
         }
 
@@ -241,6 +250,7 @@ class CashTransfer:
 @dataclass(frozen=True, slots=True)
 class CashReconciliationReport:
     account_id: str
+    currency: str
     broker_cash_balance: float
     virtual_cash_total: float
     residual_sleeve_id: str
@@ -258,6 +268,7 @@ class CashReconciliationReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "account_id": self.account_id,
+            "currency": _currency_code(self.currency),
             "status": self.status,
             "broker_cash_balance": self.broker_cash_balance,
             "virtual_cash_total": self.virtual_cash_total,
@@ -370,6 +381,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
 
     path: Path
     default_cash_by_sleeve: dict[str, float] | None = None
+    default_currency: str = "KRW"
 
     def current_portfolio(self, sleeve_id: str) -> Portfolio:
         state = self._load_state()
@@ -378,11 +390,20 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         sleeve = state["sleeves"][sleeve_id]
         return _portfolio_from_dict(sleeve)
 
-    def initialize_sleeve(self, sleeve_id: str, *, cash: float = 0.0, overwrite: bool = False) -> Portfolio:
+    def initialize_sleeve(
+        self,
+        sleeve_id: str,
+        *,
+        cash: float = 0.0,
+        currency: str | None = None,
+        overwrite: bool = False,
+    ) -> Portfolio:
         state = self._load_state()
         if overwrite or sleeve_id not in state["sleeves"]:
+            code = _currency_code(currency or self.default_currency)
             state["sleeves"][sleeve_id] = {
                 "cash": float(cash),
+                "cash_by_currency": {code: float(cash)} if cash else {},
                 "holdings": {},
             }
             self._write_state(state)
@@ -396,26 +417,29 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         amount: float,
         reason: str = "",
         account_id: str = DEFAULT_ACCOUNT_ID,
+        currency: str | None = None,
         transfer_id: str = "",
         occurred_at: datetime | None = None,
     ) -> CashTransfer:
         if amount <= 0:
             raise ValueError("cash transfer amount must be positive.")
+        code = _currency_code(currency or self.default_currency)
         state = self._load_state()
         self._ensure_sleeve(state, from_sleeve_id)
         self._ensure_sleeve(state, to_sleeve_id)
         source = state["sleeves"][from_sleeve_id]
-        if float(source.get("cash") or 0.0) < amount:
+        if _sleeve_cash_for_currency(source, code) < amount:
             raise ValueError("cash transfer exceeds source sleeve cash.")
-        state["sleeves"][from_sleeve_id]["cash"] = float(source.get("cash") or 0.0) - amount
-        state["sleeves"][to_sleeve_id]["cash"] = float(state["sleeves"][to_sleeve_id].get("cash") or 0.0) + amount
+        _adjust_sleeve_cash(state["sleeves"][from_sleeve_id], code, -amount)
+        _adjust_sleeve_cash(state["sleeves"][to_sleeve_id], code, amount)
         event = CashTransfer(
-            transfer_id=transfer_id or f"cash:{account_id}:{from_sleeve_id}:{to_sleeve_id}:{len(state['cash_transfers']) + 1}",
+            transfer_id=transfer_id or f"cash:{account_id}:{code}:{from_sleeve_id}:{to_sleeve_id}:{len(state['cash_transfers']) + 1}",
             from_sleeve_id=from_sleeve_id,
             to_sleeve_id=to_sleeve_id,
             amount=amount,
             occurred_at=occurred_at or datetime.now().astimezone(),
             account_id=account_id,
+            currency=code,
             reason=reason,
         )
         state["cash_transfers"][event.transfer_id] = event.to_dict()
@@ -427,26 +451,38 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         balance_payload: dict[str, Any],
         *,
         account_id: str = DEFAULT_ACCOUNT_ID,
+        currency: str | None = None,
         residual_sleeve_id: str = DEFAULT_CASH_SLEEVE_ID,
         synced_at: datetime | None = None,
     ) -> CashReconciliationReport:
+        code = _currency_code(currency or self.default_currency)
         snapshot = AccountCashSnapshot.from_balance_payload(
             balance_payload,
             account_id=account_id,
+            currency=code,
             synced_at=synced_at,
         )
+        code = _currency_code(snapshot.currency)
         state = self._load_state()
         self._ensure_sleeve(state, residual_sleeve_id)
-        state["account_cash_snapshots"][account_id] = snapshot.to_dict()
+        snapshot_key = _account_cash_snapshot_key(account_id, code)
+        state["account_cash_snapshots"][snapshot_key] = snapshot.to_dict()
+        if code == "KRW":
+            state["account_cash_snapshots"][account_id] = snapshot.to_dict()
         non_residual_cash = sum(
-            float(raw.get("cash") or 0.0)
+            _sleeve_cash_for_currency(raw, code)
             for sleeve_id, raw in state["sleeves"].items()
             if sleeve_id != residual_sleeve_id
         )
-        state["sleeves"][residual_sleeve_id]["cash"] = snapshot.cash_balance - non_residual_cash
+        _set_sleeve_cash_for_currency(
+            state["sleeves"][residual_sleeve_id],
+            code,
+            snapshot.cash_balance - non_residual_cash,
+        )
         self._write_state(state)
         return self.cash_reconciliation_report(
             account_id=account_id,
+            currency=code,
             residual_sleeve_id=residual_sleeve_id,
         )
 
@@ -454,17 +490,22 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         self,
         *,
         account_id: str = DEFAULT_ACCOUNT_ID,
+        currency: str | None = None,
         residual_sleeve_id: str = DEFAULT_CASH_SLEEVE_ID,
     ) -> CashReconciliationReport:
+        code = _currency_code(currency or self.default_currency)
         state = self._load_state()
-        snapshot_payload = state["account_cash_snapshots"].get(account_id)
+        snapshot_payload = state["account_cash_snapshots"].get(_account_cash_snapshot_key(account_id, code))
+        if snapshot_payload is None and code == "KRW":
+            snapshot_payload = state["account_cash_snapshots"].get(account_id)
         broker_cash_balance = float(snapshot_payload.get("cash_balance") or 0.0) if snapshot_payload else 0.0
         sleeve_cash = {
-            sleeve_id: float(raw.get("cash") or 0.0)
+            sleeve_id: _sleeve_cash_for_currency(raw, code)
             for sleeve_id, raw in state["sleeves"].items()
         }
         return CashReconciliationReport(
             account_id=account_id,
+            currency=code,
             broker_cash_balance=broker_cash_balance,
             virtual_cash_total=sum(sleeve_cash.values()),
             residual_sleeve_id=residual_sleeve_id,
@@ -491,10 +532,91 @@ class VirtualSleeveAccountStore(PortfolioProvider):
             created_at=created_at,
         )
         state["order_ownership"][record.order_id] = record.to_dict()
-        if broker_order_id:
-            state["broker_order_index"][broker_order_id] = record.order_id
+        for alias in _broker_order_aliases(broker_order_id):
+            state["broker_order_index"][alias] = record.order_id
         self._write_state(state)
         return record
+
+    def register_order_ticket(
+        self,
+        ticket: OrderTicket,
+        *,
+        broker_order_id: str = "",
+    ) -> OrderOwnership:
+        state = self._load_state()
+        self._ensure_sleeve(state, ticket.sleeve_id)
+        record = OrderOwnership(
+            order_id=ticket.order_intent_id,
+            sleeve_id=ticket.sleeve_id,
+            symbol=ticket.symbol,
+            side=ticket.side,
+            quantity=ticket.quantity,
+            reference_price=ticket.reference_price,
+            tag=ticket.tag,
+            broker_order_id=broker_order_id or ticket.broker_order_id or "",
+            created_at=ticket.created_at,
+        )
+        state["order_ownership"][record.order_id] = record.to_dict()
+        for alias in _broker_order_aliases(record.broker_order_id):
+            state["broker_order_index"][alias] = record.order_id
+        self._write_state(state)
+        return record
+
+    def bind_broker_order_id(self, order_id: str, broker_order_id: str) -> OrderOwnership:
+        if not order_id.strip():
+            raise ValueError("order_id is required.")
+        if not broker_order_id.strip():
+            raise ValueError("broker_order_id is required.")
+        state = self._load_state()
+        payload = state["order_ownership"].get(order_id)
+        if payload is None:
+            raise ValueError(f"Unknown order ownership '{order_id}'.")
+        record = OrderOwnership.from_dict(payload)
+        resolved_broker_order_id = (
+            record.broker_order_id
+            if record.broker_order_id and broker_order_id in _broker_order_aliases(record.broker_order_id)
+            else broker_order_id
+        )
+        updated = OrderOwnership(
+            order_id=record.order_id,
+            sleeve_id=record.sleeve_id,
+            symbol=record.symbol,
+            side=record.side,
+            quantity=record.quantity,
+            reference_price=record.reference_price,
+            tag=record.tag,
+            broker_order_id=resolved_broker_order_id,
+            created_at=record.created_at,
+        )
+        state["order_ownership"][updated.order_id] = updated.to_dict()
+        for alias in _broker_order_aliases(resolved_broker_order_id):
+            state["broker_order_index"][alias] = updated.order_id
+        self._write_state(state)
+        return updated
+
+    def apply_order_event(self, event: OrderEvent) -> Portfolio:
+        if event.broker_order_id:
+            try:
+                self.bind_broker_order_id(event.order_intent_id, event.broker_order_id)
+            except ValueError:
+                pass
+        if not event.is_fill or event.quantity <= 0 or event.fill_price is None:
+            return self.current_portfolio(event.sleeve_id)
+        fee = _float_or_none(event.metadata.get("fee")) or 0.0
+        return self.apply_fill(
+            VirtualFillEvent(
+                fill_id=f"order-event:{event.event_id}",
+                order_id=event.order_intent_id,
+                broker_order_id=event.broker_order_id or "",
+                symbol=event.symbol,
+                side=event.side,
+                quantity=event.quantity,
+                fill_price=event.fill_price,
+                filled_at=event.occurred_at,
+                sleeve_id=event.sleeve_id,
+                fee=fee,
+            )
+        )
 
     def apply_fill(self, fill: VirtualFillEvent) -> Portfolio:
         if fill.quantity <= 0:
@@ -636,7 +758,8 @@ class VirtualSleeveAccountStore(PortfolioProvider):
 
     def ownership_for_order(self, order_id: str) -> OrderOwnership | None:
         state = self._load_state()
-        payload = state["order_ownership"].get(order_id)
+        resolved_order_id = state["broker_order_index"].get(order_id, order_id)
+        payload = state["order_ownership"].get(resolved_order_id)
         return OrderOwnership.from_dict(payload) if payload is not None else None
 
     def fill_exists(self, fill_id: str) -> bool:
@@ -652,10 +775,13 @@ class VirtualSleeveAccountStore(PortfolioProvider):
 
     def _ensure_sleeve(self, state: dict[str, Any], sleeve_id: str) -> None:
         if sleeve_id in state["sleeves"]:
+            _normalize_sleeve_cash(state["sleeves"][sleeve_id], self.default_currency)
             return
         default_cash = (self.default_cash_by_sleeve or {}).get(sleeve_id, 0.0)
+        code = _currency_code(self.default_currency)
         state["sleeves"][sleeve_id] = {
             "cash": float(default_cash),
+            "cash_by_currency": {code: float(default_cash)} if default_cash else {},
             "holdings": {},
         }
 
@@ -684,6 +810,9 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         payload.setdefault("fill_allocations", {})
         payload.setdefault("account_cash_snapshots", {})
         payload.setdefault("cash_transfers", {})
+        for raw in dict(payload.get("sleeves") or {}).values():
+            if isinstance(raw, dict):
+                _normalize_sleeve_cash(raw, self.default_currency)
         return payload
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -723,19 +852,20 @@ class VirtualSleeveAccountStore(PortfolioProvider):
 
 
 def _apply_fill_to_portfolio(portfolio: Portfolio, fill: VirtualFillEvent) -> None:
+    currency = currency_for_symbol(fill.symbol)
     holding = portfolio.holdings.setdefault(fill.symbol.key, Holding(fill.symbol))
     if fill.side is OrderSide.BUY:
         previous_cost = holding.quantity * holding.average_price
         new_quantity = holding.quantity + fill.quantity
         holding.average_price = (previous_cost + fill.notional) / new_quantity
         holding.quantity = new_quantity
-        portfolio.cash -= fill.notional + fill.fee
+        _adjust_portfolio_cash(portfolio, currency, -(fill.notional + fill.fee))
         return
 
     new_quantity = holding.quantity - fill.quantity
     if new_quantity < 0:
         raise ValueError("sell fill exceeds sleeve holding quantity.")
-    portfolio.cash += max(fill.notional - fill.fee, 0.0)
+    _adjust_portfolio_cash(portfolio, currency, max(fill.notional - fill.fee, 0.0))
     if new_quantity <= 0:
         portfolio.holdings.pop(fill.symbol.key, None)
         return
@@ -743,6 +873,7 @@ def _apply_fill_to_portfolio(portfolio: Portfolio, fill: VirtualFillEvent) -> No
 
 
 def _portfolio_from_dict(payload: dict[str, Any]) -> Portfolio:
+    cash_by_currency = _cash_by_currency_from_payload(payload, "KRW")
     holdings = {}
     for symbol_key, raw in dict(payload.get("holdings") or {}).items():
         symbol = _symbol_from_dict(raw.get("symbol") or _symbol_dict_from_key(symbol_key))
@@ -751,12 +882,18 @@ def _portfolio_from_dict(payload: dict[str, Any]) -> Portfolio:
             quantity=int(raw.get("quantity") or 0),
             average_price=float(raw.get("average_price") or 0.0),
         )
-    return Portfolio(cash=float(payload.get("cash") or 0.0), holdings=holdings)
+    return Portfolio(cash=sum(cash_by_currency.values()), holdings=holdings, cash_by_currency=cash_by_currency)
 
 
 def _portfolio_to_dict(portfolio: Portfolio) -> dict[str, Any]:
+    cash_by_currency = {
+        _currency_code(currency): float(amount)
+        for currency, amount in dict(portfolio.cash_by_currency or {"KRW": portfolio.cash}).items()
+        if abs(float(amount)) > 1e-12
+    }
     return {
-        "cash": portfolio.cash,
+        "cash": sum(cash_by_currency.values()),
+        "cash_by_currency": cash_by_currency,
         "holdings": {
             key: {
                 "symbol": _symbol_to_dict(holding.symbol),
@@ -797,6 +934,66 @@ def _broker_positions_from_holdings(payload: dict[str, Any] | list[dict[str, Any
     return positions
 
 
+def _currency_code(currency: str) -> str:
+    code = str(currency or "").strip().upper()
+    return code or "KRW"
+
+
+def _account_cash_snapshot_key(account_id: str, currency: str) -> str:
+    return f"{account_id}:{_currency_code(currency)}"
+
+
+def _cash_by_currency_from_payload(payload: dict[str, Any], default_currency: str) -> dict[str, float]:
+    raw = payload.get("cash_by_currency")
+    if isinstance(raw, dict):
+        return {
+            _currency_code(str(currency)): float(amount or 0.0)
+            for currency, amount in raw.items()
+            if abs(float(amount or 0.0)) > 1e-12
+        }
+    cash = float(payload.get("cash") or 0.0)
+    return {_currency_code(default_currency): cash} if abs(cash) > 1e-12 else {}
+
+
+def _normalize_sleeve_cash(payload: dict[str, Any], default_currency: str) -> None:
+    cash_by_currency = _cash_by_currency_from_payload(payload, default_currency)
+    payload["cash_by_currency"] = cash_by_currency
+    payload["cash"] = sum(cash_by_currency.values())
+
+
+def _sleeve_cash_for_currency(payload: dict[str, Any], currency: str) -> float:
+    cash_by_currency = _cash_by_currency_from_payload(payload, currency)
+    return float(cash_by_currency.get(_currency_code(currency), 0.0))
+
+
+def _set_sleeve_cash_for_currency(payload: dict[str, Any], currency: str, amount: float) -> None:
+    cash_by_currency = _cash_by_currency_from_payload(payload, currency)
+    code = _currency_code(currency)
+    value = float(amount)
+    if abs(value) > 1e-12:
+        cash_by_currency[code] = value
+    else:
+        cash_by_currency.pop(code, None)
+    payload["cash_by_currency"] = cash_by_currency
+    payload["cash"] = sum(cash_by_currency.values())
+
+
+def _adjust_sleeve_cash(payload: dict[str, Any], currency: str, delta: float) -> None:
+    _set_sleeve_cash_for_currency(
+        payload,
+        currency,
+        _sleeve_cash_for_currency(payload, currency) + float(delta),
+    )
+
+
+def _adjust_portfolio_cash(portfolio: Portfolio, currency: str, delta: float) -> None:
+    code = _currency_code(currency)
+    if not portfolio.cash_by_currency:
+        portfolio.cash_by_currency[code] = portfolio.cash
+    portfolio.cash_by_currency[code] = float(portfolio.cash_by_currency.get(code, 0.0)) + float(delta)
+    portfolio.cash = sum(portfolio.cash_by_currency.values())
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -804,6 +1001,20 @@ def _float_or_none(value: Any) -> float | None:
     if not text:
         return None
     return float(text)
+
+
+def _broker_order_aliases(broker_order_id: str) -> tuple[str, ...]:
+    text = str(broker_order_id or "").strip()
+    if not text:
+        return ()
+    aliases = [text]
+    for separator in (":", "|"):
+        if separator in text:
+            parts = [part.strip() for part in text.split(separator) if part.strip()]
+            aliases.extend(parts)
+            if len(parts) >= 2:
+                aliases.append(parts[-1])
+    return tuple(dict.fromkeys(aliases))
 
 
 def _symbol_to_dict(symbol: Symbol) -> dict[str, str]:

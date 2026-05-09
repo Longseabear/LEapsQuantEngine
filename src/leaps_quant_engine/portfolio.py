@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.orders import OrderEvent
 
 
 @dataclass(slots=True)
@@ -17,6 +18,7 @@ class Holding:
 class Portfolio:
     cash: float
     holdings: dict[str, Holding] = field(default_factory=dict)
+    cash_by_currency: dict[str, float] = field(default_factory=dict)
 
     @property
     def held_symbols(self) -> tuple[Symbol, ...]:
@@ -25,6 +27,24 @@ class Portfolio:
     def quantity(self, symbol: Symbol) -> int:
         holding = self.holdings.get(symbol.key)
         return holding.quantity if holding else 0
+
+    def cash_for_currency(self, currency: str) -> float:
+        code = _currency_code(currency)
+        if self.cash_by_currency:
+            return float(self.cash_by_currency.get(code, 0.0))
+        return self.cash
+
+    def set_cash_for_currency(self, currency: str, amount: float) -> None:
+        code = _currency_code(currency)
+        self.cash_by_currency[code] = float(amount)
+        self.cash = sum(self.cash_by_currency.values())
+
+    def adjust_cash_for_currency(self, currency: str, delta: float) -> None:
+        code = _currency_code(currency)
+        if not self.cash_by_currency:
+            self.cash_by_currency[code] = self.cash
+        self.cash_by_currency[code] = float(self.cash_by_currency.get(code, 0.0)) + float(delta)
+        self.cash = sum(self.cash_by_currency.values())
 
     def mark_price(self, symbol: Symbol, data: DataSlice) -> float | None:
         bar = data.get(symbol)
@@ -52,7 +72,10 @@ class Portfolio:
         signed_quantity = intent.quantity if intent.side is OrderSide.BUY else -intent.quantity
         new_quantity = holding.quantity + signed_quantity
         cash_delta = intent.notional if intent.side is OrderSide.SELL else -intent.notional
-        self.cash += cash_delta
+        if self.cash_by_currency:
+            self.adjust_cash_for_currency(_currency_for_symbol(intent.symbol), cash_delta)
+        else:
+            self.cash += cash_delta
 
         if new_quantity <= 0:
             self.holdings.pop(intent.symbol.key, None)
@@ -61,6 +84,27 @@ class Portfolio:
         if intent.side is OrderSide.BUY:
             previous_cost = holding.quantity * holding.average_price
             holding.average_price = (previous_cost + intent.notional) / new_quantity
+        holding.quantity = new_quantity
+
+    def apply_order_event(self, event: OrderEvent) -> None:
+        if not event.is_fill or event.quantity <= 0 or event.fill_price is None:
+            return
+        holding = self.holdings.setdefault(event.symbol.key, Holding(event.symbol))
+        signed_quantity = event.quantity if event.side is OrderSide.BUY else -event.quantity
+        new_quantity = holding.quantity + signed_quantity
+        cash_delta = event.notional if event.side is OrderSide.SELL else -event.notional
+        if self.cash_by_currency:
+            self.adjust_cash_for_currency(_currency_for_symbol(event.symbol), cash_delta)
+        else:
+            self.cash += cash_delta
+
+        if new_quantity <= 0:
+            self.holdings.pop(event.symbol.key, None)
+            return
+
+        if event.side is OrderSide.BUY:
+            previous_cost = holding.quantity * holding.average_price
+            holding.average_price = (previous_cost + event.notional) / new_quantity
         holding.quantity = new_quantity
 
 
@@ -95,3 +139,12 @@ class PortfolioView:
 
     def quantity(self, symbol: Symbol) -> int:
         return self.quantities.get(symbol.key, 0)
+
+
+def _currency_code(currency: str) -> str:
+    code = str(currency or "").strip().upper()
+    return code or "KRW"
+
+
+def _currency_for_symbol(symbol: Symbol) -> str:
+    return "KRW" if symbol.market.upper() in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"} else "USD"

@@ -13,6 +13,16 @@ class ConfigurationValidationError(ValueError):
     """Raised when a runtime option file is syntactically valid but unsafe to run."""
 
 
+def _path_to_config_str(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    return path.as_posix()
+
+
+def _default_currency_for_market_scope(market_scope: str) -> str:
+    return "KRW" if market_scope == "domestic" else "USD"
+
+
 @dataclass(frozen=True, slots=True)
 class ModuleReference:
     ref: str
@@ -50,6 +60,43 @@ class MarketDataRuntimeConfig:
             "source": self.source,
             "history_source": self.history_source,
             "rate_limit_per_second": self.rate_limit_per_second,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerAccountRuntimeConfig:
+    account_id: str
+    market_scope: str
+    account_store_path: Path
+    order_store_path: Path | None = None
+    currency: str = ""
+    broker_gateway: str = "broker-engine"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.account_id.strip():
+            raise ConfigurationValidationError("broker_accounts.account_id is required.")
+        if self.market_scope not in {"domestic", "overseas"}:
+            raise ConfigurationValidationError(f"Unsupported broker account market_scope: {self.market_scope}")
+        if not str(self.account_store_path).strip():
+            raise ConfigurationValidationError("broker_accounts.account_store_path is required.")
+        currency = str(self.currency or _default_currency_for_market_scope(self.market_scope)).strip().upper()
+        if not currency:
+            raise ConfigurationValidationError("broker_accounts.currency is required.")
+        if self.broker_gateway not in {"broker-engine", "paper"}:
+            raise ConfigurationValidationError(f"Unsupported broker account gateway: {self.broker_gateway}")
+        object.__setattr__(self, "currency", currency)
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "account_id": self.account_id,
+            "market_scope": self.market_scope,
+            "account_store_path": _path_to_config_str(self.account_store_path),
+            "order_store_path": _path_to_config_str(self.order_store_path),
+            "currency": self.currency,
+            "broker_gateway": self.broker_gateway,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -103,7 +150,7 @@ class UniverseRuntimeConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "coarse_path": str(self.coarse_path),
+            "coarse_path": _path_to_config_str(self.coarse_path),
             "fine": self.fine.to_dict(),
             "active": self.active.to_dict(),
         }
@@ -179,7 +226,7 @@ class PortfolioRuntimeConfig:
             "model": self.model.to_dict(),
             "parameters": dict(self.parameters),
             "rebalance": self.rebalance.to_dict(),
-            "account_store_path": str(self.account_store_path) if self.account_store_path is not None else None,
+            "account_store_path": _path_to_config_str(self.account_store_path),
         }
 
 
@@ -187,6 +234,23 @@ class PortfolioRuntimeConfig:
 class RiskRuntimeConfig:
     model: ModuleReference = field(
         default_factory=lambda: ModuleReference("leaps_quant_engine.framework:BasicRiskManagementModel")
+    )
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model.to_dict(),
+            "parameters": dict(self.parameters),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRuntimeConfig:
+    model: ModuleReference = field(
+        default_factory=lambda: ModuleReference("leaps_quant_engine.execution:ImmediateExecutionModel")
     )
     parameters: Mapping[str, Any] = field(default_factory=dict)
 
@@ -221,28 +285,57 @@ class SleeveRuntimeConfig:
     sleeve_id: str
     universe: UniverseRuntimeConfig
     workspace_path: Path | None = None
+    broker_account_id: str | None = None
+    broker_account_routes: Mapping[str, str] = field(default_factory=dict)
     cash: float = 100_000.0
+    cash_by_currency: Mapping[str, float] = field(default_factory=dict)
     indicators: IndicatorRuntimeConfig = field(default_factory=IndicatorRuntimeConfig)
     alpha: AlphaRuntimeConfig = field(default_factory=AlphaRuntimeConfig)
     portfolio: PortfolioRuntimeConfig = field(default_factory=PortfolioRuntimeConfig)
     risk: RiskRuntimeConfig = field(default_factory=RiskRuntimeConfig)
+    execution: ExecutionRuntimeConfig = field(default_factory=ExecutionRuntimeConfig)
     worker: WorkerRuntimeConfig = field(default_factory=WorkerRuntimeConfig)
 
     def __post_init__(self) -> None:
         if not self.sleeve_id.strip():
             raise ConfigurationValidationError("sleeve_id is required.")
         _validate_non_negative("sleeve.cash", self.cash)
+        routes = {}
+        for market_scope, account_id in dict(self.broker_account_routes).items():
+            market_scope = str(market_scope).strip()
+            account_id = str(account_id).strip()
+            if market_scope not in {"domestic", "overseas"}:
+                raise ConfigurationValidationError(f"Unsupported sleeve broker_account_routes market_scope: {market_scope}")
+            if not account_id:
+                raise ConfigurationValidationError("sleeve broker_account_routes account_id cannot be empty.")
+            routes[market_scope] = account_id
+        object.__setattr__(self, "broker_account_routes", MappingProxyType(routes))
+        cash_by_currency = {}
+        for currency, amount in dict(self.cash_by_currency).items():
+            code = str(currency).strip().upper()
+            if not code:
+                raise ConfigurationValidationError("sleeve.cash_by_currency currency cannot be empty.")
+            value = float(amount)
+            if value < 0:
+                raise ConfigurationValidationError("sleeve.cash_by_currency amounts must be non-negative.")
+            if value > 0:
+                cash_by_currency[code] = value
+        object.__setattr__(self, "cash_by_currency", MappingProxyType(cash_by_currency))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "sleeve_id": self.sleeve_id,
-            "workspace_path": str(self.workspace_path) if self.workspace_path is not None else None,
+            "workspace_path": _path_to_config_str(self.workspace_path),
+            "broker_account_id": self.broker_account_id,
+            "broker_account_routes": dict(self.broker_account_routes),
             "cash": self.cash,
+            "cash_by_currency": dict(self.cash_by_currency),
             "universe": self.universe.to_dict(),
             "indicators": self.indicators.to_dict(),
             "alpha": self.alpha.to_dict(),
             "portfolio": self.portfolio.to_dict(),
             "risk": self.risk.to_dict(),
+            "execution": self.execution.to_dict(),
             "worker": self.worker.to_dict(),
         }
 
@@ -254,6 +347,8 @@ class RuntimeConfig:
     timezone: str
     market_data: MarketDataRuntimeConfig
     sleeves: tuple[SleeveRuntimeConfig, ...]
+    broker_accounts: tuple[BrokerAccountRuntimeConfig, ...] = ()
+    journal_path: Path | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -270,6 +365,21 @@ class RuntimeConfig:
             if sleeve.sleeve_id in seen:
                 raise ConfigurationValidationError(f"Duplicate sleeve_id: {sleeve.sleeve_id}")
             seen.add(sleeve.sleeve_id)
+        account_ids: set[str] = set()
+        for account in self.broker_accounts:
+            if account.account_id in account_ids:
+                raise ConfigurationValidationError(f"Duplicate broker account_id: {account.account_id}")
+            account_ids.add(account.account_id)
+        for sleeve in self.sleeves:
+            if sleeve.broker_account_id and sleeve.broker_account_id not in account_ids:
+                raise ConfigurationValidationError(
+                    f"Sleeve '{sleeve.sleeve_id}' references unknown broker_account_id: {sleeve.broker_account_id}"
+                )
+            for market_scope, broker_account_id in sleeve.broker_account_routes.items():
+                if broker_account_id not in account_ids:
+                    raise ConfigurationValidationError(
+                        f"Sleeve '{sleeve.sleeve_id}' {market_scope} route references unknown broker_account_id: {broker_account_id}"
+                    )
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     def sleeve(self, sleeve_id: str) -> SleeveRuntimeConfig:
@@ -278,12 +388,20 @@ class RuntimeConfig:
                 return sleeve
         raise KeyError(f"Unknown sleeve_id: {sleeve_id}")
 
+    def broker_account(self, account_id: str) -> BrokerAccountRuntimeConfig:
+        for account in self.broker_accounts:
+            if account.account_id == account_id:
+                return account
+        raise KeyError(f"Unknown broker account_id: {account_id}")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "runtime_id": self.runtime_id,
             "mode": self.mode,
             "timezone": self.timezone,
             "market_data": self.market_data.to_dict(),
+            "broker_accounts": [account.to_dict() for account in self.broker_accounts],
+            "journal_path": _path_to_config_str(self.journal_path),
             "sleeves": [sleeve.to_dict() for sleeve in self.sleeves],
             "metadata": dict(self.metadata),
         }
@@ -326,6 +444,8 @@ def parse_runtime_config(payload: Mapping[str, Any]) -> RuntimeConfig:
         mode=str(payload.get("mode", "live")).strip(),
         timezone=str(payload.get("timezone", "Asia/Seoul")).strip(),
         market_data=_parse_market_data_runtime_config(market_data_payload),
+        broker_accounts=tuple(_parse_broker_account_runtime_config(item) for item in _list(payload.get("broker_accounts"), default=[])),
+        journal_path=_optional_path(payload.get("journal_path", payload.get("cycle_journal_path"))),
         sleeves=tuple(_parse_sleeve_runtime_config(item) for item in _list(payload.get("sleeves"))),
         metadata=dict(_object(payload.get("metadata"), default={})),
     )
@@ -341,19 +461,51 @@ def _parse_market_data_runtime_config(payload: Mapping[str, Any]) -> MarketDataR
     )
 
 
+def _parse_broker_account_runtime_config(payload: Any) -> BrokerAccountRuntimeConfig:
+    data = _object(payload)
+    account_store_path = _optional_path(data.get("account_store_path", data.get("virtual_account_path")))
+    if account_store_path is None:
+        raise ConfigurationValidationError("broker_accounts.account_store_path is required.")
+    return BrokerAccountRuntimeConfig(
+        account_id=str(data.get("account_id", data.get("id", ""))).strip(),
+        market_scope=str(data.get("market_scope", data.get("market", ""))).strip() or "domestic",
+        account_store_path=account_store_path,
+        order_store_path=_optional_path(data.get("order_store_path", data.get("order_runtime_path"))),
+        currency=str(data.get("currency", "")).strip(),
+        broker_gateway=str(data.get("broker_gateway", data.get("gateway", "broker-engine"))).strip(),
+        metadata=dict(_object(data.get("metadata"), default={})),
+    )
+
+
 def _parse_sleeve_runtime_config(payload: Any) -> SleeveRuntimeConfig:
     data = _object(payload)
     return SleeveRuntimeConfig(
         sleeve_id=str(data.get("sleeve_id", data.get("id", ""))).strip(),
         universe=_parse_universe_runtime_config(_object(data.get("universe"))),
         workspace_path=_optional_path(data.get("workspace_path", data.get("workspace"))),
+        broker_account_id=_optional_text(data.get("broker_account_id", data.get("account_id"))),
+        broker_account_routes=_parse_broker_account_routes(data.get("broker_account_routes", data.get("account_routes"))),
         cash=float(data.get("cash", data.get("portfolio_cash", 100_000.0))),
+        cash_by_currency=dict(_object(data.get("cash_by_currency"), default={})),
         indicators=_parse_indicator_runtime_config(_object(data.get("indicators"), default={})),
         alpha=_parse_alpha_runtime_config(_object(data.get("alpha"), default={})),
         portfolio=_parse_portfolio_runtime_config(_object(data.get("portfolio"), default={})),
         risk=_parse_risk_runtime_config(_object(data.get("risk"), default={})),
+        execution=_parse_execution_runtime_config(_object(data.get("execution"), default={})),
         worker=_parse_worker_runtime_config(_object(data.get("worker"), default={})),
     )
+
+
+def _parse_broker_account_routes(payload: Any) -> dict[str, str]:
+    if payload is None:
+        return {}
+    if not isinstance(payload, Mapping):
+        raise ConfigurationValidationError("sleeve.broker_account_routes must be an object.")
+    return {
+        str(market_scope).strip(): str(account_id).strip()
+        for market_scope, account_id in payload.items()
+        if str(market_scope).strip() and str(account_id).strip()
+    }
 
 
 def _parse_universe_runtime_config(payload: Mapping[str, Any]) -> UniverseRuntimeConfig:
@@ -423,6 +575,14 @@ def _parse_risk_runtime_config(payload: Mapping[str, Any]) -> RiskRuntimeConfig:
     )
 
 
+def _parse_execution_runtime_config(payload: Mapping[str, Any]) -> ExecutionRuntimeConfig:
+    raw_model = payload.get("model", payload.get("module", "leaps_quant_engine.execution:ImmediateExecutionModel"))
+    return ExecutionRuntimeConfig(
+        model=_parse_module_reference(raw_model),
+        parameters=dict(_object(payload.get("parameters", payload.get("params")), default={})),
+    )
+
+
 def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> RebalancePolicyRuntimeConfig:
     return RebalancePolicyRuntimeConfig(
         cash_reserve_pct=float(payload.get("cash_reserve_pct", 0.0)),
@@ -482,6 +642,13 @@ def _optional_path(value: Any) -> Path | None:
     if not text:
         return None
     return Path(text)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _validate_non_negative(name: str, value: float) -> None:

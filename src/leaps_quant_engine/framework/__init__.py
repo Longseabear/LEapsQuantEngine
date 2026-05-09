@@ -1,11 +1,18 @@
 from leaps_quant_engine.framework.portfolio_construction import (
     EqualWeightPortfolioConstructionModel,
+    PortfolioAllocationTarget,
     PortfolioConstructionEngine,
     PortfolioConstructionContext,
     PortfolioConstructionModel,
     PortfolioTargetBatch,
     PortfolioTargetPlan,
     RebalancePolicy,
+)
+from leaps_quant_engine.framework.order_sizing import (
+    OrderSizingBatch,
+    OrderSizingContext,
+    OrderSizingEngine,
+    OrderSizingPlan,
 )
 from leaps_quant_engine.framework.portfolio_model_loader import (
     PortfolioConstructionModelLoadError,
@@ -35,6 +42,7 @@ __all__ = [
     "FrameworkCycleResult",
     "FrameworkRunner",
     "PassThroughRiskManagementModel",
+    "PortfolioAllocationTarget",
     "PortfolioConstructionEngine",
     "PortfolioConstructionModelLoadError",
     "PortfolioConstructionModelLoadResult",
@@ -42,6 +50,10 @@ __all__ = [
     "PortfolioConstructionModel",
     "PortfolioTargetBatch",
     "PortfolioTargetPlan",
+    "OrderSizingBatch",
+    "OrderSizingContext",
+    "OrderSizingEngine",
+    "OrderSizingPlan",
     "PythonPortfolioConstructionModelLoader",
     "PythonRiskManagementModelLoader",
     "RebalancePolicy",

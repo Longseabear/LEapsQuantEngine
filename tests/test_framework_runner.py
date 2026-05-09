@@ -77,15 +77,18 @@ def test_framework_runner_turns_active_insight_into_order_intent():
     assert result.active_insight_count == 1
     assert result.portfolio_target_batch.target_count == 1
     assert result.portfolio_target_batch.source_insight_ids == (insight.insight_id,)
-    assert result.portfolio_targets[0].quantity == 5
+    assert result.portfolio_target_batch.targets[0].target_percent == 1.0
+    assert result.order_sizing_batch.targets[0].quantity == 10
+    assert result.portfolio_targets[0].quantity == 10
     assert result.risk_decisions.approved_targets == result.portfolio_targets
     assert len(result.order_intents) == 1
     assert result.order_intents[0].side is OrderSide.BUY
-    assert result.order_intents[0].quantity == 5
+    assert result.order_intents[0].quantity == 10
     summary = result.to_dict(include_details=False)
     assert summary["new_insights"]["insight_count"] == 1
     assert "insights" not in summary["new_insights"]
     assert summary["portfolio_target_batch"]["target_count"] == 1
+    assert summary["order_sizing"]["target_count"] == 1
     assert summary["active_insights"] == []
 
 
@@ -131,4 +134,4 @@ def test_framework_runner_expires_insight_and_flattens_managed_symbol():
     assert second.insight_manager_update.expired_count == 1
     assert second.portfolio_targets[0].quantity == 0
     assert second.order_intents[0].side is OrderSide.SELL
-    assert second.order_intents[0].quantity == 5
+    assert second.order_intents[0].quantity == 10

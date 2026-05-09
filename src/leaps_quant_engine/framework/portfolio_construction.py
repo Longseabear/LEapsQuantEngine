@@ -34,42 +34,49 @@ class PortfolioConstructionContext:
         return self.portfolio.held_symbols
 
 
+@dataclass(frozen=True, slots=True)
+class PortfolioAllocationTarget:
+    symbol: Symbol
+    target_percent: float
+    tag: str = ""
+
+    def __post_init__(self) -> None:
+        if not -1.0 <= self.target_percent <= 1.0:
+            raise ValueError("target_percent must be between -1 and 1.")
+
+
 class PortfolioConstructionModel(Protocol):
-    def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioTarget, ...]:
-        """Convert active insights into desired holdings."""
+    def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
+        """Convert active insights into desired portfolio weights."""
 
 
 @dataclass(frozen=True, slots=True)
 class PortfolioTargetPlan:
-    target: PortfolioTarget
+    target: PortfolioAllocationTarget
     current_quantity: int
-    target_quantity: int
-    delta_quantity: int
     current_price: float | None
     current_value: float
-    target_value: float
-    delta_value: float
+    target_percent: float
+    desired_value: float
     source_insight_ids: tuple[str, ...] = ()
     reason: str = ""
 
     @property
     def is_entry(self) -> bool:
-        return self.current_quantity == 0 and self.target_quantity > 0
+        return self.current_quantity == 0 and self.target_percent != 0
 
     @property
     def is_exit(self) -> bool:
-        return self.current_quantity != 0 and self.target_quantity == 0
+        return self.current_quantity != 0 and self.target_percent == 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "symbol": self.target.symbol.key,
             "current_quantity": self.current_quantity,
-            "target_quantity": self.target_quantity,
-            "delta_quantity": self.delta_quantity,
             "current_price": self.current_price,
             "current_value": self.current_value,
-            "target_value": self.target_value,
-            "delta_value": self.delta_value,
+            "target_percent": self.target_percent,
+            "desired_value": self.desired_value,
             "source_insight_ids": list(self.source_insight_ids),
             "reason": self.reason,
             "tag": self.target.tag,
@@ -82,7 +89,7 @@ class PortfolioTargetPlan:
 class PortfolioTargetBatch:
     sleeve_id: str
     generated_at: datetime
-    targets: tuple[PortfolioTarget, ...]
+    targets: tuple[PortfolioAllocationTarget, ...]
     plans: tuple[PortfolioTargetPlan, ...] = ()
     source_insight_ids: tuple[str, ...] = ()
     model_name: str = ""
@@ -114,7 +121,7 @@ class PortfolioTargetBatch:
             "targets": [
                 {
                     "symbol": target.symbol.key,
-                    "quantity": target.quantity,
+                    "target_percent": target.target_percent,
                     "tag": target.tag,
                 }
                 for target in self.targets
@@ -154,22 +161,23 @@ class PortfolioConstructionEngine:
             portfolio_equity=equity,
             target_portfolio_value=target_value,
         )
-        raw_targets = self.model.create_targets(prepared_context)
-        raw_plans = self._build_plans(prepared_context, raw_targets)
-        plans = self._filter_rebalance_noise(raw_plans)
-        targets = tuple(plan.target for plan in plans)
+        raw_targets = tuple(
+            _coerce_allocation_target(prepared_context, target)
+            for target in self.model.create_targets(prepared_context)
+        )
+        plans = self._build_plans(prepared_context, raw_targets)
         return PortfolioTargetBatch(
             sleeve_id=context.sleeve_id,
             generated_at=context.data.time,
-            targets=targets,
+            targets=raw_targets,
             plans=plans,
             source_insight_ids=tuple(insight.insight_id for insight in context.active_insights),
             model_name=type(self.model).__name__,
             reason=self.reason,
             metadata={
                 "raw_target_count": len(raw_targets),
-                "filtered_target_count": len(targets),
-                "raw_plan_count": len(raw_plans),
+                "filtered_target_count": len(raw_targets),
+                "raw_plan_count": len(plans),
                 "filtered_plan_count": len(plans),
                 "portfolio_equity": equity,
                 "target_portfolio_value": target_value,
@@ -182,7 +190,7 @@ class PortfolioConstructionEngine:
     def _build_plans(
         self,
         context: PortfolioConstructionContext,
-        targets: tuple[PortfolioTarget, ...],
+        targets: tuple[PortfolioAllocationTarget, ...],
     ) -> tuple[PortfolioTargetPlan, ...]:
         insight_ids_by_symbol = _insight_ids_by_symbol(context.active_insights)
         return tuple(
@@ -195,32 +203,6 @@ class PortfolioConstructionEngine:
             for target in targets
         )
 
-    def _filter_rebalance_noise(self, plans: tuple[PortfolioTargetPlan, ...]) -> tuple[PortfolioTargetPlan, ...]:
-        filtered: list[PortfolioTargetPlan] = []
-        for plan in plans:
-            if plan.delta_quantity == 0:
-                continue
-            if abs(plan.delta_quantity) < self.rebalance_policy.min_quantity_delta:
-                continue
-            if self._below_min_notional(plan):
-                continue
-            filtered.append(plan)
-        return tuple(filtered)
-
-    def _below_min_notional(self, plan: PortfolioTargetPlan) -> bool:
-        min_notional = self.rebalance_policy.min_order_notional
-        if min_notional <= 0:
-            return False
-        if (
-            self.rebalance_policy.allow_exit_below_min_notional
-            and plan.target_quantity == 0
-            and plan.current_quantity != 0
-        ):
-            return False
-        if plan.current_price is None:
-            return True
-        return abs(plan.delta_quantity) * plan.current_price < min_notional
-
 
 @dataclass(frozen=True, slots=True)
 class EqualWeightPortfolioConstructionModel:
@@ -231,7 +213,7 @@ class EqualWeightPortfolioConstructionModel:
         if not 0.0 <= self.max_portfolio_pct <= 1.0:
             raise ValueError("max_portfolio_pct must be between 0 and 1.")
 
-    def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioTarget, ...]:
+    def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
         latest_by_symbol = _latest_insight_by_symbol(context.active_insights)
         actionable = tuple(
             insight
@@ -244,9 +226,9 @@ class EqualWeightPortfolioConstructionModel:
             equal_weight = self.max_portfolio_pct / len(actionable)
             for insight in actionable:
                 signed_weight = _target_weight(insight, equal_weight, long_only=self.long_only)
-                target_qty_by_symbol[insight.symbol_key] = PortfolioTarget(
+                target_qty_by_symbol[insight.symbol_key] = PortfolioAllocationTarget(
                     symbol=insight.symbol,
-                    quantity=_quantity_for_weight(context, insight.symbol, signed_weight),
+                    target_percent=signed_weight,
                     tag=f"framework:{insight.alpha_id}:{insight.direction.value}",
                 )
 
@@ -255,9 +237,9 @@ class EqualWeightPortfolioConstructionModel:
                 continue
             if context.portfolio.quantity(symbol) == 0:
                 continue
-            target_qty_by_symbol[symbol.key] = PortfolioTarget(
+            target_qty_by_symbol[symbol.key] = PortfolioAllocationTarget(
                 symbol=symbol,
-                quantity=0,
+                target_percent=0.0,
                 tag="framework:insight_inactive",
             )
         return tuple(target_qty_by_symbol.values())
@@ -284,23 +266,14 @@ def _symbols_by_key(symbols: tuple[Symbol, ...]) -> dict[str, Symbol]:
 
 
 def _target_weight(insight: Insight, equal_weight: float, *, long_only: bool) -> float:
-    weight = abs(insight.weight) if insight.weight is not None else equal_weight
-    weight = min(weight, equal_weight)
     if insight.direction is InsightDirection.DOWN and not long_only:
-        return -weight
-    return weight
-
-
-def _quantity_for_weight(context: PortfolioConstructionContext, symbol: Symbol, weight: float) -> int:
-    bar = context.data.get(symbol)
-    if bar is None or bar.close <= 0:
-        return context.portfolio.quantity(symbol)
-    return int((context.target_value * weight) // bar.close)
+        return -equal_weight
+    return equal_weight
 
 
 def _target_plan(
     context: PortfolioConstructionContext,
-    target: PortfolioTarget,
+    target: PortfolioAllocationTarget,
     *,
     source_insight_ids: tuple[str, ...],
     reason: str,
@@ -308,26 +281,44 @@ def _target_plan(
     current_quantity = context.portfolio.quantity(target.symbol)
     current_price = context.portfolio.mark_price(target.symbol, context.data)
     current_value = context.portfolio.position_value(target.symbol, context.data)
-    target_value = (target.quantity * current_price) if current_price is not None else 0.0
+    desired_value = context.target_value * target.target_percent
     return PortfolioTargetPlan(
         target=target,
         current_quantity=current_quantity,
-        target_quantity=target.quantity,
-        delta_quantity=target.quantity - current_quantity,
         current_price=current_price,
         current_value=current_value,
-        target_value=target_value,
-        delta_value=target_value - current_value,
+        target_percent=target.target_percent,
+        desired_value=desired_value,
         source_insight_ids=source_insight_ids,
         reason=reason,
     )
 
 
-def _target_reason(target: PortfolioTarget) -> str:
-    if target.quantity == 0:
+def _target_reason(target: PortfolioAllocationTarget) -> str:
+    if target.target_percent == 0:
         return "exit"
     return "target"
 
 
 def _portfolio_equity(portfolio: Portfolio, data: DataSlice) -> float:
     return portfolio.equity(data)
+
+
+def _coerce_allocation_target(
+    context: PortfolioConstructionContext,
+    target: PortfolioAllocationTarget | PortfolioTarget,
+) -> PortfolioAllocationTarget:
+    if isinstance(target, PortfolioAllocationTarget):
+        return target
+    if isinstance(target, PortfolioTarget):
+        if target.quantity == 0:
+            target_percent = 0.0
+        else:
+            price = context.portfolio.mark_price(target.symbol, context.data)
+            target_percent = 0.0 if price is None or context.target_value <= 0 else (target.quantity * price) / context.target_value
+        return PortfolioAllocationTarget(
+            symbol=target.symbol,
+            target_percent=target_percent,
+            tag=target.tag,
+        )
+    raise TypeError(f"Unsupported portfolio target type: {type(target).__name__}")

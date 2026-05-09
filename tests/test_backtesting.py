@@ -6,8 +6,8 @@ from leaps_quant_engine.algorithm import Algorithm
 from leaps_quant_engine.backtesting import VirtualMarketDataProvider, build_replay_feed, run_backtest
 from leaps_quant_engine.engine import Engine
 from leaps_quant_engine.examples.buy_and_hold import BuyAndHoldAlgorithm
-from leaps_quant_engine.models import Bar, DataSlice, PortfolioTarget, Symbol
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.models import Bar, DataSlice, OrderSide, PortfolioTarget, Symbol
+from leaps_quant_engine.portfolio import Holding, Portfolio
 from leaps_quant_engine.portfolio import PortfolioView
 from leaps_quant_engine.sleeve import Sleeve, SleevePolicy
 
@@ -21,6 +21,15 @@ class RoundTripAlgorithm(Algorithm):
     def on_data(self, data: DataSlice, portfolio: PortfolioView) -> list[PortfolioTarget]:
         target_quantity = 0 if data.time >= self.exit_at else self.quantity
         return [PortfolioTarget(self.symbol, target_quantity, tag="round-trip")]
+
+
+class StaticTargetAlgorithm(Algorithm):
+    def __init__(self, symbol: Symbol, quantity: int) -> None:
+        self.symbol = symbol
+        self.quantity = quantity
+
+    def on_data(self, data: DataSlice, portfolio: PortfolioView) -> list[PortfolioTarget]:
+        return [PortfolioTarget(self.symbol, self.quantity, tag="static")]
 
 
 def test_virtual_market_data_provider_replays_bars_chronologically():
@@ -56,6 +65,8 @@ def test_run_backtest_uses_immediate_fill_model_and_updates_portfolio_state():
     result = run_backtest(Engine([sleeve]), provider, [symbol])
 
     assert len(result.orders) == 1
+    assert len(result.order_tickets) == 1
+    assert len([event for event in result.order_events if event.is_fill]) == 1
     assert result.final_cash_by_sleeve == {"swing-kor": 700.0}
     assert result.final_quantity_by_sleeve == {"swing-kor": {"KRX:005930": 3}}
 
@@ -93,3 +104,36 @@ def test_run_backtest_reports_core_performance_metrics_for_closed_trades():
     assert metrics.order_count == 2
     assert result.metrics.to_report()["trade_count"] == 1
     assert result.trades_by_sleeve["swing-kor"][0].pnl == pytest.approx(20)
+
+
+def test_run_backtest_records_cross_sleeve_same_symbol_buy_sell_collision():
+    symbol = Symbol("005930", "KRX")
+    provider = VirtualMarketDataProvider.from_bars(
+        [Bar(symbol, datetime(2026, 5, 4), 100, 100, 100, 100, 10)]
+    )
+    buy_sleeve = Sleeve(
+        id="buyer",
+        algorithm=StaticTargetAlgorithm(symbol=symbol, quantity=1),
+        portfolio=Portfolio(cash=1_000),
+        policy=SleevePolicy(max_position_pct=1.0),
+    )
+    sell_sleeve = Sleeve(
+        id="seller",
+        algorithm=StaticTargetAlgorithm(symbol=symbol, quantity=0),
+        portfolio=Portfolio(
+            cash=0,
+            holdings={symbol.key: Holding(symbol, quantity=1, average_price=90.0)},
+        ),
+        policy=SleevePolicy(max_position_pct=1.0),
+    )
+
+    result = run_backtest(Engine([buy_sleeve, sell_sleeve]), provider, [symbol])
+
+    assert [(order.sleeve_id, order.side) for order in result.orders] == [
+        ("buyer", OrderSide.BUY),
+        ("seller", OrderSide.SELL),
+    ]
+    assert len(result.order_collisions) == 1
+    assert result.order_collisions[0].buy_sleeve_ids == ("buyer",)
+    assert result.order_collisions[0].sell_sleeve_ids == ("seller",)
+    assert result.final_quantity_by_sleeve == {"buyer": {"KRX:005930": 1}, "seller": {}}

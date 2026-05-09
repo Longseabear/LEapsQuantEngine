@@ -26,7 +26,9 @@ flowchart LR
     Alpha --> Insight["Insight"]
     Insight --> InsightManager["InsightManager<br/>active / expired / superseded"]
     InsightManager --> PortfolioModel["PortfolioConstructionModel"]
-    PortfolioModel --> Target["PortfolioTarget"]
+    PortfolioModel --> Allocation["PortfolioAllocationTarget<br/>target percent"]
+    Allocation --> Sizing["OrderSizingEngine"]
+    Sizing --> Target["PortfolioTarget<br/>quantity"]
     Target --> Risk["RiskManagementModel"]
     Risk --> Execution["ExecutionModel"]
     Execution --> Intent["OrderIntent"]
@@ -54,7 +56,7 @@ flowchart TB
 
 ## Current Implemented Structure
 
-The current v0 implementation has the live snapshot-to-order-intent path connected. It does not submit real broker orders yet.
+The current v0 implementation has the live snapshot-to-order-intent path connected, plus the first order-ticket and broker gateway boundary. A production live orchestrator still needs to wire continuous submit, poll, fill import, and reconciliation.
 
 ```mermaid
 flowchart LR
@@ -69,11 +71,15 @@ flowchart LR
     Framework --> AlphaRuntime["AlphaRuntime"]
     AlphaRuntime --> InsightManager["InsightManager"]
     InsightManager --> Portfolio["PortfolioConstructionEngine<br/>EqualWeightPortfolioConstructionModel"]
-    Portfolio --> TargetBatch["PortfolioTargetBatch"]
-    TargetBatch --> TargetPlan["PortfolioTargetPlan<br/>current -> target -> delta"]
-    TargetPlan --> Risk["PassThroughRiskManagementModel"]
+    Portfolio --> TargetBatch["PortfolioTargetBatch<br/>target percent / desired value"]
+    TargetBatch --> Sizing["OrderSizingEngine"]
+    Sizing --> TargetPlan["OrderSizingBatch<br/>quantity / rounding loss"]
+    TargetPlan --> Risk["BasicRiskManagementModel"]
     Risk --> Execution["ImmediateExecutionModel"]
     Execution --> Intent["OrderIntent"]
+    Intent --> Coordinator["OrderCoordinator / OrderTicket"]
+    Coordinator --> BrokerGateway["PaperBrokerExecutionGateway / BrokerEngineExecutionGateway"]
+    BrokerGateway --> OrderEvent["OrderEvent"]
 ```
 
 Implemented now:
@@ -81,15 +87,17 @@ Implemented now:
 - Universe: coarse file, fine cache refresh, active selection, and forced inclusion for held/open-order/exit-watch/manual symbols.
 - Indicators: sleeve-namespaced in-memory state, warmup, 30+ indicator catalog, live snapshot updates, and immutable `IndicatorSnapshot`.
 - Alpha: Python Alpha Model loader, `AlphaRuntime`, `Insight`, `InsightBatch`, and example alpha modules.
-- Framework: `InsightManager`, `PortfolioConstructionEngine`, equal-weight portfolio model, `PortfolioTargetPlan`, pass-through risk, immediate execution, and order-intent output.
-- Runtime: config validation, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
+- Framework: `InsightManager`, `PortfolioConstructionEngine`, equal-weight portfolio model, `PortfolioAllocationTarget`, `OrderSizingEngine`, basic risk gates, immediate execution, and order-intent output.
+- Orders: global order coordination, `OrderTicket`, `OrderEvent`, append-only order runtime state, open-ticket polling, execution-history reconciliation, simulated fills, multi-sleeve order orchestration, paper broker gateway, and a StockProgram-style broker-engine gateway.
+- Operations: `runtime-run-once --order-batch-output` persists strategy output as a submit-ready order-intent artifact. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from that artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation and returns a final status report. Order runtime commands can route through sleeve-level broker account profiles.
+- Runtime: config validation, broker account profiles, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
 - Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills and report metrics.
 
 Not complete yet:
 
-- Real risk gates beyond pass-through approval.
-- Order ticket, order event, fill, cancel, reject, and reconciliation state machine.
-- Broker submission and idempotent live order command handling.
+- Long-running live submit/poll/fill-sync/reconcile orchestration across all sleeves.
+- Rich cancel/replace handling and broker fill event ingestion beyond execution-history sync.
+- Overseas broker-engine live submit, poll, and account reconciliation. Overseas sleeve routes are explicit now, but broker-engine side effects are blocked until the overseas adapter exists.
 - Long-running production daemon/supervisor with scheduled universe reselection.
 
 ## Shape
@@ -106,10 +114,21 @@ Not complete yet:
 - `BackgroundSnapshotWorker`: bounded/background snapshot update loop.
 - `AlphaRuntime`: Python Alpha Model runner that emits insights from snapshots.
 - `InsightManager`: LEAN-style active/expired/cancelled insight state.
-- `PortfolioConstructionEngine`: turns active insights plus the sleeve virtual account portfolio into auditable `PortfolioTargetBatch` and `PortfolioTargetPlan` records.
-- `FrameworkRunner`: deterministic `Alpha -> Portfolio -> Risk -> Execution` v0 pipeline.
+- `PortfolioConstructionEngine`: turns active insights plus the sleeve virtual account portfolio into auditable allocation targets with target percent and desired value.
+- `OrderSizingEngine`: turns allocation targets into quantity-based `PortfolioTarget` records, applying rebalance noise filters and recording rounding loss.
+- `FrameworkRunner`: deterministic `Alpha -> Portfolio -> OrderSizing -> Risk -> Execution` v0 pipeline.
+- `OrderCoordinator`: converts sleeve order-intent batches into global `OrderTicket` records and collision reports.
+- `MultiSleeveOrderOrchestrator`: collects all sleeve order batches, registers ticket ownership, submits through a broker gateway, polls events, and applies fills to the virtual sleeve account ledger.
+- `FileOrderRuntimeStateStore`: records tickets and order events as append-only JSONL and reconstructs open tickets after restart.
+- `OrderRuntimePaperSmokeRunner`: paper-only end-to-end smoke for submit, supervisor polling, fill application, and final status.
+- `OrderRuntimeSubmitter`: validates order-intent batches, dry-runs ticket coordination, blocks unconfirmed broker-engine live submit, and optionally commits through `MultiSleeveOrderOrchestrator`.
+- `OrderRuntimeStatusReport`: read-only status view for open tickets, recent events, sleeve cash/holdings, pending notional, and unallocated broker fills.
+- `OrderRuntimeSupervisor`: bounded maintenance run that polls open tickets, imports execution history, and reports warnings instead of getting stuck.
+- `OpenTicketPollWorker`: reloads open tickets, polls the broker gateway, appends observed events, and applies fill events to virtual sleeve accounts.
+- `ExecutionHistoryReconcileWorker`: imports recent broker execution-history fills without stopping on bad rows, skips already-applied order-event fills, and records unknown fills for sleeve allocation.
+- `BrokerExecutionGateway`: submits or simulates tickets through paper or local broker-engine adapters and emits normalized `OrderEvent` records.
 - `UniverseSelectionModel`: sleeve-level active universe selection with forced watchlist inclusion.
-- `RuntimeConfig` / `RuntimeControlCommand`: option snapshots and command-based reload for future UI/control-plane flows.
+- `RuntimeConfig` / `BrokerAccountRuntimeConfig` / `RuntimeControlCommand`: option snapshots, sleeve-to-account routing, and command-based reload for future UI/control-plane flows.
 
 ## Smoke Test
 
@@ -120,7 +139,7 @@ py -3 -m pytest -q
 Current expected result:
 
 ```text
-115 passed
+205 passed
 ```
 
 ## Run Sample
@@ -162,9 +181,41 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/live_us_smoke.json --sleeve-id us-live --held IBM --skip-warmup --summary-only
 ```
 
+Persist the runtime cycle's execution output as a submit-ready artifact:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --summary-only --order-batch-output ../../data/order-intents/leaps_latest.json
+```
+
 The first sample lives at `configs/runtime/live_us_smoke.json`. It references the coarse universe file, the active selection module, alpha module path, portfolio construction module path, sleeve cash, market-data provider choice, rate limit, warmup settings, rebalance settings, and worker cadence. `bootstrap_sleeve_runtime(...)` turns the snapshot into provider adapters, optional fine refresh, active universe selection, alpha runtime, portfolio construction engine, sleeve portfolio, `FrameworkRunner`, and `BackgroundSnapshotWorker`. The running process should keep the parsed `RuntimeConfigSnapshot` in memory and only reload the file after a control command.
 
-`runtime-run-once` returns both worker and framework sections: worker covers market snapshot collection and indicator publication; framework covers `Alpha -> InsightManager -> Portfolio -> Risk -> Execution -> OrderIntent`.
+`runtime-run-once` returns both worker and framework sections: worker covers market snapshot collection and indicator publication; framework covers `Alpha -> InsightManager -> Portfolio -> OrderSizing -> Risk -> Execution -> OrderIntent`.
+
+`broker_accounts` can define separate domestic and overseas virtual-account/order-runtime stores. A sleeve can set `broker_account_id` so order runtime commands resolve the correct account route without reusing the old `portfolio.account_store_path` fallback. `order-runtime-status` returns `broker_account_id` and `market_scope`; overseas `broker-engine` submit/poll/reconcile is currently blocked intentionally.
+
+Dry-run or commit an order-intent batch file into the order runtime:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --commit --broker paper --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-paper-smoke configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --summary-only
+```
+
+Read the current order runtime and sleeve virtual-account state:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json --summary-only
+```
+
+Run one bounded order maintenance pass:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json --summary-only
+```
 
 ## KIS Adapter
 
@@ -212,8 +263,9 @@ Historical DataSlice replay
   -> AlphaRuntime
   -> InsightManager
   -> PortfolioConstructionEngine
-  -> PortfolioTargetBatch
-  -> PortfolioTargetPlan
+  -> PortfolioTargetBatch (target percent / desired value)
+  -> OrderSizingEngine
+  -> OrderSizingBatch (quantity / rounding loss)
   -> RiskManagement
   -> Execution
   -> immediate fill model
@@ -325,13 +377,14 @@ IndicatorSnapshot
   -> InsightManager
   -> PortfolioConstructionEngine
   -> PortfolioTargetBatch
-  -> PortfolioTargetPlan
+  -> OrderSizingEngine
+  -> OrderSizingBatch
   -> PassThroughRiskManagementModel
   -> ImmediateExecutionModel
   -> OrderIntent
 ```
 
-This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights and the sleeve's virtual account portfolio, creates auditable `PortfolioTargetBatch` records, and emits `PortfolioTargetPlan` entries that explain current quantity, target quantity, and delta. It can flatten held symbols when their active insight becomes inactive. The v0 engine wraps the equal-weight model with `RebalancePolicy` support for cash reserve, minimum quantity delta, and minimum order notional filters. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
+This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights and the sleeve's virtual account portfolio, creates auditable `PortfolioTargetBatch` records, and emits allocation plans that explain target percent and desired value. `OrderSizingEngine` then converts those allocation plans into integer quantity targets, records rounding loss, and applies `RebalancePolicy` support for cash reserve, minimum quantity delta, and minimum order notional filters. Portfolio construction can flatten held symbols when their active insight becomes inactive. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
 
 Portfolio Construction Models can be injected as Python model modules, similar to Alpha Models:
 

@@ -84,12 +84,12 @@ def test_framework_backtest_replays_indicators_alpha_and_metrics():
     assert [cycle.indicator_snapshot_id for cycle in result.framework_cycles]
     assert [cycle.new_insight_batch.insight_count for cycle in result.framework_cycles] == [1, 1, 1]
     assert [(order.side, order.quantity, order.reference_price) for order in result.orders] == [
-        (OrderSide.BUY, 5, 100.0),
-        (OrderSide.SELL, 5, 108.0),
+        (OrderSide.BUY, 10, 100.0),
+        (OrderSide.SELL, 10, 108.0),
     ]
-    assert result.final_cash == pytest.approx(1_040.0)
+    assert result.final_cash == pytest.approx(1_080.0)
     assert result.final_quantity == {}
-    assert result.metrics.total_return == pytest.approx(0.04)
+    assert result.metrics.total_return == pytest.approx(0.08)
     assert result.metrics.trade_count == 1
     assert result.metrics.order_count == 2
     assert result.to_report(include_orders=False)["order_count"] == 2

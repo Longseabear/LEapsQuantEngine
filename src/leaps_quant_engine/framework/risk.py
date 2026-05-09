@@ -7,6 +7,7 @@ from typing import Any, Mapping, Protocol
 
 from leaps_quant_engine.models import DataSlice, PortfolioTarget
 from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.snapshots import SnapshotQualityReport, SnapshotQualityStatus
 
 
 class RiskDecisionStatus(str, Enum):
@@ -67,6 +68,7 @@ class RiskManagementContext:
     data: DataSlice
     portfolio: Portfolio
     targets: tuple[PortfolioTarget, ...]
+    snapshot_quality: SnapshotQualityReport | None = None
 
 
 class RiskManagementModel(Protocol):
@@ -95,11 +97,16 @@ class PassThroughRiskManagementModel:
 class RiskLimits:
     long_only: bool = True
     max_position_pct: float = 1.0
+    max_total_exposure_pct: float = 1.0
     cash_buffer_pct: float = 0.0
+    require_fresh_for_entries: bool = True
+    reject_invalid_snapshot: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.max_position_pct <= 1.0:
             raise ValueError("max_position_pct must be between 0 and 1.")
+        if not 0.0 <= self.max_total_exposure_pct <= 1.0:
+            raise ValueError("max_total_exposure_pct must be between 0 and 1.")
         if not 0.0 <= self.cash_buffer_pct < 1.0:
             raise ValueError("cash_buffer_pct must be between 0 inclusive and 1 exclusive.")
 
@@ -113,8 +120,20 @@ class BasicRiskManagementModel:
     def manage_risk(self, context: RiskManagementContext) -> RiskDecisionBatch:
         available_cash = max(0.0, context.portfolio.cash * (1.0 - self.limits.cash_buffer_pct))
         decisions: list[RiskDecision] = []
+        approved_quantities = {
+            holding.symbol.key: holding.quantity
+            for holding in context.portfolio.holdings.values()
+            if holding.quantity != 0
+        }
         for target in context.targets:
-            decision, available_cash = self._evaluate_target(context, target, available_cash)
+            decision, available_cash = self._evaluate_target(
+                context,
+                target,
+                available_cash,
+                approved_quantities,
+            )
+            if decision.approved_target is not None:
+                approved_quantities[decision.approved_target.symbol.key] = decision.approved_target.quantity
             decisions.append(decision)
         return RiskDecisionBatch(sleeve_id=context.sleeve_id, decisions=tuple(decisions))
 
@@ -123,6 +142,7 @@ class BasicRiskManagementModel:
         context: RiskManagementContext,
         target: PortfolioTarget,
         available_cash: float,
+        approved_quantities: dict[str, int],
     ) -> tuple[RiskDecision, float]:
         if self.limits.long_only and target.quantity < 0:
             return (
@@ -136,6 +156,11 @@ class BasicRiskManagementModel:
                 available_cash,
             )
 
+        current_quantity = context.portfolio.quantity(target.symbol)
+        quality_rejection = self._snapshot_quality_rejection(context, target, current_quantity)
+        if quality_rejection is not None:
+            return quality_rejection, available_cash
+
         price = context.portfolio.mark_price(target.symbol, context.data)
         if price is None or price <= 0:
             return (
@@ -148,8 +173,8 @@ class BasicRiskManagementModel:
                 available_cash,
             )
 
-        current_quantity = context.portfolio.quantity(target.symbol)
         bounded_target = self._clamp_position_size(context, target, price)
+        bounded_target = self._clamp_total_exposure(context, bounded_target, price, approved_quantities)
         quantity_after_position_limit = bounded_target.quantity
         quantity_after_cash_limit, available_cash = self._clamp_cash(
             current_quantity=current_quantity,
@@ -192,12 +217,43 @@ class BasicRiskManagementModel:
                     "current_quantity": current_quantity,
                     "price": price,
                     "max_position_pct": self.limits.max_position_pct,
+                    "max_total_exposure_pct": self.limits.max_total_exposure_pct,
                     "cash_buffer_pct": self.limits.cash_buffer_pct,
                     "available_cash_after": available_cash,
+                    "snapshot_quality_status": context.snapshot_quality.status.value
+                    if context.snapshot_quality is not None
+                    else None,
                 },
             ),
             available_cash,
         )
+
+    def _snapshot_quality_rejection(
+        self,
+        context: RiskManagementContext,
+        target: PortfolioTarget,
+        current_quantity: int,
+    ) -> RiskDecision | None:
+        quality = context.snapshot_quality
+        if quality is None:
+            return None
+        if self.limits.reject_invalid_snapshot and quality.status is SnapshotQualityStatus.INVALID:
+            return RiskDecision(
+                original_target=target,
+                approved_target=None,
+                status=RiskDecisionStatus.REJECTED,
+                reason="snapshot_quality_invalid",
+                metadata={"snapshot_quality": quality.to_dict()},
+            )
+        if self.limits.require_fresh_for_entries and target.quantity > current_quantity and not quality.allows_new_entries:
+            return RiskDecision(
+                original_target=target,
+                approved_target=None,
+                status=RiskDecisionStatus.REJECTED,
+                reason="snapshot_quality_blocks_entry",
+                metadata={"snapshot_quality": quality.to_dict()},
+            )
+        return None
 
     def _clamp_position_size(
         self,
@@ -211,6 +267,35 @@ class BasicRiskManagementModel:
         if equity <= 0:
             return PortfolioTarget(symbol=target.symbol, quantity=0, tag=target.tag)
         max_abs_quantity = int((equity * self.limits.max_position_pct) // price)
+        if abs(target.quantity) <= max_abs_quantity:
+            return target
+        signed_quantity = max_abs_quantity if target.quantity > 0 else -max_abs_quantity
+        return PortfolioTarget(symbol=target.symbol, quantity=signed_quantity, tag=target.tag)
+
+    def _clamp_total_exposure(
+        self,
+        context: RiskManagementContext,
+        target: PortfolioTarget,
+        price: float,
+        approved_quantities: dict[str, int],
+    ) -> PortfolioTarget:
+        if self.limits.max_total_exposure_pct >= 1.0:
+            return target
+        equity = context.portfolio.equity(context.data)
+        if equity <= 0:
+            return PortfolioTarget(symbol=target.symbol, quantity=0, tag=target.tag)
+        max_total_exposure = equity * self.limits.max_total_exposure_pct
+        exposure_without_target = 0.0
+        for holding in context.portfolio.holdings.values():
+            if holding.symbol.key == target.symbol.key:
+                continue
+            quantity = approved_quantities.get(holding.symbol.key, holding.quantity)
+            mark = context.portfolio.mark_price(holding.symbol, context.data)
+            if mark is None:
+                continue
+            exposure_without_target += abs(quantity * mark)
+        allowed_symbol_exposure = max(0.0, max_total_exposure - exposure_without_target)
+        max_abs_quantity = int(allowed_symbol_exposure // price)
         if abs(target.quantity) <= max_abs_quantity:
             return target
         signed_quantity = max_abs_quantity if target.quantity > 0 else -max_abs_quantity

@@ -75,6 +75,76 @@ class BrokerEngineClient:
             raise BrokerEngineClientError(f"broker-engine operation '{operation}' returned an unexpected payload.")
         return result
 
+    def enqueue_command(
+        self,
+        operation: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._wait_for_turn()
+        try:
+            response = self.session.post(
+                f"{self.base_url}/broker/commands",
+                json={
+                    "operation": operation,
+                    "arguments": arguments or {},
+                    "metadata": metadata or {},
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise BrokerEngineClientError(f"Failed to enqueue broker-engine operation '{operation}'.") from exc
+        return self._extract_result(response, f"broker-engine enqueue '{operation}'")
+
+    def consume_events(self, *, consumer_id: str, limit: int = 200) -> dict[str, Any]:
+        self._wait_for_turn()
+        try:
+            response = self.session.get(
+                f"{self.base_url}/broker/events",
+                params={"consumer_id": consumer_id, "limit": limit},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise BrokerEngineClientError("Failed to fetch broker-engine events.") from exc
+        return self._extract_result(response, "broker-engine event fetch")
+
+    def get_snapshots(
+        self,
+        *,
+        consumer_id: str,
+        snapshot_type: str = "",
+        resource_id: str = "",
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        self._wait_for_turn()
+        params: dict[str, Any] = {"consumer_id": consumer_id, "limit": limit}
+        if snapshot_type:
+            params["snapshot_type"] = snapshot_type
+        if resource_id:
+            params["resource_id"] = resource_id
+        try:
+            response = self.session.get(
+                f"{self.base_url}/broker/snapshots",
+                params=params,
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise BrokerEngineClientError("Failed to fetch broker-engine snapshots.") from exc
+        return self._extract_result(response, "broker-engine snapshot fetch")
+
+    def process_commands(self, *, max_commands: int = 16) -> dict[str, Any]:
+        self._wait_for_turn()
+        try:
+            response = self.session.post(
+                f"{self.base_url}/broker/commands/process",
+                params={"max_commands": max_commands},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise BrokerEngineClientError("Failed to process broker-engine commands.") from exc
+        return self._extract_result(response, "broker-engine command processing")
+
     def _wait_for_turn(self) -> None:
         min_interval = 1.0 / max(self.rate_limit_per_second, 1)
         with self._lock:
@@ -82,6 +152,19 @@ class BrokerEngineClient:
             if elapsed < min_interval:
                 time.sleep(min_interval - elapsed)
             self._last_request_at = time.monotonic()
+
+    def _extract_result(self, response: requests.Response, label: str) -> dict[str, Any]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BrokerEngineClientError(f"{label} returned non-JSON (HTTP {response.status_code}).") from exc
+        if response.status_code >= 400:
+            detail = payload.get("detail") if isinstance(payload, dict) else payload
+            raise BrokerEngineClientError(f"{label} failed: {detail}")
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            raise BrokerEngineClientError(f"{label} returned an unexpected payload.")
+        return result
 
 
 @dataclass(slots=True)

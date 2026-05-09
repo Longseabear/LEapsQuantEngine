@@ -166,6 +166,7 @@ class PortfolioEngineState:
     sleeve_id: str
     as_of: datetime
     current: PortfolioSnapshot
+    allocation_batch: Any | None = None
     target_batch: Any | None = None
     risk_decisions: Any | None = None
     pending: PendingOrderSnapshot = field(default_factory=PendingOrderSnapshot)
@@ -186,7 +187,8 @@ class PortfolioEngineState:
                 portfolio=portfolio,
                 data=data,
             ),
-            target_batch=cycle.portfolio_target_batch,
+            allocation_batch=cycle.portfolio_target_batch,
+            target_batch=cycle.order_sizing_batch,
             risk_decisions=cycle.risk_decisions,
             pending=PendingOrderSnapshot.from_order_intents(tuple(cycle.order_intents)),
         )
@@ -196,6 +198,7 @@ class PortfolioEngineState:
             "sleeve_id": self.sleeve_id,
             "as_of": self.as_of.isoformat(),
             "current": self.current.to_dict(),
+            "allocation": self._batch_to_dict(self.allocation_batch, include_details=include_details),
             "target": self._batch_to_dict(self.target_batch, include_details=include_details),
             "risk": self._batch_to_dict(self.risk_decisions, include_details=True),
             "pending": self.pending.to_dict(),
@@ -206,7 +209,7 @@ class PortfolioEngineState:
             return None
         if not hasattr(batch, "to_dict"):
             return None
-        if batch.__class__.__name__ == "PortfolioTargetBatch" and not include_details:
+        if batch.__class__.__name__ in {"PortfolioTargetBatch", "OrderSizingBatch"} and not include_details:
             return {
                 "batch_id": batch.batch_id,
                 "sleeve_id": batch.sleeve_id,

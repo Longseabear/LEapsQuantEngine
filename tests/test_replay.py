@@ -61,9 +61,9 @@ def test_market_replay_store_records_and_replays_data_slices(tmp_path):
 
     assert [data.time for data in loaded] == [first.time, second.time]
     assert result.data_slice_count == 2
-    assert result.order_count == 2
-    assert result.orders[0].quantity == 5
-    assert result.final_quantity == {"KRX:005930": 4}
+    assert result.order_count == 1
+    assert result.orders[0].quantity == 10
+    assert result.final_quantity == {"KRX:005930": 10}
 
 
 def test_market_replay_store_records_agent_status(tmp_path):

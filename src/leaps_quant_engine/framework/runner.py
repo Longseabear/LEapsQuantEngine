@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightBatch, InsightManager, InsightManagerUpdate, SnapshotContext
-from leaps_quant_engine.execution import ImmediateExecutionModel
+from leaps_quant_engine.execution import ExecutionContext, ExecutionEngine, ImmediateExecutionModel, OrderIntentBatch
 from leaps_quant_engine.framework.portfolio_construction import (
     EqualWeightPortfolioConstructionModel,
     PortfolioConstructionEngine,
@@ -13,6 +13,7 @@ from leaps_quant_engine.framework.portfolio_construction import (
     PortfolioConstructionModel,
     PortfolioTargetBatch,
 )
+from leaps_quant_engine.framework.order_sizing import OrderSizingBatch, OrderSizingContext, OrderSizingEngine
 from leaps_quant_engine.framework.risk import (
     BasicRiskManagementModel,
     RiskDecisionBatch,
@@ -29,18 +30,27 @@ class StageTiming:
     alpha_ms: float
     insight_manager_ms: float
     portfolio_ms: float
+    order_sizing_ms: float
     risk_ms: float
     execution_ms: float
 
     @property
     def total_ms(self) -> float:
-        return self.alpha_ms + self.insight_manager_ms + self.portfolio_ms + self.risk_ms + self.execution_ms
+        return (
+            self.alpha_ms
+            + self.insight_manager_ms
+            + self.portfolio_ms
+            + self.order_sizing_ms
+            + self.risk_ms
+            + self.execution_ms
+        )
 
     def to_dict(self) -> dict[str, float]:
         return {
             "alpha_ms": self.alpha_ms,
             "insight_manager_ms": self.insight_manager_ms,
             "portfolio_ms": self.portfolio_ms,
+            "order_sizing_ms": self.order_sizing_ms,
             "risk_ms": self.risk_ms,
             "execution_ms": self.execution_ms,
             "total_ms": self.total_ms,
@@ -56,7 +66,9 @@ class FrameworkCycleResult:
     insight_manager_update: InsightManagerUpdate
     active_insights: tuple[Insight, ...]
     portfolio_target_batch: PortfolioTargetBatch
+    order_sizing_batch: OrderSizingBatch
     risk_decisions: RiskDecisionBatch
+    execution_batch: OrderIntentBatch
     order_intents: tuple[OrderIntent, ...]
     timings: StageTiming
 
@@ -66,7 +78,7 @@ class FrameworkCycleResult:
 
     @property
     def portfolio_targets(self) -> tuple[PortfolioTarget, ...]:
-        return self.portfolio_target_batch.targets
+        return self.order_sizing_batch.targets
 
     def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
         new_insights = self.new_insight_batch.to_dict() if include_details else {
@@ -110,7 +122,26 @@ class FrameworkCycleResult:
                 }
                 for target in self.portfolio_targets
             ],
+            "order_sizing": self.order_sizing_batch.to_dict() if include_details else {
+                "batch_id": self.order_sizing_batch.batch_id,
+                "source_batch_id": self.order_sizing_batch.source_batch_id,
+                "sleeve_id": self.order_sizing_batch.sleeve_id,
+                "generated_at": self.order_sizing_batch.generated_at.isoformat(),
+                "model_name": self.order_sizing_batch.model_name,
+                "reason": self.order_sizing_batch.reason,
+                "target_count": self.order_sizing_batch.target_count,
+                "metadata": dict(self.order_sizing_batch.metadata),
+            },
             "risk": self.risk_decisions.to_dict(),
+            "execution": self.execution_batch.to_dict() if include_details else {
+                "batch_id": self.execution_batch.batch_id,
+                "sleeve_id": self.execution_batch.sleeve_id,
+                "generated_at": self.execution_batch.generated_at.isoformat(),
+                "model_name": self.execution_batch.model_name,
+                "reason": self.execution_batch.reason,
+                "order_count": self.execution_batch.order_count,
+                "metadata": dict(self.execution_batch.metadata),
+            },
             "order_intents": [
                 {
                     "sleeve_id": order.sleeve_id,
@@ -134,7 +165,9 @@ class FrameworkRunner:
     portfolio_model: PortfolioConstructionModel = None  # type: ignore[assignment]
     portfolio_engine: PortfolioConstructionEngine = None  # type: ignore[assignment]
     risk_model: RiskManagementModel = None  # type: ignore[assignment]
+    order_sizing_engine: OrderSizingEngine = None  # type: ignore[assignment]
     execution_model: ImmediateExecutionModel = None  # type: ignore[assignment]
+    execution_engine: ExecutionEngine = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.insight_manager is None:
@@ -145,8 +178,12 @@ class FrameworkRunner:
             self.portfolio_engine = PortfolioConstructionEngine(model=self.portfolio_model)
         if self.risk_model is None:
             self.risk_model = BasicRiskManagementModel()
+        if self.order_sizing_engine is None:
+            self.order_sizing_engine = OrderSizingEngine(rebalance_policy=self.portfolio_engine.rebalance_policy)
         if self.execution_model is None:
             self.execution_model = ImmediateExecutionModel()
+        if self.execution_engine is None:
+            self.execution_engine = ExecutionEngine(model=self.execution_model)
 
     def run_once(
         self,
@@ -179,25 +216,39 @@ class FrameworkRunner:
         portfolio_ms = _elapsed_ms(started)
 
         started = time.perf_counter()
+        order_sizing_batch = self.order_sizing_engine.size(
+            OrderSizingContext(
+                sleeve_id=self.sleeve_id,
+                data=data,
+                portfolio=portfolio,
+                portfolio_targets=portfolio_target_batch,
+            )
+        )
+        order_sizing_ms = _elapsed_ms(started)
+
+        started = time.perf_counter()
         risk_decisions = self.risk_model.manage_risk(
             RiskManagementContext(
                 sleeve_id=self.sleeve_id,
                 data=data,
                 portfolio=portfolio,
-                targets=portfolio_target_batch.targets,
+                targets=order_sizing_batch.targets,
+                snapshot_quality=indicator_snapshot.quality_report,
             )
         )
         risk_ms = _elapsed_ms(started)
 
         started = time.perf_counter()
-        orders = tuple(
-            self.execution_model.create_orders(
-                self.sleeve_id,
-                portfolio,
-                data,
-                list(risk_decisions.approved_targets),
+        execution_batch = self.execution_engine.execute(
+            ExecutionContext(
+                sleeve_id=self.sleeve_id,
+                generated_at=data.time,
+                portfolio=portfolio,
+                data=data,
+                approved_targets=risk_decisions.approved_targets,
             )
         )
+        orders = execution_batch.order_intents
         execution_ms = _elapsed_ms(started)
 
         return FrameworkCycleResult(
@@ -208,12 +259,15 @@ class FrameworkRunner:
             insight_manager_update=manager_update,
             active_insights=active_insights,
             portfolio_target_batch=portfolio_target_batch,
+            order_sizing_batch=order_sizing_batch,
             risk_decisions=risk_decisions,
+            execution_batch=execution_batch,
             order_intents=orders,
             timings=StageTiming(
                 alpha_ms=alpha_ms,
                 insight_manager_ms=insight_manager_ms,
                 portfolio_ms=portfolio_ms,
+                order_sizing_ms=order_sizing_ms,
                 risk_ms=risk_ms,
                 execution_ms=execution_ms,
             ),

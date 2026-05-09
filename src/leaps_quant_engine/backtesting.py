@@ -7,12 +7,21 @@ import csv
 import math
 from typing import Any
 
+from leaps_quant_engine.cycle_journal import CycleJournalEntry, CycleJournalStore
 from leaps_quant_engine.framework import FrameworkCycleResult, FrameworkRunner
 from leaps_quant_engine.engine import Engine
+from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.history import get_daily_history
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataError, MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.orders import (
+    OrderCoordinator,
+    OrderEvent,
+    OrderIntentCollision,
+    OrderTicket,
+    SimulatedFillModel,
+)
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.universe.definition import UniverseDefinition
 
@@ -141,6 +150,9 @@ class BacktestMetrics:
 @dataclass(frozen=True, slots=True)
 class BacktestResult:
     orders: list[OrderIntent]
+    order_tickets: list[OrderTicket]
+    order_events: list[OrderEvent]
+    order_collisions: list[OrderIntentCollision]
     final_cash_by_sleeve: dict[str, float]
     final_quantity_by_sleeve: dict[str, dict[str, int]]
     metrics: BacktestMetrics
@@ -157,6 +169,10 @@ class BacktestResult:
             },
             "final_cash_by_sleeve": self.final_cash_by_sleeve,
             "final_quantity_by_sleeve": self.final_quantity_by_sleeve,
+            "order_ticket_count": len(self.order_tickets),
+            "order_event_count": len(self.order_events),
+            "order_collision_count": len(self.order_collisions),
+            "order_collisions": [collision.to_dict() for collision in self.order_collisions],
         }
 
 
@@ -165,6 +181,9 @@ class FrameworkBacktestResult:
     sleeve_id: str
     universe_id: str
     orders: list[OrderIntent]
+    order_tickets: list[OrderTicket]
+    order_events: list[OrderEvent]
+    order_collisions: list[OrderIntentCollision]
     framework_cycles: list[FrameworkCycleResult]
     final_cash: float
     final_quantity: dict[str, int]
@@ -199,6 +218,9 @@ class FrameworkBacktestResult:
             "framework_cycle_count": len(self.framework_cycles),
             "insight_count": self.insight_count,
             "order_count": self.order_count,
+            "order_ticket_count": len(self.order_tickets),
+            "order_event_count": len(self.order_events),
+            "order_collision_count": len(self.order_collisions),
             "framework_total_ms": self.framework_total_ms,
             "final_cash": self.final_cash,
             "final_quantity": dict(self.final_quantity),
@@ -206,6 +228,7 @@ class FrameworkBacktestResult:
         }
         if include_orders:
             payload["orders"] = [_order_to_report(order) for order in self.orders]
+            payload["order_collisions"] = [collision.to_dict() for collision in self.order_collisions]
         return payload
 
 
@@ -249,6 +272,11 @@ def run_framework_backtest(
     end: datetime | None = None,
     indicator_engine: IndicatorEngine | None = None,
     refresh_history: bool = False,
+    cycle_journal_store: CycleJournalStore | None = None,
+    runtime_id: str = "framework-backtest",
+    config_version: str = "",
+    account_id: str | None = None,
+    market_scope: str | None = None,
 ) -> FrameworkBacktestResult:
     feed = build_replay_feed(
         provider,
@@ -263,8 +291,13 @@ def run_framework_backtest(
 
     tracker = _SleeveBacktestTracker(sleeve_id=sleeve_id, initial_cash=portfolio.cash)
     orders: list[OrderIntent] = []
+    order_tickets: list[OrderTicket] = []
+    order_events: list[OrderEvent] = []
+    order_collisions: list[OrderIntentCollision] = []
     framework_cycles: list[FrameworkCycleResult] = []
     last_prices: dict[str, float] = {}
+    coordinator = OrderCoordinator()
+    fill_model = SimulatedFillModel()
 
     for index, data in enumerate(feed, start=1):
         for bar in data.bars.values():
@@ -282,17 +315,37 @@ def run_framework_backtest(
             data=data,
             portfolio=portfolio,
         )
+        if cycle_journal_store is not None:
+            cycle_journal_store.append(
+                CycleJournalEntry.from_framework_cycle(
+                    cycle,
+                    runtime_id=runtime_id,
+                    config_version=config_version,
+                    account_id=account_id,
+                    route_id=account_id,
+                    market_scope=market_scope,
+                )
+            )
         framework_cycles.append(cycle)
         orders.extend(cycle.order_intents)
-        for order in cycle.order_intents:
-            tracker.record_fill(order, data.time)
-            portfolio.apply_fill(order)
+        coordination = coordinator.coordinate((cycle.execution_batch,), generated_at=data.time)
+        fill_events = fill_model.fill(coordination.tickets, occurred_at=data.time)
+        order_tickets.extend(coordination.tickets)
+        order_events.extend(coordination.events)
+        order_events.extend(fill_events)
+        order_collisions.extend(coordination.collisions)
+        for event in fill_events:
+            tracker.record_fill_event(event)
+            portfolio.apply_order_event(event)
         tracker.record_snapshot(data.time, portfolio.cash, portfolio.holdings, last_prices)
 
     return FrameworkBacktestResult(
         sleeve_id=sleeve_id,
         universe_id=universe.id,
         orders=orders,
+        order_tickets=order_tickets,
+        order_events=order_events,
+        order_collisions=order_collisions,
         framework_cycles=framework_cycles,
         final_cash=portfolio.cash,
         final_quantity={
@@ -324,8 +377,13 @@ def run_framework_replay(
 
     tracker = _SleeveBacktestTracker(sleeve_id=sleeve_id, initial_cash=portfolio.cash)
     orders: list[OrderIntent] = []
+    order_tickets: list[OrderTicket] = []
+    order_events: list[OrderEvent] = []
+    order_collisions: list[OrderIntentCollision] = []
     framework_cycles: list[FrameworkCycleResult] = []
     last_prices: dict[str, float] = {}
+    coordinator = OrderCoordinator()
+    fill_model = SimulatedFillModel()
 
     for index, data in enumerate(sorted(feed, key=lambda item: item.time), start=1):
         for bar in data.bars.values():
@@ -345,15 +403,24 @@ def run_framework_replay(
         )
         framework_cycles.append(cycle)
         orders.extend(cycle.order_intents)
-        for order in cycle.order_intents:
-            tracker.record_fill(order, data.time)
-            portfolio.apply_fill(order)
+        coordination = coordinator.coordinate((cycle.execution_batch,), generated_at=data.time)
+        fill_events = fill_model.fill(coordination.tickets, occurred_at=data.time)
+        order_tickets.extend(coordination.tickets)
+        order_events.extend(coordination.events)
+        order_events.extend(fill_events)
+        order_collisions.extend(coordination.collisions)
+        for event in fill_events:
+            tracker.record_fill_event(event)
+            portfolio.apply_order_event(event)
         tracker.record_snapshot(data.time, portfolio.cash, portfolio.holdings, last_prices)
 
     return FrameworkBacktestResult(
         sleeve_id=sleeve_id,
         universe_id=universe.id,
         orders=orders,
+        order_tickets=order_tickets,
+        order_events=order_events,
+        order_collisions=order_collisions,
         framework_cycles=framework_cycles,
         final_cash=portfolio.cash,
         final_quantity={
@@ -381,22 +448,47 @@ def run_backtest(
     feed = build_replay_feed(provider, symbols, start=start, end=end)
     engine.initialize()
     result_orders: list[OrderIntent] = []
+    result_order_tickets: list[OrderTicket] = []
+    result_order_events: list[OrderEvent] = []
+    result_order_collisions: list[OrderIntentCollision] = []
     trackers = {
         sleeve.id: _SleeveBacktestTracker(sleeve_id=sleeve.id, initial_cash=sleeve.portfolio.cash)
         for sleeve in engine.sleeves
     }
+    sleeve_by_id = {sleeve.id: sleeve for sleeve in engine.sleeves}
+    coordinator = OrderCoordinator()
+    fill_model = SimulatedFillModel()
     last_prices: dict[str, float] = {}
     for data in feed:
         for bar in data.bars.values():
             last_prices[bar.symbol.key] = bar.close
+        batches: list[OrderIntentBatch] = []
         for sleeve in engine.sleeves:
             targets = sleeve.on_data(data)
             orders = engine.execution_model.create_orders(sleeve.id, sleeve.portfolio, data, targets)
             result_orders.extend(orders)
+            if orders:
+                batches.append(
+                    OrderIntentBatch(
+                        sleeve_id=sleeve.id,
+                        generated_at=data.time,
+                        order_intents=tuple(orders),
+                        model_name=type(engine.execution_model).__name__,
+                        reason="legacy_backtest_execution",
+                    )
+                )
+        coordination = coordinator.coordinate(tuple(batches), generated_at=data.time)
+        fill_events = fill_model.fill(coordination.tickets, occurred_at=data.time)
+        result_order_tickets.extend(coordination.tickets)
+        result_order_events.extend(coordination.events)
+        result_order_events.extend(fill_events)
+        result_order_collisions.extend(coordination.collisions)
+        for event in fill_events:
+            tracker = trackers[event.sleeve_id]
+            tracker.record_fill_event(event)
+            sleeve_by_id[event.sleeve_id].portfolio.apply_order_event(event)
+        for sleeve in engine.sleeves:
             tracker = trackers[sleeve.id]
-            for order in orders:
-                tracker.record_fill(order, data.time)
-                sleeve.portfolio.apply_fill(order)
             tracker.record_snapshot(data.time, sleeve.portfolio.cash, sleeve.portfolio.holdings, last_prices)
 
     snapshots_by_sleeve = {
@@ -413,6 +505,9 @@ def run_backtest(
     }
     return BacktestResult(
         orders=result_orders,
+        order_tickets=result_order_tickets,
+        order_events=result_order_events,
+        order_collisions=result_order_collisions,
         final_cash_by_sleeve={sleeve.id: sleeve.portfolio.cash for sleeve in engine.sleeves},
         final_quantity_by_sleeve={
             sleeve.id: {
@@ -453,7 +548,19 @@ class _SleeveBacktestTracker:
                 _OpenLot(quantity=order.quantity, price=order.reference_price, time=time)
             )
             return
-        self._close_lots(order, time)
+        self._close_lots(order.symbol, order.quantity, order.reference_price, time)
+
+    def record_fill_event(self, event: OrderEvent) -> None:
+        if not event.is_fill or event.quantity <= 0 or event.fill_price is None:
+            return
+        self.order_count += 1
+        self.traded_notional += event.notional
+        if event.side is OrderSide.BUY:
+            self.lots_by_symbol.setdefault(event.symbol.key, []).append(
+                _OpenLot(quantity=event.quantity, price=event.fill_price, time=event.occurred_at)
+            )
+            return
+        self._close_lots(event.symbol, event.quantity, event.fill_price, event.occurred_at)
 
     def record_snapshot(
         self,
@@ -486,9 +593,9 @@ class _SleeveBacktestTracker:
             order_count=self.order_count,
         )
 
-    def _close_lots(self, order: OrderIntent, time: datetime) -> None:
-        remaining = order.quantity
-        lots = self.lots_by_symbol.get(order.symbol.key, [])
+    def _close_lots(self, symbol: Symbol, quantity: int, price: float, time: datetime) -> None:
+        remaining = quantity
+        lots = self.lots_by_symbol.get(symbol.key, [])
         total_cost = 0.0
         total_holding_days = 0.0
         closed_quantity = 0
@@ -505,7 +612,7 @@ class _SleeveBacktestTracker:
             if lot.quantity == 0:
                 lots.pop(0)
         if not lots:
-            self.lots_by_symbol.pop(order.symbol.key, None)
+            self.lots_by_symbol.pop(symbol.key, None)
         if closed_quantity == 0:
             return
         average_entry_price = total_cost / closed_quantity
@@ -513,13 +620,13 @@ class _SleeveBacktestTracker:
         self.closed_trades.append(
             ClosedTrade(
                 sleeve_id=self.sleeve_id,
-                symbol=order.symbol,
+                symbol=symbol,
                 entry_time=entry_time or time,
                 exit_time=time,
                 quantity=closed_quantity,
                 average_entry_price=average_entry_price,
-                exit_price=order.reference_price,
-                pnl=(order.reference_price * closed_quantity) - total_cost,
+                exit_price=price,
+                pnl=(price * closed_quantity) - total_cost,
                 holding_days=average_holding_days,
             )
         )

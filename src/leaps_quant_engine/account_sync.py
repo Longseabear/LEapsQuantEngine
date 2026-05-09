@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from leaps_quant_engine.adapters.kis import BrokerEngineClient
+from leaps_quant_engine.broker_routing import currency_for_market_scope
 from leaps_quant_engine.models import OrderSide, Symbol
 from leaps_quant_engine.settings import load_kis_settings
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
@@ -115,6 +116,7 @@ class KISVirtualAccountSync:
         if sync_cash:
             cash_reconciliation = store.sync_account_cash(
                 balance,
+                currency=currency_for_market_scope(market),
                 residual_sleeve_id=residual_sleeve_id,
             ).to_dict()
             touched_sleeves = set(report_sleeve_ids) | {residual_sleeve_id}
@@ -243,6 +245,7 @@ def _require_domestic_account_market(market: str) -> None:
 def _portfolio_report(portfolio) -> dict[str, Any]:
     return {
         "cash": portfolio.cash,
+        "cash_by_currency": dict(portfolio.cash_by_currency),
         "holding_count": len(portfolio.holdings),
         "holdings": [
             {

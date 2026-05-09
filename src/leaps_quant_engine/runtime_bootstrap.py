@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import import_module
 import importlib.util
 import inspect
@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketDataEngineLiveQuoteProvider
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader
+from leaps_quant_engine.execution import ExecutionEngine
+from leaps_quant_engine.execution_model_loader import PythonExecutionModelLoader
 from leaps_quant_engine.framework import (
     FrameworkCycleResult,
     FrameworkRunner,
@@ -55,6 +57,7 @@ class RuntimeBootstrapDependencies:
     alpha_loader: PythonAlphaLoader = PythonAlphaLoader()
     portfolio_model_loader: PythonPortfolioConstructionModelLoader = PythonPortfolioConstructionModelLoader()
     risk_model_loader: PythonRiskManagementModelLoader = PythonRiskManagementModelLoader()
+    execution_model_loader: PythonExecutionModelLoader = PythonExecutionModelLoader()
     portfolio_provider: PortfolioProvider | None = None
 
     def __post_init__(self) -> None:
@@ -80,6 +83,7 @@ class RuntimeSleeveRuntime:
     active_result: ActiveUniverseResult
     fine_runtime: FineUniverseRuntime | None = None
     fine_refresh_report: FineUniverseRefreshReport | None = None
+    _pending_reload: RuntimeSleeveRuntime | None = field(default=None, init=False, repr=False)
 
     @property
     def runtime_id(self) -> str:
@@ -120,6 +124,80 @@ class RuntimeSleeveRuntime:
             extra={"engine_status": status},
         )
         return report
+
+    def stage_reload(
+        self,
+        snapshot: RuntimeConfigSnapshot,
+        *,
+        dependencies: RuntimeBootstrapDependencies | None = None,
+        refresh_fine: bool = False,
+    ) -> "RuntimeSleeveReloadReport":
+        pending = bootstrap_sleeve_runtime(
+            snapshot,
+            self.sleeve_id,
+            dependencies=dependencies,
+            refresh_fine=refresh_fine,
+            previous_live_symbols=tuple(self.active_result.active_universe.symbols),
+            held_symbols=self.portfolio.held_symbols,
+        )
+        dry_run = self._dry_run_pending_reload(pending)
+        self._pending_reload = pending
+        return RuntimeSleeveReloadReport(
+            sleeve_id=self.sleeve_id,
+            previous_version=self.config_version,
+            staged_version=snapshot.version,
+            dry_run_framework_ran=dry_run is not None,
+            dry_run_order_intent_count=len(dry_run.order_intents) if dry_run is not None else 0,
+            activated=False,
+        )
+
+    def activate_staged_reload(self) -> "RuntimeSleeveReloadReport":
+        pending = self._pending_reload
+        if pending is None:
+            return RuntimeSleeveReloadReport(
+                sleeve_id=self.sleeve_id,
+                previous_version=self.config_version,
+                staged_version=self.config_version,
+                dry_run_framework_ran=False,
+                dry_run_order_intent_count=0,
+                activated=False,
+                reason="no_staged_reload",
+            )
+        previous_version = self.config_version
+        self.snapshot = pending.snapshot
+        self.sleeve_config = pending.sleeve_config
+        self.coarse_universe = pending.coarse_universe
+        self.selection_model = pending.selection_model
+        self.live_provider = pending.live_provider
+        self.history_provider = pending.history_provider
+        self.alpha_runtime = pending.alpha_runtime
+        self.framework_runner = pending.framework_runner
+        self.portfolio_provider = pending.portfolio_provider
+        self.portfolio = pending.portfolio
+        self.worker = pending.worker
+        self.active_result = pending.active_result
+        self.fine_runtime = pending.fine_runtime
+        self.fine_refresh_report = pending.fine_refresh_report
+        self._pending_reload = None
+        return RuntimeSleeveReloadReport(
+            sleeve_id=self.sleeve_id,
+            previous_version=previous_version,
+            staged_version=self.config_version,
+            dry_run_framework_ran=False,
+            dry_run_order_intent_count=0,
+            activated=True,
+        )
+
+    def _dry_run_pending_reload(self, pending: "RuntimeSleeveRuntime") -> FrameworkCycleResult | None:
+        active_snapshot_store = self.worker.stores_by_sleeve.get(self.sleeve_id)
+        active_snapshot = active_snapshot_store.active() if active_snapshot_store is not None else None
+        if active_snapshot is None:
+            return None
+        return pending.framework_runner.run_once(
+            indicator_snapshot=active_snapshot,
+            data=_data_slice_from_indicator_snapshot(active_snapshot),
+            portfolio=self.portfolio_provider.current_portfolio(self.sleeve_id),
+        )
 
     def _run_framework_once(self) -> FrameworkCycleResult | None:
         indicator_snapshot = self.worker.stores_by_sleeve.get(self.sleeve_id, None)
@@ -182,8 +260,14 @@ class RuntimeSleeveRuntime:
             "framework": {
                 "ran": framework is not None,
                 "active_insight_count": framework.active_insight_count if framework is not None else 0,
-                "target_count": framework.portfolio_target_batch.target_count if framework is not None else 0,
-                "plan_count": framework.portfolio_target_batch.plan_count if framework is not None else 0,
+                "allocation_target_count": framework.portfolio_target_batch.target_count
+                if framework is not None
+                else 0,
+                "allocation_plan_count": framework.portfolio_target_batch.plan_count
+                if framework is not None
+                else 0,
+                "target_count": framework.order_sizing_batch.target_count if framework is not None else 0,
+                "plan_count": framework.order_sizing_batch.plan_count if framework is not None else 0,
                 "risk_decision_count": len(framework.risk_decisions.decisions) if framework is not None else 0,
                 "approved_target_count": len(framework.risk_decisions.approved_targets) if framework is not None else 0,
                 "order_intent_count": len(framework.order_intents) if framework is not None else 0,
@@ -238,6 +322,28 @@ class RuntimeRunOnceReport:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeSleeveReloadReport:
+    sleeve_id: str
+    previous_version: str
+    staged_version: str
+    dry_run_framework_ran: bool
+    dry_run_order_intent_count: int
+    activated: bool
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sleeve_id": self.sleeve_id,
+            "previous_version": self.previous_version,
+            "staged_version": self.staged_version,
+            "dry_run_framework_ran": self.dry_run_framework_ran,
+            "dry_run_order_intent_count": self.dry_run_order_intent_count,
+            "activated": self.activated,
+            "reason": self.reason,
+        }
+
+
 def bootstrap_sleeve_runtime(
     snapshot: RuntimeConfigSnapshot,
     sleeve_id: str | None = None,
@@ -261,6 +367,7 @@ def bootstrap_sleeve_runtime(
     alpha_runtime = _build_alpha_runtime(snapshot, sleeve_config, deps.alpha_loader)
     portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
     risk_model = _build_risk_model(snapshot, sleeve_config, deps.risk_model_loader)
+    execution_engine = _build_execution_engine(snapshot, sleeve_config, deps.execution_model_loader)
     selection_model = _build_selection_model(sleeve_config.universe.active.selection_model, sleeve_config, snapshot)
 
     selection_base_universe = coarse_universe
@@ -273,6 +380,7 @@ def bootstrap_sleeve_runtime(
         alpha_runtime=alpha_runtime,
         portfolio_engine=portfolio_engine,
         risk_model=risk_model,
+        execution_engine=execution_engine,
     )
     if sleeve_config.universe.fine.enabled:
         fine_runtime = FineUniverseRuntime(
@@ -384,19 +492,41 @@ def _build_risk_model(
     return risk_model_loader.load(model_ref, parameters=risk_config.parameters).model
 
 
+def _build_execution_engine(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_config: SleeveRuntimeConfig,
+    execution_model_loader: PythonExecutionModelLoader,
+) -> ExecutionEngine:
+    execution_config = sleeve_config.execution
+    model_ref = _resolve_model_reference(snapshot, sleeve_config, execution_config.model.ref)
+    model = execution_model_loader.load(model_ref, parameters=execution_config.parameters).model
+    return ExecutionEngine(model=model)
+
+
 def _build_portfolio_provider(
     snapshot: RuntimeConfigSnapshot,
     sleeve_config: SleeveRuntimeConfig,
 ) -> PortfolioProvider:
+    if sleeve_config.portfolio.account_store_path is None:
+        default_cash_by_sleeve = {
+            sleeve.sleeve_id: sleeve.cash
+            for sleeve in snapshot.config.sleeves
+        }
+        return StaticPortfolioProvider(default_cash_by_sleeve=default_cash_by_sleeve)
+    default_currency = "KRW"
+    if sleeve_config.broker_account_id:
+        try:
+            default_currency = snapshot.config.broker_account(sleeve_config.broker_account_id).currency
+        except KeyError:
+            default_currency = "KRW"
     default_cash_by_sleeve = {
-        sleeve.sleeve_id: sleeve.cash
+        sleeve.sleeve_id: float(dict(getattr(sleeve, "cash_by_currency", {}) or {}).get(default_currency, sleeve.cash))
         for sleeve in snapshot.config.sleeves
     }
-    if sleeve_config.portfolio.account_store_path is None:
-        return StaticPortfolioProvider(default_cash_by_sleeve=default_cash_by_sleeve)
     return VirtualSleeveAccountStore(
         resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
         default_cash_by_sleeve=default_cash_by_sleeve,
+        default_currency=default_currency,
     )
 
 

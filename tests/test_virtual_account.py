@@ -409,3 +409,78 @@ def test_virtual_sleeve_account_transfers_cash_between_sleeves(tmp_path):
     assert event.amount == 250_000
     assert store.current_portfolio("default sleeve").cash == 750_000
     assert store.current_portfolio("LEaps").cash == 250_000
+
+
+def test_virtual_sleeve_account_keeps_krw_and_usd_cash_separate(tmp_path):
+    store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+        default_currency="KRW",
+    )
+    domestic = Symbol("005930", "KRX")
+    overseas = Symbol("NVDA", "NAS")
+
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="kr-buy",
+            order_id="kr-order",
+            sleeve_id="LEaps",
+            symbol=domestic,
+            side=OrderSide.BUY,
+            quantity=2,
+            fill_price=100_000,
+            filled_at=datetime(2026, 5, 10, 9, 1),
+        )
+    )
+    store.sync_account_cash(
+        {"cash_balance": 5_000, "currency": "USD"},
+        account_id="kis-overseas",
+        currency="USD",
+        residual_sleeve_id="default sleeve",
+    )
+    store.transfer_cash(
+        from_sleeve_id="default sleeve",
+        to_sleeve_id="LEaps",
+        amount=1_000,
+        account_id="kis-overseas",
+        currency="USD",
+    )
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="us-buy",
+            order_id="us-order",
+            sleeve_id="LEaps",
+            symbol=overseas,
+            side=OrderSide.BUY,
+            quantity=1,
+            fill_price=250,
+            filled_at=datetime(2026, 5, 10, 23, 1),
+        )
+    )
+
+    portfolio = store.current_portfolio("LEaps")
+
+    assert portfolio.cash_by_currency == {"KRW": 800_000.0, "USD": 750.0}
+    assert portfolio.cash_for_currency("KRW") == 800_000
+    assert portfolio.cash_for_currency("USD") == 750
+    assert portfolio.cash == 800_750
+
+
+def test_virtual_sleeve_account_cash_reconciliation_is_currency_scoped(tmp_path):
+    store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 100_000, "default sleeve": 0},
+    )
+    store.current_portfolio("LEaps")
+    report = store.sync_account_cash(
+        {"cash_balance": 10_000, "currency": "USD"},
+        account_id="kis-overseas",
+        currency="USD",
+        residual_sleeve_id="default sleeve",
+    )
+
+    assert report.currency == "USD"
+    assert report.sleeve_cash["LEaps"] == 0
+    assert report.sleeve_cash["default sleeve"] == 10_000
+    assert store.current_portfolio("LEaps").cash_by_currency == {"KRW": 100_000.0}
+    assert store.current_portfolio("default sleeve").cash_by_currency == {"USD": 10_000.0}

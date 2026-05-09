@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
+from leaps_quant_engine.execution import ImmediateExecutionModel
 from leaps_quant_engine.framework import EqualWeightPortfolioConstructionModel
 from leaps_quant_engine.framework import BasicRiskManagementModel, RiskLimits
 from leaps_quant_engine.models import Bar, OrderSide, Symbol
@@ -106,6 +107,21 @@ class FakeRiskModelLoader:
         )
 
 
+class FakeExecutionModelLoader:
+    def __init__(self):
+        self.calls = []
+
+    def load(self, ref, *, parameters=None):
+        params = dict(parameters or {})
+        self.calls.append((ref, params))
+        return SimpleNamespace(
+            model=ImmediateExecutionModel(),
+            ref=ref,
+            parameters=params,
+            model_name="ImmediateExecutionModel",
+        )
+
+
 def _bar(symbol: Symbol, close: float) -> Bar:
     return Bar(
         symbol=symbol,
@@ -200,6 +216,10 @@ def _write_runtime_config(
                                 "cash_buffer_pct": 0.05,
                             },
                         },
+                        "execution": {
+                            "module": "execution.py",
+                            "params": {},
+                        },
                         "worker": {
                             "cycle_interval_seconds": 0,
                             "min_success": worker_min_success,
@@ -223,6 +243,7 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
     alpha_loader = FakeAlphaLoader()
     portfolio_model_loader = FakePortfolioModelLoader()
     risk_model_loader = FakeRiskModelLoader()
+    execution_model_loader = FakeExecutionModelLoader()
     provider_calls = {}
 
     def live_provider_factory(universe, rate_limit_per_second):
@@ -239,6 +260,7 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
             alpha_loader=alpha_loader,
             portfolio_model_loader=portfolio_model_loader,
             risk_model_loader=risk_model_loader,
+            execution_model_loader=execution_model_loader,
         ),
         held_symbols=(Symbol("IBM", "US"),),
     )
@@ -249,6 +271,7 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
     assert risk_model_loader.calls == [
         (str(tmp_path / "risk.py"), {"long_only": True, "max_position_pct": 0.4, "cash_buffer_pct": 0.05})
     ]
+    assert execution_model_loader.calls == [(str(tmp_path / "execution.py"), {})]
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.cash_reserve_pct == 0.1
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.min_order_notional == 1000
     assert runtime.framework_runner.risk_model.limits.max_position_pct == 0.4
@@ -282,6 +305,7 @@ def test_bootstrapped_runtime_can_run_one_worker_cycle(tmp_path):
             alpha_loader=FakeAlphaLoader(),
             portfolio_model_loader=FakePortfolioModelLoader(),
             risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
         ),
         held_symbols=(Symbol("IBM", "US"),),
     )
@@ -341,6 +365,7 @@ def test_runtime_fetches_current_portfolio_for_leaps_sleeve(tmp_path):
             alpha_loader=FakeAlphaLoader(),
             portfolio_model_loader=FakePortfolioModelLoader(),
             risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
             portfolio_provider=provider,
         ),
         held_symbols=(held,),
@@ -402,6 +427,7 @@ def test_runtime_uses_virtual_sleeve_account_store_from_config(tmp_path):
             alpha_loader=FakeAlphaLoader(),
             portfolio_model_loader=FakePortfolioModelLoader(),
             risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
         ),
         held_symbols=(symbol,),
     )
@@ -432,6 +458,7 @@ def test_runtime_logs_agent_readable_engine_status(tmp_path, caplog):
             alpha_loader=FakeAlphaLoader(),
             portfolio_model_loader=FakePortfolioModelLoader(),
             risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
         ),
     )
 
@@ -472,6 +499,7 @@ def test_runtime_resolves_strategy_modules_from_sleeve_workspace(tmp_path):
     alpha_loader = FakeAlphaLoader()
     portfolio_model_loader = FakePortfolioModelLoader()
     risk_model_loader = FakeRiskModelLoader()
+    execution_model_loader = FakeExecutionModelLoader()
 
     runtime = bootstrap_sleeve_runtime(
         snapshot,
@@ -482,6 +510,7 @@ def test_runtime_resolves_strategy_modules_from_sleeve_workspace(tmp_path):
             alpha_loader=alpha_loader,
             portfolio_model_loader=portfolio_model_loader,
             risk_model_loader=risk_model_loader,
+            execution_model_loader=execution_model_loader,
         ),
     )
 
@@ -491,3 +520,48 @@ def test_runtime_resolves_strategy_modules_from_sleeve_workspace(tmp_path):
     assert risk_model_loader.calls == [
         (str(workspace_path / "risk.py"), {"long_only": True, "max_position_pct": 0.4, "cash_buffer_pct": 0.05})
     ]
+    assert execution_model_loader.calls == [(str(workspace_path / "execution.py"), {})]
+
+
+def test_runtime_can_stage_dry_run_and_activate_sleeve_reload(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    initial_config_path = tmp_path / "runtime_initial.json"
+    updated_config_path = tmp_path / "runtime_updated.json"
+    _write_universe(universe_path)
+    _write_runtime_config(initial_config_path, universe_path, sleeve_id="LEaps", worker_min_success=1)
+    _write_runtime_config(updated_config_path, universe_path, sleeve_id="LEaps", worker_min_success=1)
+    payload = json.loads(updated_config_path.read_text(encoding="utf-8"))
+    payload["runtime_id"] = "live-us-test-updated"
+    payload["sleeves"][0]["risk"]["params"]["max_position_pct"] = 0.2
+    updated_config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    initial_snapshot = load_runtime_config_snapshot(initial_config_path)
+    updated_snapshot = load_runtime_config_snapshot(updated_config_path)
+    symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
+    dependencies = RuntimeBootstrapDependencies(
+        live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
+        history_provider_factory=lambda: FakeHistoryProvider(),
+        alpha_loader=FakeAlphaLoader(),
+        portfolio_model_loader=FakePortfolioModelLoader(),
+        risk_model_loader=FakeRiskModelLoader(),
+        execution_model_loader=FakeExecutionModelLoader(),
+    )
+    runtime = bootstrap_sleeve_runtime(initial_snapshot, "LEaps", dependencies=dependencies)
+    runtime.run_once()
+
+    stage_report = runtime.stage_reload(updated_snapshot, dependencies=dependencies)
+
+    assert stage_report.previous_version == initial_snapshot.version
+    assert stage_report.staged_version == updated_snapshot.version
+    assert stage_report.dry_run_framework_ran is True
+    assert runtime.config_version == initial_snapshot.version
+
+    activate_report = runtime.activate_staged_reload()
+
+    assert activate_report.activated is True
+    assert activate_report.previous_version == initial_snapshot.version
+    assert activate_report.staged_version == updated_snapshot.version
+    assert runtime.config_version == updated_snapshot.version
+    assert runtime.runtime_id == "live-us-test-updated"
+    assert runtime.framework_runner.risk_model.limits.max_position_pct == 0.2

@@ -63,14 +63,17 @@ def test_portfolio_engine_state_tracks_target_risk_and_pending_buy_order():
     )
 
     assert state.current.equity == 1_000.0
+    assert state.allocation_batch.target_count == 1
+    assert state.allocation_batch.plans[0].target_percent == 1.0
     assert state.target_batch.target_count == 1
-    assert state.target_batch.plans[0].target_quantity == 5
+    assert state.target_batch.plans[0].target_quantity == 10
     assert state.risk_decisions.approved_targets == state.target_batch.targets
     assert state.pending.order_intent_count == 1
-    assert state.pending.reserved_cash == 500.0
+    assert state.pending.reserved_cash == 1_000.0
     assert state.pending.reserved_sell_quantities == {}
     payload = state.to_dict()
-    assert payload["target"]["plans"][0]["delta_quantity"] == 5
+    assert payload["allocation"]["plans"][0]["target_percent"] == 1.0
+    assert payload["target"]["plans"][0]["delta_quantity"] == 10
     assert payload["pending"]["order_intents"][0]["side"] == "buy"
 
 
@@ -97,10 +100,10 @@ def test_portfolio_engine_state_tracks_pending_sell_quantity():
 
     assert state.current.equity == 300.0
     assert state.target_batch.plans[0].current_quantity == 2
-    assert state.target_batch.plans[0].target_quantity == 1
-    assert cycle.order_intents[0].side is OrderSide.SELL
-    assert state.pending.reserved_cash == 0.0
-    assert state.pending.reserved_sell_quantities == {"US:NVDA": 1}
+    assert state.target_batch.plans[0].target_quantity == 3
+    assert cycle.order_intents[0].side is OrderSide.BUY
+    assert state.pending.reserved_cash == 100.0
+    assert state.pending.reserved_sell_quantities == {}
 
 
 def _run_framework_cycle(

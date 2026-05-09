@@ -5,8 +5,11 @@ import pytest
 from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.framework import (
     EqualWeightPortfolioConstructionModel,
+    OrderSizingContext,
+    OrderSizingEngine,
     PortfolioConstructionContext,
     PortfolioConstructionEngine,
+    PortfolioAllocationTarget,
     RebalancePolicy,
 )
 from leaps_quant_engine.models import Bar, DataSlice, PortfolioTarget, Symbol
@@ -64,11 +67,23 @@ def test_portfolio_construction_engine_creates_target_batch_with_cash_reserve():
     assert batch.sleeve_id == "test-sleeve"
     assert batch.model_name == "EqualWeightPortfolioConstructionModel"
     assert batch.source_insight_ids == tuple(insight.insight_id for insight in insights)
-    assert {target.symbol.key: target.quantity for target in batch.targets} == {
-        "US:AAA": 4,
-        "US:BBB": 8,
+    assert {target.symbol.key: target.target_percent for target in batch.targets} == {
+        "US:AAA": pytest.approx(0.5),
+        "US:BBB": pytest.approx(0.5),
     }
-    assert {plan.target.symbol.key: plan.delta_quantity for plan in batch.plans} == {
+    assert {plan.target.symbol.key: plan.desired_value for plan in batch.plans} == {
+        "US:AAA": pytest.approx(400),
+        "US:BBB": pytest.approx(400),
+    }
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=data,
+            portfolio=Portfolio(cash=1_000),
+            portfolio_targets=batch,
+        )
+    )
+    assert {plan.allocation.symbol.key: plan.delta_quantity for plan in sized.plans} == {
         "US:AAA": 4,
         "US:BBB": 8,
     }
@@ -98,12 +113,22 @@ def test_rebalance_policy_filters_small_target_delta():
         )
     )
 
-    assert batch.targets == ()
-    assert batch.plans == ()
+    assert batch.targets == (PortfolioAllocationTarget(symbol=symbol, target_percent=1.0, tag="static"),)
+    assert len(batch.plans) == 1
+    sized = OrderSizingEngine(rebalance_policy=RebalancePolicy(min_order_notional=200.0)).size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 100.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+    assert sized.targets == ()
+    assert sized.plans == ()
     assert batch.metadata["raw_target_count"] == 1
-    assert batch.metadata["filtered_target_count"] == 0
+    assert sized.metadata["filtered_target_count"] == 0
     assert batch.metadata["raw_plan_count"] == 1
-    assert batch.metadata["filtered_plan_count"] == 0
+    assert sized.metadata["filtered_plan_count"] == 0
 
 
 def test_rebalance_policy_preserves_small_exit_targets_by_default():
@@ -125,12 +150,21 @@ def test_rebalance_policy_preserves_small_exit_targets_by_default():
         )
     )
 
-    assert batch.targets == (target,)
+    assert batch.targets == (PortfolioAllocationTarget(symbol=symbol, target_percent=0.0, tag="exit"),)
     assert len(batch.plans) == 1
-    assert batch.plans[0].current_quantity == 1
-    assert batch.plans[0].target_quantity == 0
-    assert batch.plans[0].delta_quantity == -1
-    assert batch.plans[0].is_exit is True
+    sized = OrderSizingEngine(rebalance_policy=RebalancePolicy(min_order_notional=1_000.0)).size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 100.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+    assert sized.targets == (target,)
+    assert sized.plans[0].current_quantity == 1
+    assert sized.plans[0].target_quantity == 0
+    assert sized.plans[0].delta_quantity == -1
+    assert sized.plans[0].is_exit is True
 
 
 def test_equal_weight_model_flattens_current_holding_without_active_insight():
@@ -148,13 +182,21 @@ def test_equal_weight_model_flattens_current_holding_without_active_insight():
         )
     )
 
-    assert batch.targets == (PortfolioTarget(symbol=held, quantity=0, tag="framework:insight_inactive"),)
+    assert batch.targets == (PortfolioAllocationTarget(symbol=held, target_percent=0.0, tag="framework:insight_inactive"),)
     assert batch.plans[0].current_quantity == 3
-    assert batch.plans[0].target_quantity == 0
     assert batch.plans[0].current_price == 30.0
     assert batch.plans[0].current_value == pytest.approx(90.0)
-    assert batch.plans[0].target_value == pytest.approx(0.0)
-    assert batch.plans[0].delta_value == pytest.approx(-90.0)
+    assert batch.plans[0].desired_value == pytest.approx(0.0)
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(held, 30.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+    assert sized.targets == (PortfolioTarget(symbol=held, quantity=0, tag="framework:insight_inactive"),)
+    assert sized.plans[0].delta_quantity == -3
 
 
 def test_portfolio_target_batch_serializes_target_plans():
@@ -174,6 +216,17 @@ def test_portfolio_target_batch_serializes_target_plans():
     assert payload["plan_count"] == 1
     assert payload["plans"][0]["symbol"] == "US:AAA"
     assert payload["plans"][0]["current_quantity"] == 0
-    assert payload["plans"][0]["target_quantity"] == 2
-    assert payload["plans"][0]["delta_quantity"] == 2
-    assert payload["plans"][0]["target_value"] == pytest.approx(100.0)
+    assert payload["plans"][0]["target_percent"] == pytest.approx(0.1)
+    assert payload["plans"][0]["desired_value"] == pytest.approx(100.0)
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 50.0)),
+            portfolio=Portfolio(cash=1_000),
+            portfolio_targets=batch,
+        )
+    )
+    sized_payload = sized.to_dict()
+    assert sized_payload["plans"][0]["target_quantity"] == 2
+    assert sized_payload["plans"][0]["delta_quantity"] == 2
+    assert sized_payload["plans"][0]["rounded_value"] == pytest.approx(100.0)
