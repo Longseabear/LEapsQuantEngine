@@ -14,7 +14,7 @@ from leaps_quant_engine.framework.portfolio_construction import (
     PortfolioTargetBatch,
 )
 from leaps_quant_engine.framework.risk import (
-    PassThroughRiskManagementModel,
+    BasicRiskManagementModel,
     RiskDecisionBatch,
     RiskManagementContext,
     RiskManagementModel,
@@ -144,7 +144,7 @@ class FrameworkRunner:
         if self.portfolio_engine is None:
             self.portfolio_engine = PortfolioConstructionEngine(model=self.portfolio_model)
         if self.risk_model is None:
-            self.risk_model = PassThroughRiskManagementModel()
+            self.risk_model = BasicRiskManagementModel()
         if self.execution_model is None:
             self.execution_model = ImmediateExecutionModel()
 

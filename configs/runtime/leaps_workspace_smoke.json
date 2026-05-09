@@ -1,0 +1,115 @@
+{
+  "runtime_id": "leaps-workspace-smoke",
+  "mode": "live",
+  "timezone": "Asia/Seoul",
+  "market_data": {
+    "provider": "market-data-engine",
+    "history_provider": "kis-cache",
+    "source": "market-data-engine",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 20
+  },
+  "sleeves": [
+    {
+      "sleeve_id": "LEaps",
+      "workspace_path": "sleeves/LEaps",
+      "cash": 100000,
+      "universe": {
+        "coarse_path": "configs/universes/us_live_smoke.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 2,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"
+        }
+      },
+      "indicators": {
+        "warmup_enabled": false,
+        "extra_bars": 0,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/momentum.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/volatility_trailing_stop.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/etf_rotation.py",
+            "enabled": true
+          }
+        ]
+      },
+      "portfolio": {
+        "model": "portfolios/equal_weight.py",
+        "account_store_path": "../../data/virtual-accounts/leaps_workspace_smoke.json",
+        "parameters": {
+          "max_portfolio_pct": 1.0,
+          "long_only": true
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.0,
+          "min_order_notional": 0.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true
+        }
+      },
+      "risk": {
+        "model": "risks/basic.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct": 0.35,
+          "cash_buffer_pct": 0.03
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 60,
+        "min_success": 1
+      }
+    },
+    {
+      "sleeve_id": "default sleeve",
+      "name": "default sleeve",
+      "workspace_path": "sleeves/default sleeve",
+      "cash": 0,
+      "universe": {
+        "coarse_path": "configs/universes/us_live_smoke.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 0,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"
+        }
+      },
+      "indicators": {
+        "warmup_enabled": false,
+        "extra_bars": 0,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": []
+      },
+      "portfolio": {
+        "account_store_path": "../../data/virtual-accounts/leaps_workspace_smoke.json"
+      },
+      "worker": {
+        "cycle_interval_seconds": 60
+      }
+    }
+  ],
+  "metadata": {
+    "description": "Smoke runtime proving sleeve-specific strategy modules resolve from sleeves/LEaps."
+  }
+}

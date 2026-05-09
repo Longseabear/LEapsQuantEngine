@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from importlib import import_module
 import importlib.util
 import inspect
+import json
+import logging
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
@@ -15,11 +17,13 @@ from leaps_quant_engine.framework import (
     FrameworkRunner,
     PortfolioConstructionEngine,
     PythonPortfolioConstructionModelLoader,
+    PythonRiskManagementModelLoader,
     RebalancePolicy,
 )
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
+from leaps_quant_engine.portfolio_state import PortfolioEngineState
 from leaps_quant_engine.runtime_config import ModuleReference, RuntimeConfigSnapshot, SleeveRuntimeConfig
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker, SnapshotWorkerRunReport
 from leaps_quant_engine.snapshots import IndicatorSnapshot
@@ -28,12 +32,15 @@ from leaps_quant_engine.universe.fine import FineUniverseRefreshReport, FineUniv
 from leaps_quant_engine.universe.loader import load_universe_definition
 from leaps_quant_engine.universe.runtime import ActiveUniverseResult, UniverseSelectionRuntime
 from leaps_quant_engine.universe.selection import UniverseSelectionModel
+from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 from leaps_quant_engine.warmup import WarmupPolicy
 
 
 class RuntimeBootstrapError(RuntimeError):
     """Raised when a runtime config snapshot cannot be converted into executable objects."""
 
+
+agent_status_logger = logging.getLogger("leaps_quant_engine.agent_status")
 
 LiveProviderFactory = Callable[[UniverseDefinition, int | None], MarketDataProvider]
 HistoryProviderFactory = Callable[[], MarketDataProvider]
@@ -47,6 +54,8 @@ class RuntimeBootstrapDependencies:
     history_provider_factory: HistoryProviderFactory = None  # type: ignore[assignment]
     alpha_loader: PythonAlphaLoader = PythonAlphaLoader()
     portfolio_model_loader: PythonPortfolioConstructionModelLoader = PythonPortfolioConstructionModelLoader()
+    risk_model_loader: PythonRiskManagementModelLoader = PythonRiskManagementModelLoader()
+    portfolio_provider: PortfolioProvider | None = None
 
     def __post_init__(self) -> None:
         if self.live_provider_factory is None:
@@ -65,6 +74,7 @@ class RuntimeSleeveRuntime:
     history_provider: MarketDataProvider
     alpha_runtime: AlphaRuntime
     framework_runner: FrameworkRunner
+    portfolio_provider: PortfolioProvider
     portfolio: Portfolio
     worker: BackgroundSnapshotWorker
     active_result: ActiveUniverseResult
@@ -90,7 +100,8 @@ class RuntimeSleeveRuntime:
             refresh_history=self.sleeve_config.indicators.refresh_history,
         )
         framework_result = self._run_framework_once()
-        return RuntimeRunOnceReport(
+        portfolio_state = self._portfolio_engine_state(framework_result)
+        report = RuntimeRunOnceReport(
             runtime_id=self.runtime_id,
             config_version=self.config_version,
             sleeve_id=self.sleeve_id,
@@ -100,7 +111,15 @@ class RuntimeSleeveRuntime:
             active_result=self.active_result,
             worker=run_report,
             framework=framework_result,
+            portfolio_state=portfolio_state,
         )
+        status = self._agent_status(report)
+        agent_status_logger.info(
+            "engine_status %s",
+            json.dumps(status, ensure_ascii=False, separators=(",", ":")),
+            extra={"engine_status": status},
+        )
+        return report
 
     def _run_framework_once(self) -> FrameworkCycleResult | None:
         indicator_snapshot = self.worker.stores_by_sleeve.get(self.sleeve_id, None)
@@ -108,11 +127,71 @@ class RuntimeSleeveRuntime:
         if active_snapshot is None:
             return None
         data = _data_slice_from_indicator_snapshot(active_snapshot)
+        self.portfolio = self.portfolio_provider.current_portfolio(self.sleeve_id)
         return self.framework_runner.run_once(
             indicator_snapshot=active_snapshot,
             data=data,
             portfolio=self.portfolio,
         )
+
+    def _portfolio_engine_state(self, framework: FrameworkCycleResult | None) -> PortfolioEngineState | None:
+        if framework is None:
+            return None
+        indicator_snapshot = self.worker.stores_by_sleeve.get(self.sleeve_id, None)
+        active_snapshot = indicator_snapshot.active() if indicator_snapshot is not None else None
+        if active_snapshot is None:
+            return None
+        return PortfolioEngineState.from_cycle(
+            cycle=framework,
+            portfolio=self.portfolio,
+            data=_data_slice_from_indicator_snapshot(active_snapshot),
+        )
+
+    def _agent_status(self, report: "RuntimeRunOnceReport") -> dict[str, Any]:
+        cycle = report.worker.cycles[-1] if report.worker.cycles else None
+        framework = report.framework
+        portfolio_state = report.portfolio_state
+        data = None
+        if cycle is not None:
+            active_snapshot_store = self.worker.stores_by_sleeve.get(self.sleeve_id)
+            active_snapshot = active_snapshot_store.active() if active_snapshot_store is not None else None
+            data = _data_slice_from_indicator_snapshot(active_snapshot) if active_snapshot is not None else None
+        portfolio_equity = self.portfolio.equity(data) if data is not None else self.portfolio.cash
+        return {
+            "event": "engine_status",
+            "runtime_id": self.runtime_id,
+            "config_version": self.config_version,
+            "sleeve_id": self.sleeve_id,
+            "coarse_universe_id": report.coarse_universe_id,
+            "active_universe_id": report.active_universe_id,
+            "cycle_completed": report.worker.cycles_completed,
+            "snapshot": {
+                "status": cycle.snapshot_quality.status.value if cycle is not None else "missing",
+                "as_of": cycle.snapshot_as_of if cycle is not None else None,
+                "updated_symbol_count": cycle.updated_symbol_count if cycle is not None else 0,
+                "failed_symbol_count": cycle.failed_symbol_count if cycle is not None else 0,
+                "complete_ratio": cycle.snapshot_quality.complete_ratio if cycle is not None else 0.0,
+                "reasons": list(cycle.snapshot_quality.reasons) if cycle is not None else [],
+            },
+            "portfolio": {
+                "cash": self.portfolio.cash,
+                "equity": portfolio_equity,
+                "held_symbol_count": len(self.portfolio.held_symbols),
+                "held_symbols": [symbol.key for symbol in self.portfolio.held_symbols],
+            },
+            "framework": {
+                "ran": framework is not None,
+                "active_insight_count": framework.active_insight_count if framework is not None else 0,
+                "target_count": framework.portfolio_target_batch.target_count if framework is not None else 0,
+                "plan_count": framework.portfolio_target_batch.plan_count if framework is not None else 0,
+                "risk_decision_count": len(framework.risk_decisions.decisions) if framework is not None else 0,
+                "approved_target_count": len(framework.risk_decisions.approved_targets) if framework is not None else 0,
+                "order_intent_count": len(framework.order_intents) if framework is not None else 0,
+            },
+            "portfolio_engine_state": portfolio_state.to_dict(include_details=False)
+            if portfolio_state is not None
+            else None,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +205,7 @@ class RuntimeRunOnceReport:
     active_result: ActiveUniverseResult
     worker: SnapshotWorkerRunReport
     framework: FrameworkCycleResult | None = None
+    portfolio_state: PortfolioEngineState | None = None
 
     def to_dict(
         self,
@@ -152,6 +232,9 @@ class RuntimeRunOnceReport:
             "framework": self.framework.to_dict(include_details=include_framework_details)
             if self.framework is not None
             else None,
+            "portfolio_state": self.portfolio_state.to_dict(include_details=include_framework_details)
+            if self.portfolio_state is not None
+            else None,
         }
 
 
@@ -169,7 +252,7 @@ def bootstrap_sleeve_runtime(
 ) -> RuntimeSleeveRuntime:
     deps = dependencies or RuntimeBootstrapDependencies()
     sleeve_config = _resolve_sleeve_config(snapshot, sleeve_id)
-    coarse_universe = deps.load_universe(_resolve_path(snapshot, sleeve_config.universe.coarse_path))
+    coarse_universe = deps.load_universe(resolve_runtime_path(snapshot, sleeve_config.universe.coarse_path))
     live_provider = deps.live_provider_factory(
         coarse_universe,
         snapshot.config.market_data.rate_limit_per_second,
@@ -177,16 +260,19 @@ def bootstrap_sleeve_runtime(
     history_provider = deps.history_provider_factory()
     alpha_runtime = _build_alpha_runtime(snapshot, sleeve_config, deps.alpha_loader)
     portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
-    selection_model = _build_selection_model(sleeve_config.universe.active.selection_model, sleeve_config)
+    risk_model = _build_risk_model(snapshot, sleeve_config, deps.risk_model_loader)
+    selection_model = _build_selection_model(sleeve_config.universe.active.selection_model, sleeve_config, snapshot)
 
     selection_base_universe = coarse_universe
     fine_runtime = None
     fine_refresh_report = None
-    portfolio = Portfolio(cash=sleeve_config.cash)
+    portfolio_provider = deps.portfolio_provider or _build_portfolio_provider(snapshot, sleeve_config)
+    portfolio = portfolio_provider.current_portfolio(sleeve_config.sleeve_id)
     framework_runner = FrameworkRunner(
         sleeve_id=sleeve_config.sleeve_id,
         alpha_runtime=alpha_runtime,
         portfolio_engine=portfolio_engine,
+        risk_model=risk_model,
     )
     if sleeve_config.universe.fine.enabled:
         fine_runtime = FineUniverseRuntime(
@@ -240,6 +326,7 @@ def bootstrap_sleeve_runtime(
         history_provider=history_provider,
         alpha_runtime=alpha_runtime,
         framework_runner=framework_runner,
+        portfolio_provider=portfolio_provider,
         portfolio=portfolio,
         fine_runtime=fine_runtime,
         fine_refresh_report=fine_refresh_report,
@@ -263,7 +350,7 @@ def _build_alpha_runtime(
 ) -> AlphaRuntime:
     models = []
     for module in sleeve_config.alpha.modules:
-        models.append(alpha_loader.load(_resolve_path(snapshot, Path(module.ref))).model)
+        models.append(alpha_loader.load(_resolve_sleeve_path(snapshot, sleeve_config, Path(module.ref))).model)
     return AlphaRuntime(active_models=tuple(models))
 
 
@@ -273,7 +360,7 @@ def _build_portfolio_engine(
     portfolio_model_loader: PythonPortfolioConstructionModelLoader,
 ) -> PortfolioConstructionEngine:
     portfolio_config = sleeve_config.portfolio
-    model_ref = _resolve_model_reference(snapshot, portfolio_config.model.ref)
+    model_ref = _resolve_model_reference(snapshot, sleeve_config, portfolio_config.model.ref)
     model_result = portfolio_model_loader.load(model_ref, parameters=portfolio_config.parameters)
     rebalance_config = portfolio_config.rebalance
     return PortfolioConstructionEngine(
@@ -287,8 +374,41 @@ def _build_portfolio_engine(
     )
 
 
-def _build_selection_model(reference: ModuleReference, sleeve_config: SleeveRuntimeConfig) -> UniverseSelectionModel:
-    loaded = _load_reference(reference)
+def _build_risk_model(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_config: SleeveRuntimeConfig,
+    risk_model_loader: PythonRiskManagementModelLoader,
+):
+    risk_config = sleeve_config.risk
+    model_ref = _resolve_model_reference(snapshot, sleeve_config, risk_config.model.ref)
+    return risk_model_loader.load(model_ref, parameters=risk_config.parameters).model
+
+
+def _build_portfolio_provider(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_config: SleeveRuntimeConfig,
+) -> PortfolioProvider:
+    default_cash_by_sleeve = {
+        sleeve.sleeve_id: sleeve.cash
+        for sleeve in snapshot.config.sleeves
+    }
+    if sleeve_config.portfolio.account_store_path is None:
+        return StaticPortfolioProvider(default_cash_by_sleeve=default_cash_by_sleeve)
+    return VirtualSleeveAccountStore(
+        resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+        default_cash_by_sleeve=default_cash_by_sleeve,
+    )
+
+
+def _build_selection_model(
+    reference: ModuleReference,
+    sleeve_config: SleeveRuntimeConfig,
+    snapshot: RuntimeConfigSnapshot | None = None,
+) -> UniverseSelectionModel:
+    resolved = reference
+    if snapshot is not None:
+        resolved = ModuleReference(_resolve_module_reference(snapshot, sleeve_config, reference.ref))
+    loaded = _load_reference(resolved)
     if not inspect.isclass(loaded) and hasattr(loaded, "select"):
         return _validate_selection_model(loaded)
     if not callable(loaded):
@@ -335,15 +455,29 @@ def _load_module(module_name_or_path: str) -> ModuleType:
     return import_module(module_name_or_path)
 
 
-def _resolve_path(snapshot: RuntimeConfigSnapshot, path: Path) -> Path:
+def _resolve_model_reference(snapshot: RuntimeConfigSnapshot, sleeve_config: SleeveRuntimeConfig, ref: str) -> str:
+    return _resolve_module_reference(snapshot, sleeve_config, ref)
+
+
+def _resolve_module_reference(snapshot: RuntimeConfigSnapshot, sleeve_config: SleeveRuntimeConfig, ref: str) -> str:
+    path = Path(ref)
+    if path.suffix == ".py" or path.exists():
+        return str(_resolve_sleeve_path(snapshot, sleeve_config, path))
+    return ref
+
+
+def _resolve_sleeve_path(snapshot: RuntimeConfigSnapshot, sleeve_config: SleeveRuntimeConfig, path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    if sleeve_config.workspace_path is not None:
+        return _resolve_sleeve_workspace(snapshot, sleeve_config) / path
     return resolve_runtime_path(snapshot, path)
 
 
-def _resolve_model_reference(snapshot: RuntimeConfigSnapshot, ref: str) -> str:
-    path = Path(ref)
-    if path.suffix == ".py" or path.exists():
-        return str(resolve_runtime_path(snapshot, path))
-    return ref
+def _resolve_sleeve_workspace(snapshot: RuntimeConfigSnapshot, sleeve_config: SleeveRuntimeConfig) -> Path:
+    if sleeve_config.workspace_path is None:
+        return snapshot.source_path.parent
+    return resolve_runtime_path(snapshot, sleeve_config.workspace_path)
 
 
 def _data_slice_from_indicator_snapshot(snapshot: IndicatorSnapshot) -> DataSlice:

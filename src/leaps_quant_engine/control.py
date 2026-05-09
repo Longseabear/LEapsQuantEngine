@@ -14,6 +14,7 @@ from leaps_quant_engine.runtime_config import RuntimeConfigSnapshot, load_runtim
 
 class RuntimeControlCommandType(str, Enum):
     RELOAD_CONFIG = "reload_config"
+    RELOAD_SLEEVE = "reload_sleeve"
     PAUSE_WORKER = "pause_worker"
     RESUME_WORKER = "resume_worker"
     RUN_ONCE = "run_once"
@@ -33,6 +34,20 @@ class RuntimeControlCommand:
         return cls(
             command_type=RuntimeControlCommandType.RELOAD_CONFIG,
             payload={"config_path": str(config_path)},
+            reason=reason,
+        )
+
+    @classmethod
+    def reload_sleeve(
+        cls,
+        config_path: str | Path,
+        sleeve_id: str,
+        *,
+        reason: str | None = None,
+    ) -> "RuntimeControlCommand":
+        return cls(
+            command_type=RuntimeControlCommandType.RELOAD_SLEEVE,
+            payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
             reason=reason,
         )
 
@@ -57,6 +72,12 @@ class RuntimeControlCommand:
         if not value:
             raise ValueError("reload_config command requires payload.config_path.")
         return Path(str(value))
+
+    def sleeve_id(self) -> str:
+        value = self.payload.get("sleeve_id")
+        if not value:
+            raise ValueError("sleeve reload command requires payload.sleeve_id.")
+        return str(value)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,7 +143,7 @@ class RuntimeConfigController:
         run_once_requested = False
         shutdown_requested = False
         for command in self.queue.drain():
-            if command.command_type == RuntimeControlCommandType.RELOAD_CONFIG:
+            if command.command_type in {RuntimeControlCommandType.RELOAD_CONFIG, RuntimeControlCommandType.RELOAD_SLEEVE}:
                 self.snapshot = self.loader(command.config_path())
             elif command.command_type == RuntimeControlCommandType.PAUSE_WORKER:
                 self.paused = True
@@ -143,4 +164,3 @@ class RuntimeConfigController:
             run_once_requested=run_once_requested,
             shutdown_requested=shutdown_requested,
         )
-

@@ -11,6 +11,8 @@ from leaps_quant_engine.adapters.kis import (
     KISCachedMarketDataProvider,
     MarketDataEngineLiveQuoteProvider,
 )
+from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
+from leaps_quant_engine.account_sync import KISVirtualAccountSync
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader, SnapshotContext
 from leaps_quant_engine.backtesting import run_framework_backtest
 from leaps_quant_engine.benchmark import run_daily_indicator_benchmark
@@ -24,6 +26,13 @@ from leaps_quant_engine.runtime import build_indicator_engine_from_file, run_onc
 from leaps_quant_engine.runtime_bootstrap import bootstrap_sleeve_runtime, resolve_runtime_path
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
+from leaps_quant_engine.sleeve_workspace import (
+    describe_sleeve_alpha_modules,
+    describe_sleeve_portfolio_model,
+    disable_sleeve_alpha_module,
+    enable_sleeve_alpha_module,
+    set_sleeve_portfolio_model,
+)
 from leaps_quant_engine.universe.fine import FineUniverseRuntime
 from leaps_quant_engine.universe.loader import load_universe_definition
 from leaps_quant_engine.universe.runtime import UniverseSelectionRuntime
@@ -32,6 +41,7 @@ from leaps_quant_engine.universe.selection import (
     StaticUniverseSelectionModel,
     UniverseSelectionContext,
 )
+from leaps_quant_engine.virtual_account import FillAllocation, VirtualSleeveAccountStore
 from leaps_quant_engine.warmup import WarmupPolicy, run_daily_indicator_warmup
 
 
@@ -61,11 +71,72 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_run_once.add_argument("--skip-warmup", action="store_true")
     runtime_run_once.add_argument("--summary-only", action="store_true")
 
+    sleeve_alpha_list = subparsers.add_parser("sleeve-alpha-list")
+    sleeve_alpha_list.add_argument("config", type=Path)
+    sleeve_alpha_list.add_argument("--sleeve-id", required=True)
+
+    sleeve_alpha_enable = subparsers.add_parser("sleeve-alpha-enable")
+    sleeve_alpha_enable.add_argument("config", type=Path)
+    sleeve_alpha_enable.add_argument("alpha_ref")
+    sleeve_alpha_enable.add_argument("--sleeve-id", required=True)
+
+    sleeve_alpha_disable = subparsers.add_parser("sleeve-alpha-disable")
+    sleeve_alpha_disable.add_argument("config", type=Path)
+    sleeve_alpha_disable.add_argument("alpha_ref")
+    sleeve_alpha_disable.add_argument("--sleeve-id", required=True)
+
+    sleeve_portfolio_list = subparsers.add_parser("sleeve-portfolio-list")
+    sleeve_portfolio_list.add_argument("config", type=Path)
+    sleeve_portfolio_list.add_argument("--sleeve-id", required=True)
+
+    sleeve_portfolio_set = subparsers.add_parser("sleeve-portfolio-set")
+    sleeve_portfolio_set.add_argument("config", type=Path)
+    sleeve_portfolio_set.add_argument("portfolio_ref")
+    sleeve_portfolio_set.add_argument("--sleeve-id", required=True)
+
     subparsers.add_parser("kis-health")
 
     kis_quote = subparsers.add_parser("kis-quote")
     kis_quote.add_argument("symbol")
     kis_quote.add_argument("--market", default="KRX")
+
+    kis_account_sync = subparsers.add_parser("kis-account-sync")
+    kis_account_sync.add_argument("config", type=Path)
+    kis_account_sync.add_argument("--sleeve-id", required=True)
+    kis_account_sync.add_argument("--start-date", required=True)
+    kis_account_sync.add_argument("--end-date", required=True)
+    kis_account_sync.add_argument("--market", default="domestic", choices=("domestic",))
+    kis_account_sync.add_argument("--side", default="all", choices=("all", "buy", "sell"))
+    kis_account_sync.add_argument("--symbol", default="")
+    kis_account_sync.add_argument("--assign-unknown-to-sleeve", action="store_true")
+    kis_account_sync.add_argument("--sync-cash", action="store_true")
+    kis_account_sync.add_argument("--residual-sleeve-id", default="default sleeve")
+
+    virtual_account_allocate = subparsers.add_parser("virtual-account-allocate-fill")
+    virtual_account_allocate.add_argument("config", type=Path)
+    virtual_account_allocate.add_argument("--sleeve-id", required=True)
+    virtual_account_allocate.add_argument("--fill-id", required=True)
+    virtual_account_allocate.add_argument("--allocation", action="append", required=True)
+    virtual_account_allocate.add_argument("--reason", default="")
+
+    virtual_account_reconcile = subparsers.add_parser("virtual-account-reconcile")
+    virtual_account_reconcile.add_argument("config", type=Path)
+    virtual_account_reconcile.add_argument("--sleeve-id", required=True)
+    virtual_account_reconcile.add_argument("--market", default="domestic", choices=("domestic",))
+    virtual_account_reconcile.add_argument("--summary-only", action="store_true")
+
+    virtual_account_cash_sync = subparsers.add_parser("virtual-account-sync-cash")
+    virtual_account_cash_sync.add_argument("config", type=Path)
+    virtual_account_cash_sync.add_argument("--sleeve-id", required=True)
+    virtual_account_cash_sync.add_argument("--residual-sleeve-id", default="default sleeve")
+
+    virtual_account_cash_transfer = subparsers.add_parser("virtual-account-transfer-cash")
+    virtual_account_cash_transfer.add_argument("config", type=Path)
+    virtual_account_cash_transfer.add_argument("--sleeve-id", required=True)
+    virtual_account_cash_transfer.add_argument("--from-sleeve-id", required=True)
+    virtual_account_cash_transfer.add_argument("--to-sleeve-id", required=True)
+    virtual_account_cash_transfer.add_argument("--amount", type=float, required=True)
+    virtual_account_cash_transfer.add_argument("--reason", default="")
 
     indicators_kis = subparsers.add_parser("indicators-kis-once")
     indicators_kis.add_argument("config", type=Path)
@@ -93,7 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     framework_backtest.add_argument("--start")
     framework_backtest.add_argument("--end")
     framework_backtest.add_argument("--cash", type=float, default=100_000.0)
-    framework_backtest.add_argument("--source", default="kis-cache", choices=("kis-cache",))
+    framework_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
     framework_backtest.add_argument("--refresh-history", action="store_true")
     framework_backtest.add_argument("--summary-only", action="store_true")
 
@@ -253,6 +324,51 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command == "sleeve-alpha-list":
+        print(
+            json.dumps(
+                describe_sleeve_alpha_modules(args.config, args.sleeve_id),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-alpha-enable":
+        print(
+            json.dumps(
+                enable_sleeve_alpha_module(args.config, args.sleeve_id, args.alpha_ref),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-alpha-disable":
+        print(
+            json.dumps(
+                disable_sleeve_alpha_module(args.config, args.sleeve_id, args.alpha_ref),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-portfolio-list":
+        print(
+            json.dumps(
+                describe_sleeve_portfolio_model(args.config, args.sleeve_id),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-portfolio-set":
+        print(
+            json.dumps(
+                set_sleeve_portfolio_model(args.config, args.sleeve_id, args.portfolio_ref),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "kis-health":
         provider = KISBrokerEngineMarketDataProvider.from_env()
         print(json.dumps(provider.health_check(), ensure_ascii=False, indent=2))
@@ -273,6 +389,149 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.command == "kis-account-sync":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        if sleeve_config.portfolio.account_store_path is None:
+            raise RuntimeError("portfolio.account_store_path is required for KIS account sync.")
+        default_cash_by_sleeve = {
+            sleeve.sleeve_id: sleeve.cash
+            for sleeve in snapshot.config.sleeves
+        }
+        store = VirtualSleeveAccountStore(
+            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+        )
+        report = KISVirtualAccountSync.from_env().sync(
+            store,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            market=args.market,
+            side=args.side,
+            symbol=args.symbol,
+            assign_unknown_to_sleeve_id=args.sleeve_id if args.assign_unknown_to_sleeve else None,
+            sync_cash=args.sync_cash,
+            residual_sleeve_id=args.residual_sleeve_id,
+            report_sleeve_ids=(args.sleeve_id,),
+        )
+        payload = report.to_dict()
+        payload["account_store_path"] = str(store.path)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "virtual-account-sync-cash":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        if sleeve_config.portfolio.account_store_path is None:
+            raise RuntimeError("portfolio.account_store_path is required for virtual account cash sync.")
+        default_cash_by_sleeve = {
+            sleeve.sleeve_id: sleeve.cash
+            for sleeve in snapshot.config.sleeves
+        }
+        store = VirtualSleeveAccountStore(
+            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+        )
+        balance = KISVirtualAccountSync.from_env().account_client.get_balance_summary()
+        report = store.sync_account_cash(balance, residual_sleeve_id=args.residual_sleeve_id)
+        payload = report.to_dict()
+        payload["account_store_path"] = str(store.path)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "virtual-account-transfer-cash":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        if sleeve_config.portfolio.account_store_path is None:
+            raise RuntimeError("portfolio.account_store_path is required for virtual account cash transfer.")
+        default_cash_by_sleeve = {
+            sleeve.sleeve_id: sleeve.cash
+            for sleeve in snapshot.config.sleeves
+        }
+        store = VirtualSleeveAccountStore(
+            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+        )
+        event = store.transfer_cash(
+            from_sleeve_id=args.from_sleeve_id,
+            to_sleeve_id=args.to_sleeve_id,
+            amount=args.amount,
+            reason=args.reason,
+        )
+        print(
+            json.dumps(
+                {
+                    "transfer": event.to_dict(),
+                    "account_store_path": str(store.path),
+                    "from_portfolio": _portfolio_to_json(store.current_portfolio(args.from_sleeve_id)),
+                    "to_portfolio": _portfolio_to_json(store.current_portfolio(args.to_sleeve_id)),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "virtual-account-allocate-fill":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        if sleeve_config.portfolio.account_store_path is None:
+            raise RuntimeError("portfolio.account_store_path is required for virtual account allocation.")
+        default_cash_by_sleeve = {
+            sleeve.sleeve_id: sleeve.cash
+            for sleeve in snapshot.config.sleeves
+        }
+        store = VirtualSleeveAccountStore(
+            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+        )
+        fill = store.broker_fill(args.fill_id)
+        if fill is None:
+            raise RuntimeError(f"broker fill not found: {args.fill_id}")
+        allocations = tuple(
+            FillAllocation(
+                fill_id=fill.fill_id,
+                sleeve_id=sleeve_id,
+                quantity=quantity,
+                allocation_id=f"{fill.fill_id}:{index}:{sleeve_id}",
+                reason=args.reason,
+            )
+            for index, (sleeve_id, quantity) in enumerate(_parse_fill_allocations(args.allocation), start=1)
+        )
+        portfolios = store.apply_fill_allocations(fill, allocations)
+        print(
+            json.dumps(
+                {
+                    "fill_id": fill.fill_id,
+                    "account_store_path": str(store.path),
+                    "allocations": [allocation.to_dict() for allocation in allocations],
+                    "synced_sleeves": {
+                        sleeve_id: _portfolio_to_json(portfolio)
+                        for sleeve_id, portfolio in sorted(portfolios.items())
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "virtual-account-reconcile":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        if sleeve_config.portfolio.account_store_path is None:
+            raise RuntimeError("portfolio.account_store_path is required for virtual account reconciliation.")
+        default_cash_by_sleeve = {
+            sleeve.sleeve_id: sleeve.cash
+            for sleeve in snapshot.config.sleeves
+        }
+        store = VirtualSleeveAccountStore(
+            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+        )
+        holdings = KISVirtualAccountSync.from_env().account_client.get_holdings(market=args.market)
+        report = store.reconciliation_report(holdings, include_fills=True)
+        payload = report.to_dict(include_fills=not args.summary_only)
+        payload["account_store_path"] = str(store.path)
+        payload["broker_holdings_count"] = holdings.get("holdings_count", len(holdings.get("holdings", [])))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "indicators-kis-once":
         provider = KISBrokerEngineMarketDataProvider.from_env()
@@ -307,7 +566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if args.command == "framework-backtest-daily":
-        provider = KISCachedMarketDataProvider.from_env()
+        provider = _daily_backtest_provider(args.source)
         universe = load_universe_definition(args.universe)
         alpha_load = PythonAlphaLoader().load(args.alpha)
         result = run_framework_backtest(
@@ -643,6 +902,14 @@ def _parse_cli_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(text)
 
 
+def _daily_backtest_provider(source: str):
+    if source == "finance-datareader":
+        return FinanceDataReaderMarketDataProvider()
+    if source == "kis-cache":
+        return KISCachedMarketDataProvider.from_env()
+    raise ValueError(f"Unsupported daily backtest source: {source}")
+
+
 def _exchange_map_from_universe(universe) -> dict[str, str]:
     exchange_by_symbol: dict[str, str] = {}
     for symbol in universe.symbols:
@@ -665,6 +932,37 @@ def _parse_symbol_refs(values: Sequence[str], default_market: str) -> tuple[Symb
         else:
             symbols.append(Symbol(ticker=text, market=default_market))
     return tuple(symbols)
+
+
+def _parse_fill_allocations(values: Sequence[str]) -> tuple[tuple[str, int], ...]:
+    allocations: list[tuple[str, int]] = []
+    for value in values:
+        text = value.strip()
+        if "=" not in text:
+            raise ValueError("allocation must use sleeve_id=quantity format.")
+        sleeve_id, quantity_text = text.split("=", 1)
+        sleeve_id = sleeve_id.strip()
+        quantity = int(quantity_text.strip())
+        if not sleeve_id or quantity <= 0:
+            raise ValueError("allocation sleeve_id and positive quantity are required.")
+        allocations.append((sleeve_id, quantity))
+    return tuple(allocations)
+
+
+def _portfolio_to_json(portfolio: Portfolio) -> dict[str, object]:
+    return {
+        "cash": portfolio.cash,
+        "holding_count": len(portfolio.holdings),
+        "holdings": [
+            {
+                "symbol": holding.symbol.ticker,
+                "market": holding.symbol.market,
+                "quantity": holding.quantity,
+                "average_price": holding.average_price,
+            }
+            for holding in portfolio.holdings.values()
+        ],
+    }
 
 
 def _default_market_from_runtime_snapshot(snapshot, sleeve_id: str | None) -> str:

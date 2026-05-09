@@ -169,6 +169,7 @@ class PortfolioRuntimeConfig:
     )
     parameters: Mapping[str, Any] = field(default_factory=dict)
     rebalance: RebalancePolicyRuntimeConfig = field(default_factory=RebalancePolicyRuntimeConfig)
+    account_store_path: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
@@ -178,6 +179,24 @@ class PortfolioRuntimeConfig:
             "model": self.model.to_dict(),
             "parameters": dict(self.parameters),
             "rebalance": self.rebalance.to_dict(),
+            "account_store_path": str(self.account_store_path) if self.account_store_path is not None else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RiskRuntimeConfig:
+    model: ModuleReference = field(
+        default_factory=lambda: ModuleReference("leaps_quant_engine.framework:BasicRiskManagementModel")
+    )
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model.to_dict(),
+            "parameters": dict(self.parameters),
         }
 
 
@@ -201,10 +220,12 @@ class WorkerRuntimeConfig:
 class SleeveRuntimeConfig:
     sleeve_id: str
     universe: UniverseRuntimeConfig
+    workspace_path: Path | None = None
     cash: float = 100_000.0
     indicators: IndicatorRuntimeConfig = field(default_factory=IndicatorRuntimeConfig)
     alpha: AlphaRuntimeConfig = field(default_factory=AlphaRuntimeConfig)
     portfolio: PortfolioRuntimeConfig = field(default_factory=PortfolioRuntimeConfig)
+    risk: RiskRuntimeConfig = field(default_factory=RiskRuntimeConfig)
     worker: WorkerRuntimeConfig = field(default_factory=WorkerRuntimeConfig)
 
     def __post_init__(self) -> None:
@@ -215,11 +236,13 @@ class SleeveRuntimeConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "sleeve_id": self.sleeve_id,
+            "workspace_path": str(self.workspace_path) if self.workspace_path is not None else None,
             "cash": self.cash,
             "universe": self.universe.to_dict(),
             "indicators": self.indicators.to_dict(),
             "alpha": self.alpha.to_dict(),
             "portfolio": self.portfolio.to_dict(),
+            "risk": self.risk.to_dict(),
             "worker": self.worker.to_dict(),
         }
 
@@ -323,10 +346,12 @@ def _parse_sleeve_runtime_config(payload: Any) -> SleeveRuntimeConfig:
     return SleeveRuntimeConfig(
         sleeve_id=str(data.get("sleeve_id", data.get("id", ""))).strip(),
         universe=_parse_universe_runtime_config(_object(data.get("universe"))),
+        workspace_path=_optional_path(data.get("workspace_path", data.get("workspace"))),
         cash=float(data.get("cash", data.get("portfolio_cash", 100_000.0))),
         indicators=_parse_indicator_runtime_config(_object(data.get("indicators"), default={})),
         alpha=_parse_alpha_runtime_config(_object(data.get("alpha"), default={})),
         portfolio=_parse_portfolio_runtime_config(_object(data.get("portfolio"), default={})),
+        risk=_parse_risk_runtime_config(_object(data.get("risk"), default={})),
         worker=_parse_worker_runtime_config(_object(data.get("worker"), default={})),
     )
 
@@ -386,6 +411,15 @@ def _parse_portfolio_runtime_config(payload: Mapping[str, Any]) -> PortfolioRunt
         model=_parse_module_reference(raw_model),
         parameters=dict(_object(payload.get("parameters", payload.get("params")), default={})),
         rebalance=_parse_rebalance_policy_runtime_config(_object(payload.get("rebalance"), default={})),
+        account_store_path=_optional_path(payload.get("account_store_path", payload.get("virtual_account_path"))),
+    )
+
+
+def _parse_risk_runtime_config(payload: Mapping[str, Any]) -> RiskRuntimeConfig:
+    raw_model = payload.get("model", payload.get("module", "leaps_quant_engine.framework:BasicRiskManagementModel"))
+    return RiskRuntimeConfig(
+        model=_parse_module_reference(raw_model),
+        parameters=dict(_object(payload.get("parameters", payload.get("params")), default={})),
     )
 
 
@@ -439,6 +473,15 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _optional_path(value: Any) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text)
 
 
 def _validate_non_negative(name: str, value: float) -> None:

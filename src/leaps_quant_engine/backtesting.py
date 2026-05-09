@@ -309,6 +309,67 @@ def run_framework_backtest(
     )
 
 
+def run_framework_replay(
+    feed: list[DataSlice],
+    universe: UniverseDefinition,
+    *,
+    sleeve_id: str,
+    framework_runner: FrameworkRunner,
+    portfolio: Portfolio,
+    indicator_engine: IndicatorEngine | None = None,
+) -> FrameworkBacktestResult:
+    indicator_engine = indicator_engine or IndicatorEngine()
+    if sleeve_id not in indicator_engine.registries_by_sleeve:
+        indicator_engine.register_universe(sleeve_id, universe)
+
+    tracker = _SleeveBacktestTracker(sleeve_id=sleeve_id, initial_cash=portfolio.cash)
+    orders: list[OrderIntent] = []
+    framework_cycles: list[FrameworkCycleResult] = []
+    last_prices: dict[str, float] = {}
+
+    for index, data in enumerate(sorted(feed, key=lambda item: item.time), start=1):
+        for bar in data.bars.values():
+            last_prices[bar.symbol.key] = bar.close
+        indicator_engine.on_data(data)
+        indicator_snapshot = indicator_engine.snapshot(
+            sleeve_id,
+            universe_id=universe.id,
+            source_snapshot_id=f"replay-{sleeve_id}-{index}",
+            as_of=data.time,
+            created_at=data.time,
+        )
+        cycle = framework_runner.run_once(
+            indicator_snapshot=indicator_snapshot,
+            data=data,
+            portfolio=portfolio,
+        )
+        framework_cycles.append(cycle)
+        orders.extend(cycle.order_intents)
+        for order in cycle.order_intents:
+            tracker.record_fill(order, data.time)
+            portfolio.apply_fill(order)
+        tracker.record_snapshot(data.time, portfolio.cash, portfolio.holdings, last_prices)
+
+    return FrameworkBacktestResult(
+        sleeve_id=sleeve_id,
+        universe_id=universe.id,
+        orders=orders,
+        framework_cycles=framework_cycles,
+        final_cash=portfolio.cash,
+        final_quantity={
+            key: holding.quantity
+            for key, holding in portfolio.holdings.items()
+        },
+        metrics=tracker.metrics(),
+        snapshots=tracker.snapshots,
+        trades=tracker.closed_trades,
+        data_slice_count=len(feed),
+        indicator_snapshot_count=len(framework_cycles),
+        start=feed[0].time if feed else None,
+        end=feed[-1].time if feed else None,
+    )
+
+
 def run_backtest(
     engine: Engine,
     provider: MarketDataProvider,

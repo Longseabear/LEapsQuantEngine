@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, Symbol
 
@@ -61,6 +62,23 @@ class Portfolio:
             previous_cost = holding.quantity * holding.average_price
             holding.average_price = (previous_cost + intent.notional) / new_quantity
         holding.quantity = new_quantity
+
+
+class PortfolioProvider(Protocol):
+    def current_portfolio(self, sleeve_id: str) -> Portfolio:
+        """Return the current virtual portfolio for a sleeve."""
+
+
+@dataclass(slots=True)
+class StaticPortfolioProvider:
+    portfolios: dict[str, Portfolio] = field(default_factory=dict)
+    default_cash_by_sleeve: dict[str, float] = field(default_factory=dict)
+
+    def current_portfolio(self, sleeve_id: str) -> Portfolio:
+        portfolio = self.portfolios.get(sleeve_id)
+        if portfolio is not None:
+            return portfolio
+        return Portfolio(cash=self.default_cash_by_sleeve.get(sleeve_id, 0.0))
 
 
 @dataclass(frozen=True, slots=True)

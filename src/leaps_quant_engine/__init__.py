@@ -1,6 +1,13 @@
 """LEAN-style quant engine primitives."""
 
 from leaps_quant_engine.algorithm import Algorithm
+from leaps_quant_engine.account_sync import (
+    KISAccountClient,
+    KISAccountSyncReport,
+    KISVirtualAccountSync,
+    execution_to_virtual_fill,
+)
+from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
 from leaps_quant_engine.alpha import (
     AlphaModel,
     AlphaRuntime,
@@ -26,6 +33,7 @@ from leaps_quant_engine.backtesting import (
     FrameworkBacktestResult,
     VirtualMarketDataProvider,
     run_framework_backtest,
+    run_framework_replay,
     run_backtest,
 )
 from leaps_quant_engine.benchmark import run_daily_indicator_benchmark
@@ -38,6 +46,7 @@ from leaps_quant_engine.control import (
 )
 from leaps_quant_engine.engine import Engine
 from leaps_quant_engine.framework import (
+    BasicRiskManagementModel,
     EqualWeightPortfolioConstructionModel,
     FrameworkCycleResult,
     FrameworkRunner,
@@ -50,12 +59,16 @@ from leaps_quant_engine.framework import (
     PortfolioTargetBatch,
     PortfolioTargetPlan,
     PythonPortfolioConstructionModelLoader,
+    PythonRiskManagementModelLoader,
     RebalancePolicy,
     RiskDecision,
     RiskDecisionBatch,
     RiskDecisionStatus,
+    RiskLimits,
     RiskManagementContext,
     RiskManagementModel,
+    RiskManagementModelLoadError,
+    RiskManagementModelLoadResult,
     StageTiming,
 )
 from leaps_quant_engine.indicators import (
@@ -75,7 +88,14 @@ from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
 from leaps_quant_engine.logging import configure_logging
 from leaps_quant_engine.market_data_snapshot import MarketDataSnapshot, MarketDataSnapshotEngine
 from leaps_quant_engine.models import Bar, DataSlice, OrderIntent, PortfolioTarget, Symbol
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
+from leaps_quant_engine.portfolio_state import (
+    PendingOrderSnapshot,
+    PortfolioEngineState,
+    PortfolioHoldingSnapshot,
+    PortfolioSnapshot,
+)
+from leaps_quant_engine.replay import MarketReplaySession, MarketReplayStore
 from leaps_quant_engine.runtime import (
     build_engine_from_config,
     build_engine_from_file,
@@ -99,6 +119,7 @@ from leaps_quant_engine.runtime_config import (
     MarketDataRuntimeConfig,
     ModuleReference,
     PortfolioRuntimeConfig,
+    RiskRuntimeConfig,
     RebalancePolicyRuntimeConfig,
     RuntimeConfig,
     RuntimeConfigSnapshot,
@@ -126,10 +147,26 @@ from leaps_quant_engine.universe.fine import (
     FineUniverseRefreshReport,
     FineUniverseRuntime,
 )
+from leaps_quant_engine.virtual_account import (
+    AccountCashSnapshot,
+    CashReconciliationReport,
+    CashTransfer,
+    DEFAULT_ACCOUNT_ID,
+    DEFAULT_CASH_SLEEVE_ID,
+    FillAllocation,
+    FillAllocationStatus,
+    OrderOwnership,
+    PositionReconciliationRow,
+    UNKNOWN_SLEEVE_ID,
+    VirtualAccountReconciliationReport,
+    VirtualFillEvent,
+    VirtualSleeveAccountStore,
+)
 from leaps_quant_engine.warmup import WarmupPolicy, WarmupReport, WarmupResult, WarmupSymbolReport, run_daily_indicator_warmup
 
 __all__ = [
     "Algorithm",
+    "AccountCashSnapshot",
     "ActiveUniverseResult",
     "ActiveUniverseRuntimeConfig",
     "AlphaModel",
@@ -140,9 +177,14 @@ __all__ = [
     "BacktestSnapshot",
     "Bar",
     "BackgroundSnapshotWorker",
+    "BasicRiskManagementModel",
     "ClosedTrade",
     "ConfigurationValidationError",
+    "CashReconciliationReport",
+    "CashTransfer",
     "DataSlice",
+    "DEFAULT_ACCOUNT_ID",
+    "DEFAULT_CASH_SLEEVE_ID",
     "Engine",
     "EqualWeightPortfolioConstructionModel",
     "FineUniverseCache",
@@ -151,6 +193,9 @@ __all__ = [
     "FineUniverseRefreshReport",
     "FineUniverseRuntime",
     "FineUniverseRuntimeConfig",
+    "FinanceDataReaderMarketDataProvider",
+    "FillAllocation",
+    "FillAllocationStatus",
     "FrameworkCycleResult",
     "FrameworkBacktestResult",
     "FrameworkRunner",
@@ -172,15 +217,27 @@ __all__ = [
     "InsightState",
     "InsightStore",
     "InsightType",
+    "KISAccountClient",
+    "KISAccountSyncReport",
+    "KISVirtualAccountSync",
     "MarketDataSnapshot",
     "MarketDataSnapshotEngine",
+    "MarketReplaySession",
+    "MarketReplayStore",
     "MarketDataRuntimeConfig",
     "Momentum",
     "MomentumUniverseSelectionModel",
     "ModuleReference",
     "OrderIntent",
+    "OrderOwnership",
     "PassThroughRiskManagementModel",
+    "PendingOrderSnapshot",
     "Portfolio",
+    "PortfolioEngineState",
+    "PortfolioHoldingSnapshot",
+    "PortfolioProvider",
+    "PortfolioSnapshot",
+    "StaticPortfolioProvider",
     "PortfolioConstructionEngine",
     "PortfolioConstructionModelLoadError",
     "PortfolioConstructionModelLoadResult",
@@ -190,7 +247,9 @@ __all__ = [
     "PortfolioTargetPlan",
     "PortfolioTarget",
     "PortfolioRuntimeConfig",
+    "PositionReconciliationRow",
     "PythonPortfolioConstructionModelLoader",
+    "PythonRiskManagementModelLoader",
     "PythonAlphaLoadResult",
     "PythonAlphaLoader",
     "RollingDollarVolume",
@@ -198,8 +257,12 @@ __all__ = [
     "RiskDecision",
     "RiskDecisionBatch",
     "RiskDecisionStatus",
+    "RiskLimits",
     "RiskManagementContext",
     "RiskManagementModel",
+    "RiskManagementModelLoadError",
+    "RiskManagementModelLoadResult",
+    "RiskRuntimeConfig",
     "RebalancePolicy",
     "RebalancePolicyRuntimeConfig",
     "RuntimeBootstrapDependencies",
@@ -227,11 +290,15 @@ __all__ = [
     "SnapshotWorkerRunReport",
     "StaticUniverseSelectionModel",
     "VirtualMarketDataProvider",
+    "VirtualAccountReconciliationReport",
+    "VirtualFillEvent",
+    "VirtualSleeveAccountStore",
     "UniverseSelectionCandidate",
     "UniverseSelectionContext",
     "UniverseSelectionResult",
     "UniverseSelectionRuntime",
     "UniverseRuntimeConfig",
+    "UNKNOWN_SLEEVE_ID",
     "WarmupPolicy",
     "WarmupReport",
     "WarmupResult",
@@ -243,12 +310,14 @@ __all__ = [
     "build_indicator_engine_from_file",
     "bootstrap_sleeve_runtime",
     "configure_logging",
+    "execution_to_virtual_fill",
     "load_runtime_config_snapshot",
     "parse_runtime_config",
     "resolve_runtime_path",
     "run_daily_indicator_benchmark",
     "run_daily_indicator_warmup",
     "run_framework_backtest",
+    "run_framework_replay",
     "run_live_indicator_snapshot",
     "run_backtest",
 ]

@@ -18,6 +18,7 @@ This document records what is currently implemented and what should come next. I
 ### Backtesting
 
 - `VirtualMarketDataProvider` for deterministic replay.
+- `FinanceDataReaderMarketDataProvider` for multi-year daily historical backtests.
 - `run_backtest(...)` with immediate fill simulation.
 - `run_framework_backtest(...)` for LEAN-style alpha framework replay:
   - historical `DataSlice`
@@ -36,6 +37,21 @@ This document records what is currently implemented and what should come next. I
   - win rate
   - trade count
   - order count
+
+### Market Replay
+
+- `MarketReplayStore` records normalized `DataSlice` rows as JSONL under a session/sleeve path.
+- `run_framework_replay(...)` replays stored `DataSlice` rows through the same `IndicatorEngine -> FrameworkRunner -> immediate fill` path used by framework backtests.
+- Replay sessions reserve paths for agent-readable engine status and order intent JSONL:
+
+```text
+data/replay/sessions/<session_id>/<sleeve_id>/
+  data_slices.jsonl
+  engine_status.jsonl
+  order_intents.jsonl
+```
+
+The v0 replay store is intentionally bar/snapshot oriented. It does not yet persist tick-level broker packets or full `FrameworkCycleResult` objects.
 
 ### Indicators
 
@@ -212,6 +228,19 @@ Runtime bootstrap is also implemented. `bootstrap_sleeve_runtime(...)` takes a v
 - `FrameworkRunner` for alpha, insight state, portfolio construction, risk, and execution
 - `BackgroundSnapshotWorker`
 
+Sleeves can now declare a `workspace_path`. File-based strategy module references inside `alpha.modules`, `portfolio.model`, and file-based active selection models resolve relative to that sleeve workspace. Shared universe paths remain runtime/global paths unless they are absolute.
+Sleeve alpha modules can be managed from the CLI:
+
+```powershell
+py -3 -m leaps_quant_engine.cli sleeve-alpha-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-alpha-enable configs/runtime/leaps_workspace_smoke.json alphas/momentum.py --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-alpha-disable configs/runtime/leaps_workspace_smoke.json alphas/momentum.py --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-portfolio-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-portfolio-set configs/runtime/leaps_workspace_smoke.json equal_weight --sleeve-id LEaps
+```
+
+These commands update the runtime config and emit a `reload_sleeve` control command payload so an operating agent can apply the change at a runtime boundary. Alpha modules are multi-active; portfolio construction model selection is single-active.
+
 This is the first executable bridge from option snapshot to a live one-cycle worker path.
 The worker now owns snapshot collection and indicator publication only in this bootstrap path. Alpha and downstream framework stages run after the active `IndicatorSnapshot` is published, so `runtime-run-once` can show both worker timing and framework artifacts.
 
@@ -233,6 +262,48 @@ Configured one-cycle runtime command:
 ```powershell
 $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/live_us_smoke.json --sleeve-id us-live --held IBM --skip-warmup --summary-only
+```
+
+Read-only KIS account sync into a configured virtual sleeve account store:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli kis-account-sync configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --start-date 20260508 --end-date 20260508
+```
+
+Historical/manual assignment of an unknown execution to the requested sleeve is explicit:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli kis-account-sync configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --start-date 20260508 --end-date 20260508 --assign-unknown-to-sleeve
+```
+
+Allocate a previously recorded raw broker fill into sleeve projections:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli virtual-account-allocate-fill configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --fill-id kis:domestic:12345:20260508T093000:10:70000 --allocation LEaps=6 --allocation ETF=4 --reason initial-sleeve-split
+```
+
+Compare broker holdings to the aggregate virtual sleeve projection:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli virtual-account-reconcile configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --summary-only
+```
+
+Sync broker cash into the virtual account projection:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli virtual-account-sync-cash configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --residual-sleeve-id "default sleeve"
+```
+
+Move cash explicitly between virtual sleeves:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli virtual-account-transfer-cash configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --from-sleeve-id "default sleeve" --to-sleeve-id LEaps --amount 250000 --reason initial-allocation
 ```
 
 ### Alpha Runtime
@@ -341,7 +412,10 @@ Implemented framework contracts:
 - `RiskManagementModel`
 - `RiskDecision`
 - `RiskDecisionBatch`
+- `RiskLimits`
+- `BasicRiskManagementModel`
 - `PassThroughRiskManagementModel`
+- `PythonRiskManagementModelLoader`
 
 Current v0 behavior:
 
@@ -349,12 +423,31 @@ Current v0 behavior:
 - `InsightManager` maintains active/inactive signal state.
 - `PortfolioConstructionEngine` reads active insights and the sleeve virtual account portfolio, then produces auditable `PortfolioTargetBatch` records.
 - `PortfolioTargetPlan` records current quantity, target quantity, delta quantity, current value, target value, delta value, and insight lineage for each emitted target.
+- `PortfolioEngineState` folds a framework cycle into an agent-readable portfolio state snapshot:
+  - current sleeve cash, equity, exposure, holdings, mark price, and unrealized PnL
+  - target batch and target plans
+  - risk decisions
+  - pending order intents with reserved buy cash and reserved sell quantities
 - The core assumes sleeve-level virtual accounts already exist. KIS account-level holdings are a broker adapter concern, not the portfolio construction source of truth.
+- Runtime bootstrap can now read the current sleeve portfolio through a `PortfolioProvider` before each framework cycle. The default provider preserves the configured starting cash behavior, while tests prove a `LEaps` sleeve can supply its own current virtual portfolio.
+- `VirtualSleeveAccountStore` is the first file-backed virtual account provider for live/paper ownership state. It stores sleeve cash/holdings, `order_id -> sleeve` ownership, broker order aliases, and idempotent fill events. Unknown external fills are routed to the `unassigned` sleeve.
+- Runtime config can opt a sleeve into this store with `portfolio.account_store_path`. `configs/runtime/leaps_workspace_smoke.json` now points `LEaps` at `../../data/virtual-accounts/leaps_workspace_smoke.json`, resolving to the repo-level ignored runtime data directory.
+- Real KIS account attachment is now a read-only sync path, not a direct portfolio source. `KISVirtualAccountSync` calls broker-engine operations for balance, holdings, and execution history, converts executions into `VirtualFillEvent` records, applies owned or explicitly assigned fills into `VirtualSleeveAccountStore`, and records unknown broker fills for later allocation. KIS holdings are reported for reconciliation but do not overwrite sleeve holdings.
+- `FillAllocation` supports partial or full splitting of one broker fill across multiple virtual sleeves by quantity. The broker fill stays in the raw fill ledger, and each sleeve portfolio projection gets only its allocated quantity and proportional fee. This is intentionally lighter than StockProgram's order-chain-lot model: the LEAN engine still sees only `PortfolioProvider.current_portfolio(sleeve_id)`.
+- Unknown broker executions are not silently turned into strategy positions. The operator can intentionally assign unknown fills to a sleeve with `--assign-unknown-to-sleeve`, or record them first and later distribute them with `virtual-account-allocate-fill`.
+- `VirtualSleeveAccountStore` can report allocation status per broker fill (`unallocated`, `partially_allocated`, `fully_allocated`) and reconcile KIS current holdings against the aggregate virtual sleeve projection. This gives operators a bounded daily check instead of replaying all historical fills during every engine cycle.
+- KIS cash balance sync follows the StockProgram lesson without copying the whole fund interface. `virtual-account-sync-cash` stores the KIS account cash snapshot, keeps strategy sleeve cash as internal allocation state, and assigns residual cash to `default sleeve`. `virtual-account-transfer-cash` moves cash between virtual sleeves explicitly.
+- Backtesting remains separated: `run_backtest(...)`, `run_framework_backtest(...)`, and `run_framework_replay(...)` still receive an explicit in-memory `Portfolio` and do not read or write the live/paper virtual account store.
+- The `LEaps` sleeve has an initial workspace at `sleeves/LEaps` with sleeve-local `alphas/momentum.py`, `alphas/volatility_trailing_stop.py`, `alphas/etf_rotation.py`, and `portfolios/equal_weight.py` modules, plus `configs/runtime/leaps_workspace_smoke.json` as a loading smoke config.
+- Each runtime cycle emits an agent-readable `engine_status` log line through the `leaps_quant_engine.agent_status` logger. The status includes snapshot quality, symbol update counts, portfolio cash/equity, active insight count, target/plan counts, risk approval count, and order intent count.
 - `EqualWeightPortfolioConstructionModel` remains the first model implementation.
 - `RebalancePolicy` can reserve cash, filter tiny quantity deltas, and suppress tiny non-exit order notionals.
 - Portfolio Construction Models can be loaded from Python model modules through `PythonPortfolioConstructionModelLoader`.
 - When previously managed or currently held symbols lose active insight support, portfolio construction can emit flatten targets.
-- Risk runs every framework cycle and currently passes targets through.
+- Risk runs every framework cycle. The default `FrameworkRunner` risk model is now `BasicRiskManagementModel`, which enforces v0 long-only behavior, per-symbol max position percentage, and available-cash clamps before execution sees targets.
+- Sleeves can inject risk models through `risk.model` and `risk.parameters`. File-based risk model references resolve relative to `workspace_path`, matching alpha and portfolio model loading.
+- The `LEaps` sleeve workspace now includes `risks/basic.py`, a minimal example using `BasicRiskManagementModel` with `long_only`, `max_position_pct`, and `cash_buffer_pct` parameters.
+- `PassThroughRiskManagementModel` remains available for tests and controlled smoke scenarios.
 - Execution turns approved targets into `OrderIntent` records using the existing immediate execution model.
 - `runtime-run-once` now runs this framework path after `BackgroundSnapshotWorker` publishes the active indicator snapshot.
 
@@ -641,6 +734,52 @@ win rate: 55.81%
 trade count: 482
 ```
 
+Recent LEaps framework backtest using the CLI default long-history source:
+
+```text
+command:
+  framework-backtest-daily configs/universes/swing_kor_core.json examples/alpha/price_above_sma_alpha.py --sleeve-id LEaps --start 2021-05-10 --end 2026-05-08 --cash 6385012 --source finance-datareader --summary-only
+
+source: finance-datareader
+period: 2021-05-10 -> 2026-05-08
+data slices: 1,224
+insights: 1,600
+orders: 653
+final cash: 730,312
+final positions:
+  KRX:005930 27
+  KRX:035420 34
+  KRX:000660 4
+total return: 245.09%
+CAGR: 28.15%
+Sharpe: 1.02
+MDD: 41.91%
+turnover: 18.39
+trade count: 318
+```
+
+After wiring the default risk model to `BasicRiskManagementModel`, the same run produced:
+
+```text
+period: 2021-05-10 -> 2026-05-08
+data slices: 1,224
+insights: 1,600
+orders: 650
+final cash: 779,312
+final positions:
+  KRX:005930 27
+  KRX:000660 4
+  KRX:035420 34
+total return: 245.85%
+CAGR: 28.21%
+Sharpe: 1.02
+MDD: 41.52%
+turnover: 18.02
+trade count: 315
+```
+
+The 2026-05-08 one-day smoke with the same source produced no insights/orders and kept equity unchanged at 6,385,012.
+
 KIS/broker-engine daily cache limitation observed on 2026-05-09:
 
 ```text
@@ -650,6 +789,8 @@ returned sessions per symbol: 30
 ```
 
 The legacy broker operation currently applies `start_date` / `end_date` filtering after receiving the KIS daily payload. If the provider payload contains only recent rows, the new engine cannot expand that into a five-year replay. Treat KIS daily cache as a recent-cache smoke until a paged KIS history path or a dedicated historical provider adapter is implemented.
+
+`framework-backtest-daily` defaults to `--source finance-datareader` for long-horizon daily backtests. Use `--source kis-cache` only for recent smoke tests of the broker-engine cached-history path.
 
 Recent Korean 200-symbol five-year daily framework load test:
 
@@ -742,7 +883,7 @@ py -3 -m pytest -q
 Expected current result:
 
 ```text
-115 passed
+160 passed
 ```
 
 Run sample:
@@ -762,8 +903,8 @@ py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live
 ## Known Limitations
 
 - `BackgroundSnapshotWorker` exists, but it is not yet wrapped by a production process supervisor.
-- Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, but formal risk gates are not wired yet.
-- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading, a v0 equal-weight model, rebalance policy, and `PortfolioTargetPlan` current-vs-target deltas. Risk still only has a pass-through implementation.
+- Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, but formal freshness-based risk gates are not wired yet.
+- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading, a v0 equal-weight model, rebalance policy, and `PortfolioTargetPlan` current-vs-target deltas. Risk now has a basic deterministic clamp model and sleeve-level Python module loading, but richer portfolio-wide exposure policy is not implemented yet.
 - Framework alpha backtesting exists, but n-1 minute delayed indicator snapshot modeling is not implemented yet.
 - Universe selection exists, but is not yet automatically scheduled into the live worker loop.
 - No order ticket/order event state machine yet.
@@ -847,10 +988,8 @@ UniverseSelectionRuntime
 
 After that:
 
-1. Define minimal `RiskManagementModel` quality gates.
-2. Add configurable portfolio construction and risk module references.
-3. Add risk quality gates and max exposure / max position clamps.
-4. Persist and replay portfolio/risk state snapshots across process restarts.
-5. Simulate n-1 minute delayed indicator snapshots in backtests.
-6. Add idempotent order intent lineage before broker submission.
-7. Add order ticket/order event state machine.
+1. Add freshness-based risk gates and portfolio-level max exposure clamps.
+2. Persist and replay portfolio/risk state snapshots across process restarts.
+3. Simulate n-1 minute delayed indicator snapshots in backtests.
+4. Add idempotent order intent lineage before broker submission.
+5. Add order ticket/order event state machine.

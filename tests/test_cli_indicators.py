@@ -35,7 +35,7 @@ def test_cli_indicators_backtest_once_outputs_configured_symbols(monkeypatch, ca
 
 
 def test_cli_indicators_kis_once_updates_from_provider(monkeypatch, capsys):
-    class FakeProvider:
+    class FakeKISProvider:
         @classmethod
         def from_env(cls):
             return cls()
@@ -55,7 +55,7 @@ def test_cli_indicators_kis_once_updates_from_provider(monkeypatch, capsys):
         def values_for(self, sleeve_id, symbols, ready_only=False):
             return {"KRX:005930": {}}
 
-    monkeypatch.setattr(cli, "KISBrokerEngineMarketDataProvider", FakeProvider)
+    monkeypatch.setattr(cli, "KISBrokerEngineMarketDataProvider", FakeKISProvider)
     monkeypatch.setattr(cli, "build_indicator_engine_from_file", lambda path: FakeIndicatorEngine())
 
     exit_code = cli.main(
@@ -128,10 +128,13 @@ def test_cli_benchmark_indicators_daily_outputs_report(monkeypatch, capsys):
 
 
 def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, capsys):
-    class FakeProvider:
+    class FakeKISProvider:
         @classmethod
         def from_env(cls):
             return cls()
+
+    class FakeFinanceProvider:
+        pass
 
     class FakeAlphaLoader:
         def load(self, path):
@@ -160,7 +163,8 @@ def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, caps
             }
         )
 
-    monkeypatch.setattr(cli, "KISCachedMarketDataProvider", FakeProvider)
+    monkeypatch.setattr(cli, "KISCachedMarketDataProvider", FakeKISProvider)
+    monkeypatch.setattr(cli, "FinanceDataReaderMarketDataProvider", FakeFinanceProvider)
     monkeypatch.setattr(cli, "load_universe_definition", lambda path: universe)
     monkeypatch.setattr(cli, "PythonAlphaLoader", FakeAlphaLoader)
     monkeypatch.setattr(cli, "run_framework_backtest", fake_run_framework_backtest)
@@ -184,7 +188,7 @@ def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, caps
 
     assert exit_code == 0
     assert captured["universe"] is universe
-    assert isinstance(captured["provider"], FakeProvider)
+    assert isinstance(captured["provider"], FakeFinanceProvider)
     assert captured["sleeve_id"] == "swing-kor"
     assert captured["portfolio"].cash == 1_000_000
     assert captured["start"] == datetime(2026, 1, 1)
@@ -194,7 +198,7 @@ def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, caps
     output = json.loads(capsys.readouterr().out)
     assert output["framework_cycle_count"] == 3
     assert output["include_orders"] is False
-    assert output["source"] == "kis-cache"
+    assert output["source"] == "finance-datareader"
     assert output["alpha"]["alpha_id"] == "fake-alpha"
 
 
