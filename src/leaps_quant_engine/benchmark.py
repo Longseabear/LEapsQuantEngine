@@ -6,6 +6,8 @@ from math import ceil
 from time import perf_counter
 from typing import Any
 
+from leaps_quant_engine.history import load_daily_history as _load_daily_history
+from leaps_quant_engine.history import get_daily_history
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
@@ -103,16 +105,13 @@ def load_daily_history(
     end: datetime | None = None,
     refresh_history: bool = False,
 ) -> dict[str, list[Bar]]:
-    return {
-        symbol.key: _get_history(
-            provider,
-            symbol,
-            start=start,
-            end=end,
-            refresh_history=refresh_history,
-        )
-        for symbol in symbols
-    }
+    return _load_daily_history(
+        provider,
+        symbols,
+        start=start,
+        end=end,
+        refresh_history=refresh_history,
+    )
 
 
 def build_replay_feed_from_history(history_by_symbol: dict[str, list[Bar]]) -> list[DataSlice]:
@@ -134,19 +133,13 @@ def _get_history(
     end: datetime | None,
     refresh_history: bool,
 ) -> list[Bar]:
-    get_cached_daily_history = getattr(provider, "get_cached_daily_history", None)
-    if get_cached_daily_history is not None:
-        return list(
-            get_cached_daily_history(
-                symbol,
-                start=start,
-                end=end,
-                refresh=refresh_history,
-            )
-        )
-    if refresh_history:
-        raise ValueError("refresh_history requires a provider with get_cached_daily_history().")
-    return list(provider.get_history(symbol, start=start, end=end))
+    return get_daily_history(
+        provider,
+        symbol,
+        start=start,
+        end=end,
+        refresh_history=refresh_history,
+    )
 
 
 def _ready_symbol_count(indicator_engine: IndicatorEngine, sleeve_id: str, symbols: list[Symbol]) -> int:

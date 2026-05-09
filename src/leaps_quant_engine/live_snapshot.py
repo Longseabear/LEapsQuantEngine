@@ -8,6 +8,7 @@ from typing import Any
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.market_data_snapshot import MarketDataSnapshotEngine
+from leaps_quant_engine.snapshots import SnapshotFreshnessPolicy
 from leaps_quant_engine.universe.definition import UniverseDefinition
 
 
@@ -22,6 +23,7 @@ def run_live_indicator_snapshot(
     source: str,
     min_success: int | None = None,
     include_failures: bool = False,
+    freshness_policy: SnapshotFreshnessPolicy | None = None,
 ) -> dict[str, Any]:
     provider_client = getattr(provider, "client", None)
     rate_limit_per_second = getattr(provider_client, "rate_limit_per_second", None)
@@ -49,11 +51,19 @@ def run_live_indicator_snapshot(
         list(universe.symbols),
         min_success=min_success,
     )
+    quality_report = (freshness_policy or SnapshotFreshnessPolicy()).evaluate(
+        requested_symbol_count=collection.report.requested_symbol_count,
+        collected_symbol_count=collection.report.collected_symbol_count,
+        failed_symbol_count=collection.report.failed_symbol_count,
+        completed_at=collection.report.completed_at,
+        elapsed_ms=collection.report.elapsed_ms,
+    )
     update_started = time.perf_counter()
     indicator_snapshots = snapshot_engine.update_indicators(
         collection.snapshot,
         sleeve_ids=[sleeve_id],
         universe_id_by_sleeve={sleeve_id: universe.id},
+        quality_report_by_sleeve={sleeve_id: quality_report},
     )
     indicator_update_ms = (time.perf_counter() - update_started) * 1000
 
@@ -74,6 +84,7 @@ def run_live_indicator_snapshot(
         "market_snapshot_id": collection.snapshot.snapshot_id,
         "indicator_snapshot_id": indicator_snapshot.snapshot_id,
         "snapshot_as_of": indicator_snapshot.as_of.isoformat(),
+        "snapshot_quality": quality_report.to_dict(),
         "collection_elapsed_ms": collection.report.elapsed_ms,
         "indicator_update_snapshot_ms": indicator_update_ms,
         "ready_count_min": min(ready_counts, default=0),
@@ -98,6 +109,9 @@ def run_live_indicator_snapshot(
             "market_snapshot_id": report["market_snapshot_id"],
             "indicator_snapshot_id": report["indicator_snapshot_id"],
             "rate_limit_per_second": rate_limit_per_second,
+            "quality_status": quality_report.status.value,
+            "quality_complete_ratio": quality_report.complete_ratio,
+            "quality_reasons": list(quality_report.reasons),
         },
     )
     return report

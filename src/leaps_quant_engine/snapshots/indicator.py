@@ -6,6 +6,8 @@ from threading import Lock
 from types import MappingProxyType
 from typing import Mapping
 
+from leaps_quant_engine.snapshots.freshness import SnapshotQualityReport
+
 
 @dataclass(frozen=True, slots=True)
 class IndicatorValue:
@@ -26,6 +28,7 @@ class IndicatorSnapshot:
     symbols: tuple[str, ...]
     values: Mapping[str, Mapping[str, IndicatorValue]]
     source_snapshot_id: str | None = None
+    quality_report: SnapshotQualityReport | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbols", tuple(self.symbols))

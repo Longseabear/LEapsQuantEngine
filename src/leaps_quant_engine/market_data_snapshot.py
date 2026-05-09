@@ -11,7 +11,7 @@ from uuid import uuid4
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
-from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorSnapshotStore
+from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorSnapshotStore, SnapshotQualityReport
 
 
 logger = logging.getLogger(__name__)
@@ -177,6 +177,7 @@ class MarketDataSnapshotEngine:
         *,
         sleeve_ids: list[str] | None = None,
         universe_id_by_sleeve: Mapping[str, str] | None = None,
+        quality_report_by_sleeve: Mapping[str, SnapshotQualityReport] | None = None,
         publish_active: bool = True,
     ) -> dict[str, IndicatorSnapshot]:
         started = time.perf_counter()
@@ -198,6 +199,7 @@ class MarketDataSnapshotEngine:
                 universe_id=(universe_id_by_sleeve or {}).get(sleeve_id),
                 source_snapshot_id=snapshot.snapshot_id,
                 as_of=snapshot.time,
+                quality_report=(quality_report_by_sleeve or {}).get(sleeve_id),
             )
             store = self.stores_by_sleeve.setdefault(sleeve_id, IndicatorSnapshotStore())
             if publish_active:
@@ -214,6 +216,11 @@ class MarketDataSnapshotEngine:
                     "indicator_snapshot_id": indicator_snapshot.snapshot_id,
                     "symbol_count": len(indicator_snapshot.symbols),
                     "publish_active": publish_active,
+                    "quality_status": (
+                        indicator_snapshot.quality_report.status.value
+                        if indicator_snapshot.quality_report is not None
+                        else None
+                    ),
                 },
             )
         logger.info(
@@ -233,6 +240,7 @@ class MarketDataSnapshotEngine:
         symbols: list[Symbol] | None = None,
         sleeve_ids: list[str] | None = None,
         universe_id_by_sleeve: Mapping[str, str] | None = None,
+        quality_report_by_sleeve: Mapping[str, SnapshotQualityReport] | None = None,
         publish_active: bool = True,
     ) -> tuple[MarketDataSnapshot, dict[str, IndicatorSnapshot]]:
         snapshot = self.collect_once(symbols)
@@ -240,6 +248,7 @@ class MarketDataSnapshotEngine:
             snapshot,
             sleeve_ids=sleeve_ids,
             universe_id_by_sleeve=universe_id_by_sleeve,
+            quality_report_by_sleeve=quality_report_by_sleeve,
             publish_active=publish_active,
         )
         return snapshot, indicator_snapshots

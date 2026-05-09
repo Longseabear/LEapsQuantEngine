@@ -1,6 +1,6 @@
 # Current Status
 
-Last updated: 2026-05-08
+Last updated: 2026-05-09
 
 This document records what is currently implemented and what should come next. It is intentionally operational: keep it close to the code and update it whenever a public runtime contract changes.
 
@@ -73,6 +73,11 @@ Implemented snapshot classes:
 - `MarketDataSnapshot`
 - `MarketDataCollectionReport`
 - `MarketDataCollectionFailure`
+- `BackgroundSnapshotWorker`
+- `SnapshotWorkerCycleReport`
+- `SnapshotWorkerRunReport`
+- `SnapshotFreshnessPolicy`
+- `SnapshotQualityReport`
 - `IndicatorValue`
 - `IndicatorSnapshot`
 - `IndicatorSnapshotStore`
@@ -82,6 +87,305 @@ Snapshot collection supports best-effort operation:
 - symbol-level quote failures are recorded
 - `min_success` can guard snapshot quality
 - successful bars can still be published when the threshold is satisfied
+
+`SnapshotFreshnessPolicy` evaluates collected market data before consumers use it:
+
+```text
+MarketDataSnapshot
+  -> SnapshotFreshnessPolicy
+  -> SnapshotQualityReport
+  -> IndicatorSnapshot
+  -> future Alpha / Risk consumers
+```
+
+Quality statuses:
+
+- `fresh`: safe for new entries and risk checks
+- `degraded`: usable for cautious/risk workflows, but not ideal for new entries
+- `stale`: old snapshot; risk checks may inspect it, but new entries should be blocked
+- `invalid`: do not use for decisions
+
+Current quality inputs:
+
+- complete ratio
+- snapshot age
+- collection duration
+- requested/collected/failed symbol counts
+
+### Warmup
+
+Indicator warmup is now a separate startup/restart step, not a per-tick loop.
+
+```text
+UniverseDefinition
+  -> WarmupPolicy.required_bars(...)
+  -> cached daily history load
+  -> IndicatorEngine.warm_up(...)
+  -> WarmupReport
+  -> live snapshot worker starts from ready in-memory state
+```
+
+Implemented warmup classes:
+
+- `WarmupPolicy`
+- `WarmupSymbolReport`
+- `WarmupReport`
+- `WarmupResult`
+
+Warmup computes the largest required indicator `warmup_period` for the sleeve universe, loads cache-first daily history, keeps only the needed trailing bars, updates the same in-memory `IndicatorEngine` used by live/replay paths, and reports symbol readiness.
+
+Operational triggers:
+
+- before market open
+- engine restart
+- universe or indicator-plan change
+- confirmed daily bar refresh
+- explicit operator smoke/debug run
+
+### Background Snapshot Worker
+
+The first long-running runtime building block is implemented as a deterministic worker object:
+
+```text
+BackgroundSnapshotWorker.run(...)
+  -> optional warmup
+  -> collect MarketDataSnapshot best-effort
+  -> evaluate SnapshotFreshnessPolicy
+  -> IndicatorEngine.on_data(...)
+  -> publish IndicatorSnapshotStore active snapshot
+  -> return SnapshotWorkerCycleReport
+```
+
+The worker can run a bounded number of cycles for smoke/debug commands or can be started on a background thread with `start(...)`. It does not make strategy decisions. Its job is to keep the latest indicator snapshot available for future alpha/risk consumers.
+
+### Runtime Config And Control
+
+Runtime option snapshots now have a v0 contract.
+
+Implemented contracts:
+
+- `ModuleReference`
+- `MarketDataRuntimeConfig`
+- `UniverseRuntimeConfig`
+- `FineUniverseRuntimeConfig`
+- `ActiveUniverseRuntimeConfig`
+- `IndicatorRuntimeConfig`
+- `AlphaRuntimeConfig`
+- `WorkerRuntimeConfig`
+- `SleeveRuntimeConfig`
+- `RuntimeConfig`
+- `RuntimeConfigSnapshot`
+- `RuntimeControlCommand`
+- `RuntimeControlQueue`
+- `RuntimeConfigController`
+
+The boundary is intentional:
+
+```text
+config = settings and module references
+module = strategy / selection / alpha / risk logic
+control command = when to apply a change
+runtime snapshot = currently applied config version
+```
+
+The running process should not poll and reload config files every cycle. It should keep the active `RuntimeConfigSnapshot` in memory, drain control commands at cycle boundaries, and load a config file only for explicit `reload_config` commands.
+
+Runtime bootstrap is also implemented. `bootstrap_sleeve_runtime(...)` takes a validated `RuntimeConfigSnapshot` and builds:
+
+- coarse `UniverseDefinition`
+- market-data and history providers
+- optional `FineUniverseRuntime` and fine refresh report
+- configured `UniverseSelectionModel`
+- active `UniverseDefinition`
+- `AlphaRuntime` from alpha module references
+- sleeve `Portfolio` with configured cash allocation
+- `FrameworkRunner` for alpha, insight state, portfolio construction, risk, and execution
+- `BackgroundSnapshotWorker`
+
+This is the first executable bridge from option snapshot to a live one-cycle worker path.
+The worker now owns snapshot collection and indicator publication only in this bootstrap path. Alpha and downstream framework stages run after the active `IndicatorSnapshot` is published, so `runtime-run-once` can show both worker timing and framework artifacts.
+
+The first config smoke file is:
+
+```text
+configs/runtime/live_us_smoke.json
+```
+
+Validation command:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli runtime-config-validate configs/runtime/live_us_smoke.json
+```
+
+Configured one-cycle runtime command:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/live_us_smoke.json --sleeve-id us-live --held IBM --skip-warmup --summary-only
+```
+
+### Alpha Runtime
+
+Python alpha plugins are supported directly.
+
+Implemented alpha contracts:
+
+- `SnapshotContext`
+- `InsightDirection`
+- `Insight`
+- `InsightBatch`
+- `InsightStore`
+- `AlphaRuntime`
+- `PythonAlphaLoader`
+- `FunctionAlphaModel`
+
+Runtime flow:
+
+```text
+IndicatorSnapshot
+  -> SnapshotContext
+  -> AlphaRuntime
+  -> Python AlphaModel.generate(context)
+  -> InsightBatch
+  -> InsightStore
+```
+
+Python alpha module formats:
+
+- `create_alpha_model()`
+- `ALPHA_MODEL`
+- module-level `generate(context)` with optional `ALPHA_ID` and `VERSION`
+
+Alpha models are direct Python code and therefore trusted in-process plugins. They must still dry-run against a snapshot before activation, and `AlphaRuntime` swaps pending models only at snapshot boundaries.
+
+Alpha output is intentionally not an order. `Insight` is the next deterministic pipeline artifact before portfolio construction and risk.
+
+Current example alpha modules:
+
+- `examples/alpha/live_quote_smoke_alpha.py`
+- `examples/alpha/price_above_sma_alpha.py`
+- `examples/alpha/momentum_strategy_alpha.py`
+- `examples/alpha/etf_rotation_alpha.py`
+- `examples/alpha/volatility_trailing_stop_alpha.py`
+
+The examples are intentionally simple. Live quote smoke emits short-lived UP insights from live quote indicators so the configured runtime can prove snapshot-to-order-intent flow. Momentum emits UP insights for price-above-average positive momentum. ETF rotation emits weighted UP insights for top-ranked ETFs and FLAT insights for unselected names. Volatility trailing stop emits FLAT exit insights when price breaches a volatility-adjusted stop.
+
+### Insight Manager And Framework Pipeline
+
+`Insight` now carries LEAN-style prediction fields:
+
+- `insight_id`
+- `insight_type`
+- `direction`
+- `generated_at`
+- `expires_at`
+- `magnitude`
+- `confidence`
+- `weight`
+- `group_id`
+- `alpha_id`
+- `alpha_version`
+- `source_snapshot_id`
+- `reason`
+
+`InsightManager` tracks insight state:
+
+```text
+active
+expired
+cancelled
+superseded
+```
+
+The manager ingests new `InsightBatch` objects, supersedes active same-alpha/same-symbol/same-type insights, expires old insights by time, and exposes the current active insight set.
+
+The first LEAN-style framework runner is implemented:
+
+```text
+IndicatorSnapshot
+  -> AlphaRuntime
+  -> InsightManager
+  -> PortfolioConstructionModel
+  -> RiskManagementModel
+  -> ExecutionModel
+  -> OrderIntent
+```
+
+Implemented framework contracts:
+
+- `FrameworkRunner`
+- `FrameworkCycleResult`
+- `StageTiming`
+- `PortfolioConstructionContext`
+- `PortfolioConstructionModel`
+- `EqualWeightPortfolioConstructionModel`
+- `RiskManagementContext`
+- `RiskManagementModel`
+- `RiskDecision`
+- `RiskDecisionBatch`
+- `PassThroughRiskManagementModel`
+
+Current v0 behavior:
+
+- Alpha emits new insights only.
+- `InsightManager` maintains active/inactive signal state.
+- Portfolio construction reads active insights and produces `PortfolioTarget` records.
+- When previously managed insights expire, portfolio construction can emit flatten targets.
+- Risk runs every framework cycle and currently passes targets through.
+- Execution turns approved targets into `OrderIntent` records using the existing immediate execution model.
+- `runtime-run-once` now runs this framework path after `BackgroundSnapshotWorker` publishes the active indicator snapshot.
+
+### Universe Selection
+
+Universe selection now has a v0 domain structure.
+
+Implemented contracts:
+
+- `UniverseSelectionContext`
+- `UniverseSelectionCandidate`
+- `UniverseSelectionResult`
+- `StaticUniverseSelectionModel`
+- `MomentumUniverseSelectionModel`
+- `FineUniverseCache`
+- `FineUniverseRuntime`
+- `FineUniverseRefreshReport`
+
+The selection hierarchy is:
+
+```text
+coarse universe file, e.g. 200 symbols
+  -> fine universe cache refresh
+  -> fresh fine universe
+  -> sleeve UniverseSelectionModel
+  -> selected active candidates
+  -> forced operational watchlist
+  -> live universe
+```
+
+Fine universe is the paced cache tier. It can refresh a larger symbol set over a 1-5 minute window, keeping per-symbol `updated_at`, freshness, and failure metadata. Active selection can then run from fresh fine symbols instead of assuming every coarse symbol is current.
+
+Forced symbols are always included in the final live universe:
+
+```text
+live_symbols =
+  selected_symbols
+  + held_symbols
+  + open_order_symbols
+  + exit_watch_symbols
+  + manual_symbols
+```
+
+`UniverseSelectionResult.to_universe_definition(...)` can turn the selected live symbols back into a `UniverseDefinition` for `BackgroundSnapshotWorker`.
+
+The first implemented strategy selector is momentum/liquidity based. It scores candidates from an `IndicatorSnapshot` using:
+
+- liquidity indicator
+- momentum indicator
+- optional price-above-average bonus
+- optional volatility penalty
+
+This is intentionally only a v0 selector. Different sleeves should be able to provide different selection models later.
 
 ### Market Data
 
@@ -126,6 +430,48 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli benchmark-indicators-daily configs/universes/benchmark_kor_200.json --sleeve-id benchmark-kor
 ```
 
+Daily indicator warmup smoke:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli warmup-indicators-daily configs/universes/swing_kor_core.json --sleeve-id swing-kor --summary-only
+```
+
+Bounded snapshot worker run:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli snapshot-worker-run configs/universes/swing_kor_core.json --sleeve-id swing-kor --cycles 1 --interval-seconds 0 --summary-only
+```
+
+Python alpha smoke:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli alpha-run-snapshot configs/universes/swing_kor_core.json examples/alpha/price_above_sma_alpha.py --sleeve-id swing-kor --min-success 2 --rate-limit-per-second 20 --summary-only
+```
+
+Active universe selection smoke:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli select-active-universe configs/universes/benchmark_kor_200.json --sleeve-id benchmark-kor --top-n 60 --summary-only
+```
+
+Active-only snapshot worker smoke:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli active-snapshot-worker-run configs/universes/us_live_smoke.json --sleeve-id us-live --top-n 2 --held IBM --cycles 1 --interval-seconds 0 --skip-worker-warmup --min-success 2 --rate-limit-per-second 20 --summary-only
+```
+
+Fine universe refresh smoke:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli fine-universe-refresh configs/universes/us_live_smoke.json --rate-limit-per-second 20 --include-entries
+```
+
 Recent 200-symbol Korean daily replay result:
 
 - universe: 200
@@ -156,6 +502,70 @@ Interpretation:
 ```text
 data collection is the bottleneck
 indicator update is not the bottleneck
+```
+
+Recent US Coarse/Fine/Active smoke result:
+
+```text
+Coarse universe:
+  NVDA, MSFT, AAPL, IBM
+
+Fine refresh:
+  requested: 4
+  updated: 4
+  failed: 0
+  fresh: 4
+  elapsed: about 857 ms
+
+Active selection:
+  selected: NVDA, MSFT
+  forced held: IBM
+  live universe: NVDA, MSFT, IBM
+
+Active live worker:
+  requested: 3
+  updated: 3
+  failed: 0
+  quality: fresh
+  collection: about 2,358 ms
+  indicator update + snapshot publish: about 0.206 ms
+```
+
+Interpretation:
+
+```text
+fine cache can refresh broader candidates on a slower cadence
+active worker should update only symbols that need live freshness
+KIS / market-data-engine collection remains the bottleneck
+engine-side indicator and snapshot work remains sub-millisecond for this size
+```
+
+Recent configured runtime smoke:
+
+```text
+command:
+  runtime-run-once configs/runtime/live_us_smoke.json --sleeve-id us-live --held IBM --skip-warmup --summary-only
+
+fine refresh:
+  requested: 4
+  updated: 4
+  elapsed: about 538 ms on a warm local cache
+
+worker:
+  live universe: NVDA, MSFT, IBM
+  requested: 3
+  updated: 3
+  quality: fresh
+  collection: about 262 ms
+  indicator update + snapshot publish: about 0.140 ms
+
+framework:
+  alpha: live-quote-smoke
+  new insights: 3
+  portfolio targets: 3
+  approved risk decisions: 3
+  order intents: 3 buy intents
+  framework total: about 0.252 ms
 ```
 
 ### Logging
@@ -192,6 +602,16 @@ Important event names:
 - `indicator_snapshot.update.complete`
 - `live_indicator_snapshot.start`
 - `live_indicator_snapshot.complete`
+- `background_snapshot_worker.warmup.start`
+- `background_snapshot_worker.warmup.complete`
+- `background_snapshot_worker.cycle.start`
+- `background_snapshot_worker.cycle.complete`
+- `alpha_runtime.pending.stage`
+- `alpha_runtime.pending.activate`
+- `alpha_runtime.model.complete`
+- `alpha_runtime.batch.publish`
+
+`live_indicator_snapshot.complete` includes quality fields such as `quality_status`, `quality_complete_ratio`, and `quality_reasons`.
 
 ## Current Commands
 
@@ -204,7 +624,7 @@ py -3 -m pytest -q
 Expected current result:
 
 ```text
-52 passed
+103 passed
 ```
 
 Run sample:
@@ -223,31 +643,94 @@ py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live
 
 ## Known Limitations
 
-- No continuous background snapshot worker yet.
-- No freshness/degraded-state policy yet.
-- No formal `UniverseSelectionModel`, `AlphaModel`, `PortfolioConstructionModel`, or `RiskManagementModel` interface yet.
+- `BackgroundSnapshotWorker` exists, but it is not yet wrapped by a production process supervisor.
+- Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, but formal risk gates are not wired yet.
+- `PortfolioConstructionModel` and `RiskManagementModel` interfaces exist, but only v0 equal-weight and pass-through implementations are available.
+- Universe selection exists, but is not yet automatically scheduled into the live worker loop.
 - No order ticket/order event state machine yet.
 - Live 200-symbol polling is bounded by external KIS/market-data-engine throughput and should not be used as a high-frequency strategy loop.
 - Current live US Top 200 universe generation was tested ad hoc; the committed fixture is a small smoke universe.
+
+## Indicator Resolution Policy
+
+Default strategy indicators should be treated as confirmed daily indicators.
+
+For swing/low-frequency strategies:
+
+```text
+confirmed daily indicators
+  -> update only when a daily bar is complete
+  -> remain fixed during the next intraday session
+
+live market snapshot
+  -> current price
+  -> current volume
+  -> intraday return
+  -> freshness / data quality
+```
+
+Example:
+
+```text
+2026-05-08 intraday alpha check
+  SMA20 = value confirmed from daily bars through 2026-05-07 close
+  current_price = latest live quote during 2026-05-08 session
+
+condition:
+  current_price > confirmed_daily_sma20
+```
+
+In this model, the SMA value does not move intraday, but the comparison result can change because current price moves.
+
+Provisional daily indicators may be added later, but they must be explicitly named and replayable:
+
+```text
+sma_20_daily_confirmed
+sma_20_daily_provisional = previous 19 confirmed daily closes + current live price
+```
+
+Do not mix daily bars, minute bars, and quote snapshots into the same indicator stream. Indicator definitions should eventually declare a resolution such as `daily`, `minute`, or `quote`, and the engine should reject mismatched updates unless a consolidator explicitly converts the data.
+
+Current practical split:
+
+```text
+Confirmed daily / history-updated:
+  SMA, EMA, momentum/ROC, ATR, rolling high/low/range,
+  rolling volatility, drawdown, rolling dollar volume
+
+Live quote / snapshot-updated:
+  close/current price, volume, one-snapshot dollar volume,
+  quote VWAP-like values, intraday return, spread/liquidity fields
+```
+
+`us_live_smoke.json` intentionally uses live quote indicators:
+
+```text
+close
+volume
+dollar_volume_1
+vwap_1
+```
+
+These can be updated by active live snapshots. Confirmed daily indicators should not be advanced by quote snapshots unless the indicator is explicitly defined as provisional or intraday.
 
 ## Next Work
 
 Recommended next vertical slice:
 
 ```text
-BackgroundSnapshotWorker
-  -> paced active universe quote collection
-  -> MarketDataSnapshot close
-  -> IndicatorEngine update
-  -> IndicatorSnapshotStore publish
-  -> freshness/degraded-state report
+UniverseSelectionRuntime
+  -> run selection on schedule or operator trigger
+  -> publish active UniverseDefinition
+  -> restart/update BackgroundSnapshotWorker target symbols safely
+  -> keep forced watchlist invariant
 ```
 
 After that:
 
-1. Add snapshot freshness policy.
-2. Add active universe selection from a larger research universe.
-3. Define `AlphaModel` over `IndicatorSnapshot`.
-4. Route alpha outputs into portfolio construction and risk.
-5. Simulate n-1 minute indicator snapshots in backtests.
-6. Add order intent lineage into portfolio state transitions.
+1. Define minimal `RiskManagementModel` quality gates.
+2. Add configurable portfolio construction and risk module references.
+3. Persist and replay portfolio/risk state snapshots across process restarts.
+4. Simulate n-1 minute indicator snapshots in backtests.
+5. Add idempotent order intent lineage before broker submission.
+6. Add order ticket/order event state machine.

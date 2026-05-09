@@ -6,6 +6,7 @@ from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
 from leaps_quant_engine.market_data_snapshot import MarketDataSnapshot, MarketDataSnapshotEngine
 from leaps_quant_engine.models import Bar, Symbol
+from leaps_quant_engine.snapshots import SnapshotFreshnessPolicy, SnapshotQualityStatus
 from leaps_quant_engine.universe.loader import parse_universe_definition
 
 
@@ -147,6 +148,7 @@ def test_live_indicator_snapshot_runner_splits_collection_and_indicator_timing()
         source="fake-live",
         min_success=1,
         include_failures=True,
+        freshness_policy=SnapshotFreshnessPolicy(degraded_complete_ratio=0.5),
     )
 
     assert report["source"] == "fake-live"
@@ -156,4 +158,36 @@ def test_live_indicator_snapshot_runner_splits_collection_and_indicator_timing()
     assert report["failed_symbol_count"] == 1
     assert report["indicator_count_per_symbol"] == 1
     assert report["indicator_updates_estimated"] == 1
+    assert report["snapshot_quality"]["status"] == "degraded"
     assert report["failures"][0]["symbol"] == "KRX:FAIL"
+
+
+def test_indicator_snapshot_receives_quality_report_from_live_runner():
+    universe = parse_universe_definition(
+        {
+            "id": "live",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "close", "type": "close", "period": 1}],
+        }
+    )
+    indicator_engine = IndicatorEngine()
+    indicator_engine.register_universe("live-sleeve", universe)
+    snapshot_engine = MarketDataSnapshotEngine(BestEffortProvider(), indicator_engine)
+    collection = snapshot_engine.collect_once_best_effort(list(universe.symbols))
+    quality = SnapshotFreshnessPolicy().evaluate(
+        requested_symbol_count=collection.report.requested_symbol_count,
+        collected_symbol_count=collection.report.collected_symbol_count,
+        failed_symbol_count=collection.report.failed_symbol_count,
+        completed_at=collection.report.completed_at,
+        elapsed_ms=collection.report.elapsed_ms,
+    )
+
+    snapshots = snapshot_engine.update_indicators(
+        collection.snapshot,
+        sleeve_ids=["live-sleeve"],
+        quality_report_by_sleeve={"live-sleeve": quality},
+    )
+
+    assert snapshots["live-sleeve"].quality_report is quality
+    assert snapshots["live-sleeve"].quality_report.status == SnapshotQualityStatus.FRESH

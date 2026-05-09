@@ -8,7 +8,7 @@ from leaps_quant_engine.indicators.factory import create_indicator
 from leaps_quant_engine.indicators.registry import IndicatorRegistry
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
-from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
+from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue, SnapshotQualityReport
 from leaps_quant_engine.universe.definition import UniverseDefinition
 
 
@@ -108,6 +108,7 @@ class IndicatorEngine:
         source_snapshot_id: str | None = None,
         as_of: datetime | None = None,
         created_at: datetime | None = None,
+        quality_report: SnapshotQualityReport | None = None,
     ) -> IndicatorSnapshot:
         registry = self._registry(sleeve_id)
         symbols = self.symbols_for_sleeve(sleeve_id)
@@ -131,6 +132,7 @@ class IndicatorEngine:
             created_at=created_at or datetime.now(),
             symbols=tuple(symbol.key for symbol in symbols),
             values=values,
+            quality_report=quality_report,
         )
 
     def symbols_for_sleeve(self, sleeve_id: str) -> list[Symbol]:
