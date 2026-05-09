@@ -70,7 +70,8 @@ flowchart LR
     AlphaRuntime --> InsightManager["InsightManager"]
     InsightManager --> Portfolio["PortfolioConstructionEngine<br/>EqualWeightPortfolioConstructionModel"]
     Portfolio --> TargetBatch["PortfolioTargetBatch"]
-    TargetBatch --> Risk["PassThroughRiskManagementModel"]
+    TargetBatch --> TargetPlan["PortfolioTargetPlan<br/>current -> target -> delta"]
+    TargetPlan --> Risk["PassThroughRiskManagementModel"]
     Risk --> Execution["ImmediateExecutionModel"]
     Execution --> Intent["OrderIntent"]
 ```
@@ -80,7 +81,7 @@ Implemented now:
 - Universe: coarse file, fine cache refresh, active selection, and forced inclusion for held/open-order/exit-watch/manual symbols.
 - Indicators: sleeve-namespaced in-memory state, warmup, 30+ indicator catalog, live snapshot updates, and immutable `IndicatorSnapshot`.
 - Alpha: Python Alpha Model loader, `AlphaRuntime`, `Insight`, `InsightBatch`, and example alpha modules.
-- Framework: `InsightManager`, `PortfolioConstructionEngine`, equal-weight portfolio model, pass-through risk, immediate execution, and order-intent output.
+- Framework: `InsightManager`, `PortfolioConstructionEngine`, equal-weight portfolio model, `PortfolioTargetPlan`, pass-through risk, immediate execution, and order-intent output.
 - Runtime: config validation, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
 - Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills and report metrics.
 
@@ -96,7 +97,7 @@ Not complete yet:
 - `Algorithm`: user strategy logic, similar to LEAN's algorithm surface.
 - `Engine`: event loop that feeds data slices into algorithms.
 - `Sleeve`: budgeted strategy compartment with its own policy and risk boundary.
-- `Portfolio`: shared state for cash, holdings, and sleeve allocations.
+- `Portfolio`: sleeve virtual account projection for cash, holdings, mark value, and equity.
 - `Execution`: converts sleeve-approved targets into order intents.
 - `Runtime`: wires config, algorithms, data, and execution together.
 - `IndicatorEngine`: sleeve-namespaced incremental indicator state.
@@ -105,7 +106,7 @@ Not complete yet:
 - `BackgroundSnapshotWorker`: bounded/background snapshot update loop.
 - `AlphaRuntime`: Python Alpha Model runner that emits insights from snapshots.
 - `InsightManager`: LEAN-style active/expired/cancelled insight state.
-- `PortfolioConstructionEngine`: turns active insights into auditable `PortfolioTargetBatch` records through a pluggable model and rebalance policy.
+- `PortfolioConstructionEngine`: turns active insights plus the sleeve virtual account portfolio into auditable `PortfolioTargetBatch` and `PortfolioTargetPlan` records.
 - `FrameworkRunner`: deterministic `Alpha -> Portfolio -> Risk -> Execution` v0 pipeline.
 - `UniverseSelectionModel`: sleeve-level active universe selection with forced watchlist inclusion.
 - `RuntimeConfig` / `RuntimeControlCommand`: option snapshots and command-based reload for future UI/control-plane flows.
@@ -119,7 +120,7 @@ py -3 -m pytest -q
 Current expected result:
 
 ```text
-113 passed
+115 passed
 ```
 
 ## Run Sample
@@ -212,6 +213,7 @@ Historical DataSlice replay
   -> InsightManager
   -> PortfolioConstructionEngine
   -> PortfolioTargetBatch
+  -> PortfolioTargetPlan
   -> RiskManagement
   -> Execution
   -> immediate fill model
@@ -323,12 +325,13 @@ IndicatorSnapshot
   -> InsightManager
   -> PortfolioConstructionEngine
   -> PortfolioTargetBatch
+  -> PortfolioTargetPlan
   -> PassThroughRiskManagementModel
   -> ImmediateExecutionModel
   -> OrderIntent
 ```
 
-This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights, creates auditable `PortfolioTargetBatch` records, and emits flatten targets when previously managed insights become inactive. The v0 engine wraps the equal-weight model with `RebalancePolicy` support for cash reserve, minimum quantity delta, and minimum order notional filters. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
+This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights and the sleeve's virtual account portfolio, creates auditable `PortfolioTargetBatch` records, and emits `PortfolioTargetPlan` entries that explain current quantity, target quantity, and delta. It can flatten held symbols when their active insight becomes inactive. The v0 engine wraps the equal-weight model with `RebalancePolicy` support for cash reserve, minimum quantity delta, and minimum order notional filters. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
 
 Portfolio Construction Models can be injected as Python model modules, similar to Alpha Models:
 

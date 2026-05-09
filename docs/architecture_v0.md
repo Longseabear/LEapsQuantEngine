@@ -43,7 +43,8 @@ flowchart LR
     Alpha --> Insights["InsightBatch"]
     Insights --> Manager["InsightManager"]
     Manager --> PC["PortfolioConstructionModel"]
-    PC --> Risk["RiskManagementModel"]
+    PC --> TargetPlan["PortfolioTargetPlan<br/>current -> target -> delta"]
+    TargetPlan --> Risk["RiskManagementModel"]
     Risk --> ExecModel["ExecutionModel"]
     ExecModel --> OrderIntent["OrderIntent"]
     OrderIntent --> Future["Order ticket / events / PortfolioState"]
@@ -79,7 +80,9 @@ flowchart LR
 - Alpha hot reload should happen by staging a pending model and activating it at the next snapshot boundary.
 - `InsightManager` stores active insight state. Alpha models only emit new insights; portfolio construction consumes the current active insight set.
 - `FrameworkRunner` is the first deterministic model pipeline runner for `Alpha -> PortfolioConstruction -> RiskManagement -> Execution`.
-- `EqualWeightPortfolioConstructionModel` converts active up insights into quantity targets and can emit flatten targets when previously managed insights expire.
+- The portfolio layer assumes each sleeve has its own virtual account projection; KIS account-level holdings are not part of the deterministic core contract.
+- `EqualWeightPortfolioConstructionModel` converts active up insights plus the sleeve portfolio projection into quantity targets and can emit flatten targets when held or previously managed symbols lose active insight support.
+- `PortfolioTargetPlan` records current quantity/value, target quantity/value, and delta so Risk can reason about entries, exits, and rebalances.
 - `PassThroughRiskManagementModel` proves the risk stage contract while leaving real risk gates for the next slice.
 - `FineUniverseRuntime` is the paced cache tier between coarse and active. It refreshes broader candidates on a 1-5 minute cadence and records per-symbol freshness and failures.
 - `UniverseSelectionModel` turns a broad coarse/fine universe into an active live universe. Sleeve strategy owns candidate ranking, while the engine force-includes held/open-order/exit-watch symbols.

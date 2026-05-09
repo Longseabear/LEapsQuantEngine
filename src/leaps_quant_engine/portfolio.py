@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, Symbol
 
 
 @dataclass(slots=True)
@@ -17,9 +17,34 @@ class Portfolio:
     cash: float
     holdings: dict[str, Holding] = field(default_factory=dict)
 
+    @property
+    def held_symbols(self) -> tuple[Symbol, ...]:
+        return tuple(holding.symbol for holding in self.holdings.values() if holding.quantity != 0)
+
     def quantity(self, symbol: Symbol) -> int:
         holding = self.holdings.get(symbol.key)
         return holding.quantity if holding else 0
+
+    def mark_price(self, symbol: Symbol, data: DataSlice) -> float | None:
+        bar = data.get(symbol)
+        if bar is not None:
+            return bar.close
+        holding = self.holdings.get(symbol.key)
+        if holding is not None and holding.average_price > 0:
+            return holding.average_price
+        return None
+
+    def position_value(self, symbol: Symbol, data: DataSlice) -> float:
+        price = self.mark_price(symbol, data)
+        if price is None:
+            return 0.0
+        return self.quantity(symbol) * price
+
+    def equity(self, data: DataSlice) -> float:
+        return self.cash + sum(
+            self.position_value(holding.symbol, data)
+            for holding in self.holdings.values()
+        )
 
     def apply_fill(self, intent: OrderIntent) -> None:
         holding = self.holdings.setdefault(intent.symbol.key, Holding(intent.symbol))

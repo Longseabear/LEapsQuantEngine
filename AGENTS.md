@@ -191,6 +191,8 @@ Each sleeve owns:
 - risk policy
 - execution policy
 
+For the deterministic core, treat each sleeve as having an abstract virtual account/portfolio. KIS account-level holdings are not the portfolio construction source of truth; KIS remains a downstream broker adapter concern.
+
 Sleeves may share infrastructure such as data feeds and broker adapters, but they must not silently share state. Cross-sleeve movement of cash, lots, or positions must be explicit and auditable.
 
 ## Universe Selection Direction

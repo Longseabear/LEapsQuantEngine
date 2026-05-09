@@ -4,6 +4,7 @@ from leaps_quant_engine.framework.portfolio_construction import (
     PortfolioConstructionContext,
     PortfolioConstructionModel,
     PortfolioTargetBatch,
+    PortfolioTargetPlan,
     RebalancePolicy,
 )
 from leaps_quant_engine.framework.portfolio_model_loader import (
@@ -32,6 +33,7 @@ __all__ = [
     "PortfolioConstructionContext",
     "PortfolioConstructionModel",
     "PortfolioTargetBatch",
+    "PortfolioTargetPlan",
     "PythonPortfolioConstructionModelLoader",
     "RebalancePolicy",
     "RiskDecision",

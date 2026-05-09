@@ -318,6 +318,7 @@ IndicatorSnapshot
   -> InsightManager
   -> PortfolioConstructionEngine
   -> PortfolioTargetBatch
+  -> PortfolioTargetPlan
   -> RiskManagementModel
   -> ExecutionModel
   -> OrderIntent
@@ -329,6 +330,7 @@ Implemented framework contracts:
 - `FrameworkCycleResult`
 - `StageTiming`
 - `PortfolioTargetBatch`
+- `PortfolioTargetPlan`
 - `RebalancePolicy`
 - `PythonPortfolioConstructionModelLoader`
 - `PortfolioConstructionContext`
@@ -345,11 +347,13 @@ Current v0 behavior:
 
 - Alpha emits new insights only.
 - `InsightManager` maintains active/inactive signal state.
-- `PortfolioConstructionEngine` reads active insights and produces auditable `PortfolioTargetBatch` records.
+- `PortfolioConstructionEngine` reads active insights and the sleeve virtual account portfolio, then produces auditable `PortfolioTargetBatch` records.
+- `PortfolioTargetPlan` records current quantity, target quantity, delta quantity, current value, target value, delta value, and insight lineage for each emitted target.
+- The core assumes sleeve-level virtual accounts already exist. KIS account-level holdings are a broker adapter concern, not the portfolio construction source of truth.
 - `EqualWeightPortfolioConstructionModel` remains the first model implementation.
 - `RebalancePolicy` can reserve cash, filter tiny quantity deltas, and suppress tiny non-exit order notionals.
 - Portfolio Construction Models can be loaded from Python model modules through `PythonPortfolioConstructionModelLoader`.
-- When previously managed insights expire, portfolio construction can emit flatten targets.
+- When previously managed or currently held symbols lose active insight support, portfolio construction can emit flatten targets.
 - Risk runs every framework cycle and currently passes targets through.
 - Execution turns approved targets into `OrderIntent` records using the existing immediate execution model.
 - `runtime-run-once` now runs this framework path after `BackgroundSnapshotWorker` publishes the active indicator snapshot.
@@ -738,7 +742,7 @@ py -3 -m pytest -q
 Expected current result:
 
 ```text
-113 passed
+115 passed
 ```
 
 Run sample:
@@ -759,7 +763,7 @@ py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live
 
 - `BackgroundSnapshotWorker` exists, but it is not yet wrapped by a production process supervisor.
 - Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, but formal risk gates are not wired yet.
-- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading, a v0 equal-weight model, and rebalance policy. Risk still only has a pass-through implementation.
+- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading, a v0 equal-weight model, rebalance policy, and `PortfolioTargetPlan` current-vs-target deltas. Risk still only has a pass-through implementation.
 - Framework alpha backtesting exists, but n-1 minute delayed indicator snapshot modeling is not implemented yet.
 - Universe selection exists, but is not yet automatically scheduled into the live worker loop.
 - No order ticket/order event state machine yet.

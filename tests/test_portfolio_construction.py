@@ -68,8 +68,15 @@ def test_portfolio_construction_engine_creates_target_batch_with_cash_reserve():
         "US:AAA": 4,
         "US:BBB": 8,
     }
+    assert {plan.target.symbol.key: plan.delta_quantity for plan in batch.plans} == {
+        "US:AAA": 4,
+        "US:BBB": 8,
+    }
+    assert batch.plans[0].source_insight_ids
     assert batch.metadata["portfolio_equity"] == pytest.approx(1_000)
     assert batch.metadata["target_portfolio_value"] == pytest.approx(800)
+    assert batch.metadata["raw_plan_count"] == 2
+    assert batch.metadata["filtered_plan_count"] == 2
 
 
 def test_rebalance_policy_filters_small_target_delta():
@@ -92,8 +99,11 @@ def test_rebalance_policy_filters_small_target_delta():
     )
 
     assert batch.targets == ()
+    assert batch.plans == ()
     assert batch.metadata["raw_target_count"] == 1
     assert batch.metadata["filtered_target_count"] == 0
+    assert batch.metadata["raw_plan_count"] == 1
+    assert batch.metadata["filtered_plan_count"] == 0
 
 
 def test_rebalance_policy_preserves_small_exit_targets_by_default():
@@ -116,3 +126,54 @@ def test_rebalance_policy_preserves_small_exit_targets_by_default():
     )
 
     assert batch.targets == (target,)
+    assert len(batch.plans) == 1
+    assert batch.plans[0].current_quantity == 1
+    assert batch.plans[0].target_quantity == 0
+    assert batch.plans[0].delta_quantity == -1
+    assert batch.plans[0].is_exit is True
+
+
+def test_equal_weight_model_flattens_current_holding_without_active_insight():
+    held = Symbol("HELD", "US")
+    portfolio = Portfolio(cash=100, holdings={held.key: Holding(held, quantity=3, average_price=25.0)})
+    engine = PortfolioConstructionEngine(model=EqualWeightPortfolioConstructionModel())
+
+    batch = engine.create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(held, 30.0)),
+            portfolio=portfolio,
+            active_insights=(),
+            managed_symbols=(),
+        )
+    )
+
+    assert batch.targets == (PortfolioTarget(symbol=held, quantity=0, tag="framework:insight_inactive"),)
+    assert batch.plans[0].current_quantity == 3
+    assert batch.plans[0].target_quantity == 0
+    assert batch.plans[0].current_price == 30.0
+    assert batch.plans[0].current_value == pytest.approx(90.0)
+    assert batch.plans[0].target_value == pytest.approx(0.0)
+    assert batch.plans[0].delta_value == pytest.approx(-90.0)
+
+
+def test_portfolio_target_batch_serializes_target_plans():
+    symbol = Symbol("AAA", "US")
+    batch = PortfolioConstructionEngine(model=StaticTargetModel(PortfolioTarget(symbol, 2, "static"))).create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 50.0)),
+            portfolio=Portfolio(cash=1_000),
+            active_insights=(),
+            managed_symbols=(),
+        )
+    )
+
+    payload = batch.to_dict()
+
+    assert payload["plan_count"] == 1
+    assert payload["plans"][0]["symbol"] == "US:AAA"
+    assert payload["plans"][0]["current_quantity"] == 0
+    assert payload["plans"][0]["target_quantity"] == 2
+    assert payload["plans"][0]["delta_quantity"] == 2
+    assert payload["plans"][0]["target_value"] == pytest.approx(100.0)

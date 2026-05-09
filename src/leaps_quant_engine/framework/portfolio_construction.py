@@ -29,6 +29,10 @@ class PortfolioConstructionContext:
     def target_value(self) -> float:
         return self.target_portfolio_value if self.target_portfolio_value > 0 else self.equity
 
+    @property
+    def held_symbols(self) -> tuple[Symbol, ...]:
+        return self.portfolio.held_symbols
+
 
 class PortfolioConstructionModel(Protocol):
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioTarget, ...]:
@@ -36,10 +40,50 @@ class PortfolioConstructionModel(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class PortfolioTargetPlan:
+    target: PortfolioTarget
+    current_quantity: int
+    target_quantity: int
+    delta_quantity: int
+    current_price: float | None
+    current_value: float
+    target_value: float
+    delta_value: float
+    source_insight_ids: tuple[str, ...] = ()
+    reason: str = ""
+
+    @property
+    def is_entry(self) -> bool:
+        return self.current_quantity == 0 and self.target_quantity > 0
+
+    @property
+    def is_exit(self) -> bool:
+        return self.current_quantity != 0 and self.target_quantity == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.target.symbol.key,
+            "current_quantity": self.current_quantity,
+            "target_quantity": self.target_quantity,
+            "delta_quantity": self.delta_quantity,
+            "current_price": self.current_price,
+            "current_value": self.current_value,
+            "target_value": self.target_value,
+            "delta_value": self.delta_value,
+            "source_insight_ids": list(self.source_insight_ids),
+            "reason": self.reason,
+            "tag": self.target.tag,
+            "is_entry": self.is_entry,
+            "is_exit": self.is_exit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PortfolioTargetBatch:
     sleeve_id: str
     generated_at: datetime
     targets: tuple[PortfolioTarget, ...]
+    plans: tuple[PortfolioTargetPlan, ...] = ()
     source_insight_ids: tuple[str, ...] = ()
     model_name: str = ""
     reason: str = ""
@@ -53,6 +97,10 @@ class PortfolioTargetBatch:
     def target_count(self) -> int:
         return len(self.targets)
 
+    @property
+    def plan_count(self) -> int:
+        return len(self.plans)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "batch_id": self.batch_id,
@@ -62,6 +110,7 @@ class PortfolioTargetBatch:
             "reason": self.reason,
             "source_insight_ids": list(self.source_insight_ids),
             "target_count": self.target_count,
+            "plan_count": self.plan_count,
             "targets": [
                 {
                     "symbol": target.symbol.key,
@@ -70,6 +119,7 @@ class PortfolioTargetBatch:
                 }
                 for target in self.targets
             ],
+            "plans": [plan.to_dict() for plan in self.plans],
             "metadata": dict(self.metadata),
         }
 
@@ -105,17 +155,22 @@ class PortfolioConstructionEngine:
             target_portfolio_value=target_value,
         )
         raw_targets = self.model.create_targets(prepared_context)
-        targets = self._filter_rebalance_noise(prepared_context, raw_targets)
+        raw_plans = self._build_plans(prepared_context, raw_targets)
+        plans = self._filter_rebalance_noise(raw_plans)
+        targets = tuple(plan.target for plan in plans)
         return PortfolioTargetBatch(
             sleeve_id=context.sleeve_id,
             generated_at=context.data.time,
             targets=targets,
+            plans=plans,
             source_insight_ids=tuple(insight.insight_id for insight in context.active_insights),
             model_name=type(self.model).__name__,
             reason=self.reason,
             metadata={
                 "raw_target_count": len(raw_targets),
                 "filtered_target_count": len(targets),
+                "raw_plan_count": len(raw_plans),
+                "filtered_plan_count": len(plans),
                 "portfolio_equity": equity,
                 "target_portfolio_value": target_value,
                 "cash_reserve_pct": self.rebalance_policy.cash_reserve_pct,
@@ -124,45 +179,47 @@ class PortfolioConstructionEngine:
             },
         )
 
-    def _filter_rebalance_noise(
+    def _build_plans(
         self,
         context: PortfolioConstructionContext,
         targets: tuple[PortfolioTarget, ...],
-    ) -> tuple[PortfolioTarget, ...]:
-        filtered: list[PortfolioTarget] = []
-        for target in targets:
-            current_quantity = context.portfolio.quantity(target.symbol)
-            delta = target.quantity - current_quantity
-            if delta == 0:
+    ) -> tuple[PortfolioTargetPlan, ...]:
+        insight_ids_by_symbol = _insight_ids_by_symbol(context.active_insights)
+        return tuple(
+            _target_plan(
+                context,
+                target,
+                source_insight_ids=insight_ids_by_symbol.get(target.symbol.key, ()),
+                reason=_target_reason(target),
+            )
+            for target in targets
+        )
+
+    def _filter_rebalance_noise(self, plans: tuple[PortfolioTargetPlan, ...]) -> tuple[PortfolioTargetPlan, ...]:
+        filtered: list[PortfolioTargetPlan] = []
+        for plan in plans:
+            if plan.delta_quantity == 0:
                 continue
-            if abs(delta) < self.rebalance_policy.min_quantity_delta:
+            if abs(plan.delta_quantity) < self.rebalance_policy.min_quantity_delta:
                 continue
-            if self._below_min_notional(context, target, delta, current_quantity=current_quantity):
+            if self._below_min_notional(plan):
                 continue
-            filtered.append(target)
+            filtered.append(plan)
         return tuple(filtered)
 
-    def _below_min_notional(
-        self,
-        context: PortfolioConstructionContext,
-        target: PortfolioTarget,
-        delta: int,
-        *,
-        current_quantity: int,
-    ) -> bool:
+    def _below_min_notional(self, plan: PortfolioTargetPlan) -> bool:
         min_notional = self.rebalance_policy.min_order_notional
         if min_notional <= 0:
             return False
         if (
             self.rebalance_policy.allow_exit_below_min_notional
-            and target.quantity == 0
-            and current_quantity != 0
+            and plan.target_quantity == 0
+            and plan.current_quantity != 0
         ):
             return False
-        bar = context.data.get(target.symbol)
-        if bar is None:
+        if plan.current_price is None:
             return True
-        return abs(delta) * bar.close < min_notional
+        return abs(plan.delta_quantity) * plan.current_price < min_notional
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +250,7 @@ class EqualWeightPortfolioConstructionModel:
                     tag=f"framework:{insight.alpha_id}:{insight.direction.value}",
                 )
 
-        for symbol in context.managed_symbols:
+        for symbol in _symbols_by_key((*context.managed_symbols, *context.held_symbols)).values():
             if symbol.key in target_qty_by_symbol:
                 continue
             if context.portfolio.quantity(symbol) == 0:
@@ -215,6 +272,17 @@ def _latest_insight_by_symbol(insights: tuple[Insight, ...]) -> dict[str, Insigh
     return latest
 
 
+def _insight_ids_by_symbol(insights: tuple[Insight, ...]) -> dict[str, tuple[str, ...]]:
+    result: dict[str, list[str]] = {}
+    for insight in insights:
+        result.setdefault(insight.symbol_key, []).append(insight.insight_id)
+    return {symbol_key: tuple(insight_ids) for symbol_key, insight_ids in result.items()}
+
+
+def _symbols_by_key(symbols: tuple[Symbol, ...]) -> dict[str, Symbol]:
+    return {symbol.key: symbol for symbol in symbols}
+
+
 def _target_weight(insight: Insight, equal_weight: float, *, long_only: bool) -> float:
     weight = abs(insight.weight) if insight.weight is not None else equal_weight
     weight = min(weight, equal_weight)
@@ -230,10 +298,36 @@ def _quantity_for_weight(context: PortfolioConstructionContext, symbol: Symbol, 
     return int((context.target_value * weight) // bar.close)
 
 
+def _target_plan(
+    context: PortfolioConstructionContext,
+    target: PortfolioTarget,
+    *,
+    source_insight_ids: tuple[str, ...],
+    reason: str,
+) -> PortfolioTargetPlan:
+    current_quantity = context.portfolio.quantity(target.symbol)
+    current_price = context.portfolio.mark_price(target.symbol, context.data)
+    current_value = context.portfolio.position_value(target.symbol, context.data)
+    target_value = (target.quantity * current_price) if current_price is not None else 0.0
+    return PortfolioTargetPlan(
+        target=target,
+        current_quantity=current_quantity,
+        target_quantity=target.quantity,
+        delta_quantity=target.quantity - current_quantity,
+        current_price=current_price,
+        current_value=current_value,
+        target_value=target_value,
+        delta_value=target_value - current_value,
+        source_insight_ids=source_insight_ids,
+        reason=reason,
+    )
+
+
+def _target_reason(target: PortfolioTarget) -> str:
+    if target.quantity == 0:
+        return "exit"
+    return "target"
+
+
 def _portfolio_equity(portfolio: Portfolio, data: DataSlice) -> float:
-    equity = portfolio.cash
-    for holding in portfolio.holdings.values():
-        bar = data.get(holding.symbol)
-        price = bar.close if bar is not None else holding.average_price
-        equity += holding.quantity * price
-    return equity
+    return portfolio.equity(data)
