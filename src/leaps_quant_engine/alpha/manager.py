@@ -80,11 +80,15 @@ class InsightManagerUpdate:
 @dataclass(slots=True)
 class InsightManager:
     _records_by_id: dict[str, InsightRecord] = field(default_factory=dict)
+    _active_ids: set[str] = field(default_factory=set)
+    _active_ids_by_key: dict[tuple[str, str, str, str], set[str]] = field(default_factory=dict)
+    _tracked_symbols_by_sleeve: dict[str, dict[str, Symbol]] = field(default_factory=dict)
 
     def ingest(self, batch: InsightBatch, *, as_of: datetime | None = None) -> InsightManagerUpdate:
         now = as_of or batch.generated_at
         update = self.expire(now)
         added: list[Insight] = []
+        expired_on_ingest: list[Insight] = []
         superseded: list[Insight] = []
         for insight in batch.insights:
             superseded.extend(self._supersede_matching(insight, as_of=now))
@@ -95,26 +99,27 @@ class InsightManager:
                 state_updated_at=now,
                 state_reason="ingested" if state is InsightState.ACTIVE else "expired_on_ingest",
             )
+            self._track_symbol(insight)
             if state is InsightState.ACTIVE:
+                self._activate(insight)
                 added.append(insight)
             else:
-                update = update.combine(InsightManagerUpdate(expired=(insight,)))
-        return update.combine(InsightManagerUpdate(added=tuple(added), superseded=tuple(superseded)))
+                expired_on_ingest.append(insight)
+        return update.combine(
+            InsightManagerUpdate(
+                added=tuple(added),
+                expired=tuple(expired_on_ingest),
+                superseded=tuple(superseded),
+            )
+        )
 
     def expire(self, as_of: datetime) -> InsightManagerUpdate:
         expired: list[Insight] = []
-        for insight_id, record in list(self._records_by_id.items()):
-            if record.state is not InsightState.ACTIVE:
-                continue
+        for insight_id in list(self._active_ids):
+            record = self._records_by_id[insight_id]
             if not record.insight.is_expired(as_of):
                 continue
-            self._records_by_id[insight_id] = InsightRecord(
-                insight=record.insight,
-                state=InsightState.EXPIRED,
-                state_updated_at=as_of,
-                state_reason="expired",
-            )
-            expired.append(record.insight)
+            expired.append(self._deactivate(insight_id, record, InsightState.EXPIRED, as_of, "expired"))
         return InsightManagerUpdate(expired=tuple(expired))
 
     def active(self, as_of: datetime | None = None, *, sleeve_id: str | None = None) -> tuple[Insight, ...]:
@@ -123,11 +128,10 @@ class InsightManager:
         return tuple(
             record.insight
             for record in sorted(
-                self._records_by_id.values(),
+                (self._records_by_id[insight_id] for insight_id in self._active_ids),
                 key=lambda item: (item.insight.generated_at, item.insight.insight_id),
             )
-            if record.state is InsightState.ACTIVE
-            and (sleeve_id is None or record.insight.sleeve_id == sleeve_id)
+            if sleeve_id is None or record.insight.sleeve_id == sleeve_id
         )
 
     def cancel_symbol(
@@ -154,29 +158,24 @@ class InsightManager:
         reason: str = "cancelled",
     ) -> InsightManagerUpdate:
         cancelled: list[Insight] = []
-        for insight_id, record in list(self._records_by_id.items()):
-            if record.state is not InsightState.ACTIVE or not predicate(record.insight):
+        for insight_id in list(self._active_ids):
+            record = self._records_by_id[insight_id]
+            if not predicate(record.insight):
                 continue
-            self._records_by_id[insight_id] = InsightRecord(
-                insight=record.insight,
-                state=InsightState.CANCELLED,
-                state_updated_at=as_of,
-                state_reason=reason,
-            )
-            cancelled.append(record.insight)
+            cancelled.append(self._deactivate(insight_id, record, InsightState.CANCELLED, as_of, reason))
         return InsightManagerUpdate(cancelled=tuple(cancelled))
 
     def tracked_symbols(self, sleeve_id: str | None = None) -> tuple[Symbol, ...]:
+        if sleeve_id is not None:
+            return tuple(self._tracked_symbols_by_sleeve.get(sleeve_id, {}).values())
         result: list[Symbol] = []
         seen: set[str] = set()
-        for record in self._records_by_id.values():
-            insight = record.insight
-            if sleeve_id is not None and insight.sleeve_id != sleeve_id:
-                continue
-            if insight.symbol_key in seen:
-                continue
-            seen.add(insight.symbol_key)
-            result.append(insight.symbol)
+        for symbols in self._tracked_symbols_by_sleeve.values():
+            for symbol_key, symbol in symbols.items():
+                if symbol_key in seen:
+                    continue
+                seen.add(symbol_key)
+                result.append(symbol)
         return tuple(result)
 
     def latest_by_symbol(self, sleeve_id: str | None = None) -> Mapping[str, Insight]:
@@ -199,23 +198,57 @@ class InsightManager:
 
     def _supersede_matching(self, insight: Insight, *, as_of: datetime) -> tuple[Insight, ...]:
         superseded: list[Insight] = []
-        for insight_id, record in list(self._records_by_id.items()):
-            previous = record.insight
-            if record.state is not InsightState.ACTIVE:
-                continue
-            if (
-                previous.sleeve_id != insight.sleeve_id
-                or previous.symbol_key != insight.symbol_key
-                or previous.alpha_id != insight.alpha_id
-                or previous.insight_type is not insight.insight_type
-            ):
-                continue
-            self._records_by_id[insight_id] = InsightRecord(
-                insight=previous,
-                state=InsightState.SUPERSEDED,
-                state_updated_at=as_of,
-                state_reason=f"superseded_by:{insight.insight_id}",
+        for insight_id in list(self._active_ids_by_key.get(_active_key(insight), ())):
+            record = self._records_by_id[insight_id]
+            superseded.append(
+                self._deactivate(
+                    insight_id,
+                    record,
+                    InsightState.SUPERSEDED,
+                    as_of,
+                    f"superseded_by:{insight.insight_id}",
+                )
             )
-            superseded.append(previous)
         return tuple(superseded)
 
+    def _activate(self, insight: Insight) -> None:
+        self._active_ids.add(insight.insight_id)
+        self._active_ids_by_key.setdefault(_active_key(insight), set()).add(insight.insight_id)
+
+    def _deactivate(
+        self,
+        insight_id: str,
+        record: InsightRecord,
+        state: InsightState,
+        as_of: datetime,
+        reason: str,
+    ) -> Insight:
+        self._active_ids.discard(insight_id)
+        key = _active_key(record.insight)
+        ids = self._active_ids_by_key.get(key)
+        if ids is not None:
+            ids.discard(insight_id)
+            if not ids:
+                del self._active_ids_by_key[key]
+        self._records_by_id[insight_id] = InsightRecord(
+            insight=record.insight,
+            state=state,
+            state_updated_at=as_of,
+            state_reason=reason,
+        )
+        return record.insight
+
+    def _track_symbol(self, insight: Insight) -> None:
+        self._tracked_symbols_by_sleeve.setdefault(insight.sleeve_id, {}).setdefault(
+            insight.symbol_key,
+            insight.symbol,
+        )
+
+
+def _active_key(insight: Insight) -> tuple[str, str, str, str]:
+    return (
+        insight.sleeve_id,
+        insight.symbol_key,
+        insight.alpha_id,
+        insight.insight_type.value,
+    )

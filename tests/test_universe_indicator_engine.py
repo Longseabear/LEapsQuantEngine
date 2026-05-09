@@ -18,6 +18,7 @@ def test_load_universe_definition_from_file():
     assert universe.id == "swing-kor-core"
     assert universe.symbol_keys[:2] == ("KRX:005930", "KRX:000660")
     assert [indicator.name for indicator in universe.indicators] == [
+        "close",
         "sma_3_close",
         "momentum_2_close",
         "dollar_volume_2",

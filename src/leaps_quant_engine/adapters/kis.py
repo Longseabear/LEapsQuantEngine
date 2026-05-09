@@ -366,6 +366,35 @@ class KISCachedMarketDataProvider(MarketDataProvider):
         rows = _extract_history_rows(result)
         return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
 
+    def get_cached_minute_history(
+        self,
+        symbol: Symbol,
+        *,
+        trade_date: datetime,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        interval_minutes: int = 1,
+        refresh: bool = False,
+    ) -> list[Bar]:
+        if _kis_market(symbol.market) != "domestic":
+            raise MarketDataError("Cached minute history is currently supported for domestic symbols only.")
+        result = self.client.call_tool(
+            "get_or_cache_domestic_minute_bars",
+            {
+                "symbol": symbol.ticker,
+                "trade_date": trade_date.strftime("%Y-%m-%d"),
+                "start_time": start_time,
+                "end_time": end_time,
+                "interval_minutes": interval_minutes,
+                "refresh": refresh,
+            },
+        )
+        rows = _extract_history_rows(result)
+        return sorted(
+            (_row_to_bar(symbol, row, default_date=trade_date) for row in rows),
+            key=lambda bar: bar.time,
+        )
+
 
 @dataclass(slots=True)
 class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
@@ -426,7 +455,19 @@ def _daily_history_arguments(
 
 def _safe_market_data_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     safe: dict[str, Any] = {}
-    for key in ("market", "symbol", "exchange", "period_code", "start_date", "end_date", "refresh"):
+    for key in (
+        "market",
+        "symbol",
+        "exchange",
+        "period_code",
+        "start_date",
+        "end_date",
+        "trade_date",
+        "start_time",
+        "end_time",
+        "interval_minutes",
+        "refresh",
+    ):
         if key in arguments:
             safe[key] = arguments[key]
     return safe
@@ -516,16 +557,15 @@ def _extract_history_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raise MarketDataError(f"Could not extract history rows from KIS payload keys={sorted(payload)}")
 
 
-def _row_to_bar(symbol: Symbol, row: dict[str, Any]) -> Bar:
-    timestamp = str(_first_present(row, ("time", "date", "ts", "stck_bsop_date", "xymd")))
+def _row_to_bar(symbol: Symbol, row: dict[str, Any], *, default_date: datetime | None = None) -> Bar:
     return Bar(
         symbol=symbol,
-        time=_parse_date(timestamp),
+        time=_parse_row_datetime(row, default_date=default_date),
         open=_float_field(row, "open", "open_price", "stck_oprc", "ovrs_nmix_oprc"),
         high=_float_field(row, "high", "high_price", "stck_hgpr", "ovrs_nmix_hgpr"),
         low=_float_field(row, "low", "low_price", "stck_lwpr", "ovrs_nmix_lwpr"),
-        close=_float_field(row, "close", "close_price", "stck_clpr", "ovrs_nmix_prpr"),
-        volume=int(_first_present(row, ("volume", "acml_vol", "acml_vol_qty"), default=0)),
+        close=_float_field(row, "close", "close_price", "stck_clpr", "stck_prpr", "ovrs_nmix_prpr"),
+        volume=int(_first_present(row, ("volume", "cntg_vol", "acml_vol", "acml_vol_qty"), default=0)),
     )
 
 
@@ -551,6 +591,39 @@ def _parse_date(value: str) -> datetime:
     if len(text) == 8 and text.isdigit():
         return datetime.strptime(text, "%Y%m%d")
     return datetime.fromisoformat(text)
+
+
+def _parse_row_datetime(row: dict[str, Any], *, default_date: datetime | None = None) -> datetime:
+    for name in ("datetime", "timestamp", "ts"):
+        value = row.get(name)
+        if value not in (None, ""):
+            return _parse_date(str(value))
+    date_value = _first_present(row, ("date", "trade_date", "stck_bsop_date", "xymd"), default=None)
+    time_value = _first_present(row, ("time", "stck_cntg_hour", "hour", "hhmmss"), default=None)
+    if date_value not in (None, "") and time_value not in (None, ""):
+        return _combine_date_time(str(date_value), str(time_value))
+    if time_value not in (None, "") and default_date is not None:
+        return _combine_date_time(default_date.strftime("%Y%m%d"), str(time_value))
+    if date_value not in (None, ""):
+        return _parse_date(str(date_value))
+    value = _first_present(row, ("time",), default=None)
+    if value not in (None, ""):
+        return _parse_date(str(value))
+    raise MarketDataError(f"Could not extract datetime from KIS history row keys={sorted(row)}")
+
+
+def _combine_date_time(date_value: str, time_value: str) -> datetime:
+    date_text = date_value.strip().replace("-", "")
+    time_text = time_value.strip().replace(":", "")
+    if "." in time_text:
+        time_text = time_text.split(".", 1)[0]
+    if len(time_text) == 4 and time_text.isdigit():
+        time_text = f"{time_text}00"
+    if len(time_text) == 5 and time_text.isdigit():
+        time_text = f"0{time_text}"
+    if len(date_text) == 8 and time_text[:6].isdigit():
+        return datetime.strptime(f"{date_text}{time_text[:6]}", "%Y%m%d%H%M%S")
+    return _parse_date(f"{date_value}T{time_value}")
 
 
 def _float_field(row: dict[str, Any], *names: str) -> float:

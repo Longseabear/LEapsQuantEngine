@@ -8,8 +8,10 @@ from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightBatch, Insigh
 from leaps_quant_engine.execution import ImmediateExecutionModel
 from leaps_quant_engine.framework.portfolio_construction import (
     EqualWeightPortfolioConstructionModel,
+    PortfolioConstructionEngine,
     PortfolioConstructionContext,
     PortfolioConstructionModel,
+    PortfolioTargetBatch,
 )
 from leaps_quant_engine.framework.risk import (
     PassThroughRiskManagementModel,
@@ -53,7 +55,7 @@ class FrameworkCycleResult:
     new_insight_batch: InsightBatch
     insight_manager_update: InsightManagerUpdate
     active_insights: tuple[Insight, ...]
-    portfolio_targets: tuple[PortfolioTarget, ...]
+    portfolio_target_batch: PortfolioTargetBatch
     risk_decisions: RiskDecisionBatch
     order_intents: tuple[OrderIntent, ...]
     timings: StageTiming
@@ -61,6 +63,10 @@ class FrameworkCycleResult:
     @property
     def active_insight_count(self) -> int:
         return len(self.active_insights)
+
+    @property
+    def portfolio_targets(self) -> tuple[PortfolioTarget, ...]:
+        return self.portfolio_target_batch.targets
 
     def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
         new_insights = self.new_insight_batch.to_dict() if include_details else {
@@ -86,6 +92,16 @@ class FrameworkCycleResult:
             "insight_manager_update": manager_update,
             "active_insight_count": self.active_insight_count,
             "active_insights": [insight.to_dict() for insight in self.active_insights] if include_details else [],
+            "portfolio_target_batch": self.portfolio_target_batch.to_dict() if include_details else {
+                "batch_id": self.portfolio_target_batch.batch_id,
+                "sleeve_id": self.portfolio_target_batch.sleeve_id,
+                "generated_at": self.portfolio_target_batch.generated_at.isoformat(),
+                "model_name": self.portfolio_target_batch.model_name,
+                "reason": self.portfolio_target_batch.reason,
+                "source_insight_ids": list(self.portfolio_target_batch.source_insight_ids),
+                "target_count": self.portfolio_target_batch.target_count,
+                "metadata": dict(self.portfolio_target_batch.metadata),
+            },
             "portfolio_targets": [
                 {
                     "symbol": target.symbol.key,
@@ -116,6 +132,7 @@ class FrameworkRunner:
     alpha_runtime: AlphaRuntime
     insight_manager: InsightManager = None  # type: ignore[assignment]
     portfolio_model: PortfolioConstructionModel = None  # type: ignore[assignment]
+    portfolio_engine: PortfolioConstructionEngine = None  # type: ignore[assignment]
     risk_model: RiskManagementModel = None  # type: ignore[assignment]
     execution_model: ImmediateExecutionModel = None  # type: ignore[assignment]
 
@@ -124,6 +141,8 @@ class FrameworkRunner:
             self.insight_manager = InsightManager()
         if self.portfolio_model is None:
             self.portfolio_model = EqualWeightPortfolioConstructionModel()
+        if self.portfolio_engine is None:
+            self.portfolio_engine = PortfolioConstructionEngine(model=self.portfolio_model)
         if self.risk_model is None:
             self.risk_model = PassThroughRiskManagementModel()
         if self.execution_model is None:
@@ -148,7 +167,7 @@ class FrameworkRunner:
         insight_manager_ms = _elapsed_ms(started)
 
         started = time.perf_counter()
-        portfolio_targets = self.portfolio_model.create_targets(
+        portfolio_target_batch = self.portfolio_engine.create_targets(
             PortfolioConstructionContext(
                 sleeve_id=self.sleeve_id,
                 data=data,
@@ -165,7 +184,7 @@ class FrameworkRunner:
                 sleeve_id=self.sleeve_id,
                 data=data,
                 portfolio=portfolio,
-                targets=portfolio_targets,
+                targets=portfolio_target_batch.targets,
             )
         )
         risk_ms = _elapsed_ms(started)
@@ -188,7 +207,7 @@ class FrameworkRunner:
             new_insight_batch=insight_batch,
             insight_manager_update=manager_update,
             active_insights=active_insights,
-            portfolio_targets=portfolio_targets,
+            portfolio_target_batch=portfolio_target_batch,
             risk_decisions=risk_decisions,
             order_intents=orders,
             timings=StageTiming(

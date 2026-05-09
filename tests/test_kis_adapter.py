@@ -81,6 +81,28 @@ class FakeMarketDataEngineClient:
                     }
                 ]
             }
+        if tool == "get_or_cache_domestic_minute_bars":
+            return {
+                "bars": [
+                    {
+                        "time": "090100",
+                        "open": "70000",
+                        "high": "70100",
+                        "low": "69900",
+                        "close": "70050",
+                        "volume": "100",
+                    },
+                    {
+                        "date": "20260508",
+                        "time": "09:00:00",
+                        "open": "69900",
+                        "high": "70000",
+                        "low": "69800",
+                        "close": "69950",
+                        "volume": "90",
+                    },
+                ]
+            }
         raise AssertionError(tool)
 
 
@@ -210,5 +232,36 @@ def test_cached_kis_provider_uses_market_data_engine_cache_tool():
             "start_date": "20260501",
             "end_date": "20260507",
             "refresh": False,
+        },
+    )
+
+
+def test_cached_kis_provider_loads_domestic_minute_history_from_cache_tool():
+    provider = KISCachedMarketDataProvider(client=FakeMarketDataEngineClient())
+
+    bars = provider.get_cached_minute_history(
+        Symbol("005930", "KRX"),
+        trade_date=datetime(2026, 5, 8),
+        start_time="09:00:00",
+        end_time="09:01:00",
+        interval_minutes=1,
+        refresh=True,
+    )
+
+    assert [bar.time for bar in bars] == [
+        datetime(2026, 5, 8, 9, 0),
+        datetime(2026, 5, 8, 9, 1),
+    ]
+    assert bars[0].close == 69950.0
+    assert bars[1].volume == 100
+    assert provider.client.calls[0] == (
+        "get_or_cache_domestic_minute_bars",
+        {
+            "symbol": "005930",
+            "trade_date": "2026-05-08",
+            "start_time": "09:00:00",
+            "end_time": "09:01:00",
+            "interval_minutes": 1,
+            "refresh": True,
         },
     )

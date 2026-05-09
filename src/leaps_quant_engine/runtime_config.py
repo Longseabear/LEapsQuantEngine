@@ -140,6 +140,48 @@ class AlphaRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RebalancePolicyRuntimeConfig:
+    cash_reserve_pct: float = 0.0
+    min_order_notional: float = 0.0
+    min_quantity_delta: int = 1
+    allow_exit_below_min_notional: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.cash_reserve_pct < 1.0:
+            raise ConfigurationValidationError("portfolio.rebalance.cash_reserve_pct must be between 0 inclusive and 1 exclusive.")
+        _validate_non_negative("portfolio.rebalance.min_order_notional", self.min_order_notional)
+        if self.min_quantity_delta < 0:
+            raise ConfigurationValidationError("portfolio.rebalance.min_quantity_delta must be non-negative.")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cash_reserve_pct": self.cash_reserve_pct,
+            "min_order_notional": self.min_order_notional,
+            "min_quantity_delta": self.min_quantity_delta,
+            "allow_exit_below_min_notional": self.allow_exit_below_min_notional,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioRuntimeConfig:
+    model: ModuleReference = field(
+        default_factory=lambda: ModuleReference("leaps_quant_engine.framework:EqualWeightPortfolioConstructionModel")
+    )
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    rebalance: RebalancePolicyRuntimeConfig = field(default_factory=RebalancePolicyRuntimeConfig)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model.to_dict(),
+            "parameters": dict(self.parameters),
+            "rebalance": self.rebalance.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerRuntimeConfig:
     cycle_interval_seconds: float = 60.0
     min_success: int | None = None
@@ -162,6 +204,7 @@ class SleeveRuntimeConfig:
     cash: float = 100_000.0
     indicators: IndicatorRuntimeConfig = field(default_factory=IndicatorRuntimeConfig)
     alpha: AlphaRuntimeConfig = field(default_factory=AlphaRuntimeConfig)
+    portfolio: PortfolioRuntimeConfig = field(default_factory=PortfolioRuntimeConfig)
     worker: WorkerRuntimeConfig = field(default_factory=WorkerRuntimeConfig)
 
     def __post_init__(self) -> None:
@@ -176,6 +219,7 @@ class SleeveRuntimeConfig:
             "universe": self.universe.to_dict(),
             "indicators": self.indicators.to_dict(),
             "alpha": self.alpha.to_dict(),
+            "portfolio": self.portfolio.to_dict(),
             "worker": self.worker.to_dict(),
         }
 
@@ -282,6 +326,7 @@ def _parse_sleeve_runtime_config(payload: Any) -> SleeveRuntimeConfig:
         cash=float(data.get("cash", data.get("portfolio_cash", 100_000.0))),
         indicators=_parse_indicator_runtime_config(_object(data.get("indicators"), default={})),
         alpha=_parse_alpha_runtime_config(_object(data.get("alpha"), default={})),
+        portfolio=_parse_portfolio_runtime_config(_object(data.get("portfolio"), default={})),
         worker=_parse_worker_runtime_config(_object(data.get("worker"), default={})),
     )
 
@@ -332,6 +377,24 @@ def _parse_alpha_runtime_config(payload: Mapping[str, Any]) -> AlphaRuntimeConfi
             for module in (_parse_optional_module_reference(item) for item in _list(payload.get("modules"), default=[]))
             if module is not None
         )
+    )
+
+
+def _parse_portfolio_runtime_config(payload: Mapping[str, Any]) -> PortfolioRuntimeConfig:
+    raw_model = payload.get("model", payload.get("module", "leaps_quant_engine.framework:EqualWeightPortfolioConstructionModel"))
+    return PortfolioRuntimeConfig(
+        model=_parse_module_reference(raw_model),
+        parameters=dict(_object(payload.get("parameters", payload.get("params")), default={})),
+        rebalance=_parse_rebalance_policy_runtime_config(_object(payload.get("rebalance"), default={})),
+    )
+
+
+def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> RebalancePolicyRuntimeConfig:
+    return RebalancePolicyRuntimeConfig(
+        cash_reserve_pct=float(payload.get("cash_reserve_pct", 0.0)),
+        min_order_notional=float(payload.get("min_order_notional", 0.0)),
+        min_quantity_delta=int(payload.get("min_quantity_delta", 1)),
+        allow_exit_below_min_notional=bool(payload.get("allow_exit_below_min_notional", True)),
     )
 
 

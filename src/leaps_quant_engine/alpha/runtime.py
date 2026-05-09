@@ -65,7 +65,7 @@ class AlphaRuntime:
             self.activate_pending()
         with self._lock:
             models = self.active_models
-        generated_at = datetime.now()
+        generated_at = context.as_of
         insights: list[Insight] = []
         for model in models:
             model_insights = list(model.generate(context))

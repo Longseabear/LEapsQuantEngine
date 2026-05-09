@@ -75,6 +75,8 @@ def test_framework_runner_turns_active_insight_into_order_intent():
 
     assert result.new_insight_batch.insight_count == 1
     assert result.active_insight_count == 1
+    assert result.portfolio_target_batch.target_count == 1
+    assert result.portfolio_target_batch.source_insight_ids == (insight.insight_id,)
     assert result.portfolio_targets[0].quantity == 5
     assert result.risk_decisions.approved_targets == result.portfolio_targets
     assert len(result.order_intents) == 1
@@ -83,6 +85,7 @@ def test_framework_runner_turns_active_insight_into_order_intent():
     summary = result.to_dict(include_details=False)
     assert summary["new_insights"]["insight_count"] == 1
     assert "insights" not in summary["new_insights"]
+    assert summary["portfolio_target_batch"]["target_count"] == 1
     assert summary["active_insights"] == []
 
 

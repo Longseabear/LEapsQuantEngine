@@ -5,10 +5,16 @@ from datetime import datetime
 from pathlib import Path
 import csv
 import math
+from typing import Any
 
+from leaps_quant_engine.framework import FrameworkCycleResult, FrameworkRunner
 from leaps_quant_engine.engine import Engine
+from leaps_quant_engine.history import get_daily_history
+from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataError, MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.universe.definition import UniverseDefinition
 
 
 @dataclass(slots=True)
@@ -154,26 +160,153 @@ class BacktestResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class FrameworkBacktestResult:
+    sleeve_id: str
+    universe_id: str
+    orders: list[OrderIntent]
+    framework_cycles: list[FrameworkCycleResult]
+    final_cash: float
+    final_quantity: dict[str, int]
+    metrics: BacktestMetrics
+    snapshots: list[BacktestSnapshot]
+    trades: list[ClosedTrade]
+    data_slice_count: int
+    indicator_snapshot_count: int
+    start: datetime | None
+    end: datetime | None
+
+    @property
+    def insight_count(self) -> int:
+        return sum(cycle.new_insight_batch.insight_count for cycle in self.framework_cycles)
+
+    @property
+    def order_count(self) -> int:
+        return len(self.orders)
+
+    @property
+    def framework_total_ms(self) -> float:
+        return sum(cycle.timings.total_ms for cycle in self.framework_cycles)
+
+    def to_report(self, *, include_orders: bool = True) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "sleeve_id": self.sleeve_id,
+            "universe_id": self.universe_id,
+            "start": self.start.isoformat() if self.start else None,
+            "end": self.end.isoformat() if self.end else None,
+            "data_slice_count": self.data_slice_count,
+            "indicator_snapshot_count": self.indicator_snapshot_count,
+            "framework_cycle_count": len(self.framework_cycles),
+            "insight_count": self.insight_count,
+            "order_count": self.order_count,
+            "framework_total_ms": self.framework_total_ms,
+            "final_cash": self.final_cash,
+            "final_quantity": dict(self.final_quantity),
+            "metrics": self.metrics.to_report(),
+        }
+        if include_orders:
+            payload["orders"] = [_order_to_report(order) for order in self.orders]
+        return payload
+
+
 def build_replay_feed(
     provider: MarketDataProvider,
     symbols: list[Symbol],
     *,
     start: datetime | None = None,
     end: datetime | None = None,
+    refresh_history: bool = False,
 ) -> list[DataSlice]:
-    bars_by_symbol = {symbol.key: provider.get_history(symbol, start=start, end=end) for symbol in symbols}
-    times = sorted({bar.time for bars in bars_by_symbol.values() for bar in bars})
-    feed: list[DataSlice] = []
-    for time in times:
-        bars = {
-            symbol_key: bar
-            for symbol_key, series in bars_by_symbol.items()
-            for bar in series
-            if bar.time == time
-        }
-        if bars:
-            feed.append(DataSlice(time=time, bars=bars))
-    return feed
+    bars_by_symbol = {
+        symbol.key: get_daily_history(
+            provider,
+            symbol,
+            start=start,
+            end=end,
+            refresh_history=refresh_history,
+        )
+        for symbol in symbols
+    }
+    bars_by_time: dict[datetime, dict[str, Bar]] = {}
+    for symbol_key, series in bars_by_symbol.items():
+        for bar in series:
+            bars_by_time.setdefault(bar.time, {})[symbol_key] = bar
+    return [
+        DataSlice(time=time, bars=bars_by_time[time])
+        for time in sorted(bars_by_time)
+        if bars_by_time[time]
+    ]
+
+
+def run_framework_backtest(
+    universe: UniverseDefinition,
+    provider: MarketDataProvider,
+    *,
+    sleeve_id: str,
+    framework_runner: FrameworkRunner,
+    portfolio: Portfolio,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    indicator_engine: IndicatorEngine | None = None,
+    refresh_history: bool = False,
+) -> FrameworkBacktestResult:
+    feed = build_replay_feed(
+        provider,
+        list(universe.symbols),
+        start=start,
+        end=end,
+        refresh_history=refresh_history,
+    )
+    indicator_engine = indicator_engine or IndicatorEngine()
+    if sleeve_id not in indicator_engine.registries_by_sleeve:
+        indicator_engine.register_universe(sleeve_id, universe)
+
+    tracker = _SleeveBacktestTracker(sleeve_id=sleeve_id, initial_cash=portfolio.cash)
+    orders: list[OrderIntent] = []
+    framework_cycles: list[FrameworkCycleResult] = []
+    last_prices: dict[str, float] = {}
+
+    for index, data in enumerate(feed, start=1):
+        for bar in data.bars.values():
+            last_prices[bar.symbol.key] = bar.close
+        indicator_engine.on_data(data)
+        indicator_snapshot = indicator_engine.snapshot(
+            sleeve_id,
+            universe_id=universe.id,
+            source_snapshot_id=f"backtest-{sleeve_id}-{index}",
+            as_of=data.time,
+            created_at=data.time,
+        )
+        cycle = framework_runner.run_once(
+            indicator_snapshot=indicator_snapshot,
+            data=data,
+            portfolio=portfolio,
+        )
+        framework_cycles.append(cycle)
+        orders.extend(cycle.order_intents)
+        for order in cycle.order_intents:
+            tracker.record_fill(order, data.time)
+            portfolio.apply_fill(order)
+        tracker.record_snapshot(data.time, portfolio.cash, portfolio.holdings, last_prices)
+
+    return FrameworkBacktestResult(
+        sleeve_id=sleeve_id,
+        universe_id=universe.id,
+        orders=orders,
+        framework_cycles=framework_cycles,
+        final_cash=portfolio.cash,
+        final_quantity={
+            key: holding.quantity
+            for key, holding in portfolio.holdings.items()
+        },
+        metrics=tracker.metrics(),
+        snapshots=tracker.snapshots,
+        trades=tracker.closed_trades,
+        data_slice_count=len(feed),
+        indicator_snapshot_count=len(framework_cycles),
+        start=feed[0].time if feed else start,
+        end=feed[-1].time if feed else end,
+    )
 
 
 def run_backtest(
@@ -442,6 +575,19 @@ def _win_rate(closed_trades: list[ClosedTrade]) -> float:
 
 def _average(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _order_to_report(order: OrderIntent) -> dict[str, object]:
+    return {
+        "sleeve_id": order.sleeve_id,
+        "symbol": order.symbol.key,
+        "side": order.side.value,
+        "quantity": order.quantity,
+        "reference_price": order.reference_price,
+        "notional": order.notional,
+        "tag": order.tag,
+    }
+
 
 def _parse_datetime(value: str) -> datetime:
     text = value.strip()

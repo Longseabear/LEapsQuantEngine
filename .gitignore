@@ -10,5 +10,7 @@ build/
 logs/
 data/
 runtime/
+!configs/runtime/
+!configs/runtime/*.json
 .git_legacy_backup*/
 reference/stockprogram_legacy/

@@ -10,7 +10,13 @@ from typing import Any, Callable
 
 from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketDataEngineLiveQuoteProvider
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader
-from leaps_quant_engine.framework import FrameworkCycleResult, FrameworkRunner
+from leaps_quant_engine.framework import (
+    FrameworkCycleResult,
+    FrameworkRunner,
+    PortfolioConstructionEngine,
+    PythonPortfolioConstructionModelLoader,
+    RebalancePolicy,
+)
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.portfolio import Portfolio
@@ -40,6 +46,7 @@ class RuntimeBootstrapDependencies:
     live_provider_factory: LiveProviderFactory = None  # type: ignore[assignment]
     history_provider_factory: HistoryProviderFactory = None  # type: ignore[assignment]
     alpha_loader: PythonAlphaLoader = PythonAlphaLoader()
+    portfolio_model_loader: PythonPortfolioConstructionModelLoader = PythonPortfolioConstructionModelLoader()
 
     def __post_init__(self) -> None:
         if self.live_provider_factory is None:
@@ -169,13 +176,18 @@ def bootstrap_sleeve_runtime(
     )
     history_provider = deps.history_provider_factory()
     alpha_runtime = _build_alpha_runtime(snapshot, sleeve_config, deps.alpha_loader)
+    portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
     selection_model = _build_selection_model(sleeve_config.universe.active.selection_model, sleeve_config)
 
     selection_base_universe = coarse_universe
     fine_runtime = None
     fine_refresh_report = None
     portfolio = Portfolio(cash=sleeve_config.cash)
-    framework_runner = FrameworkRunner(sleeve_id=sleeve_config.sleeve_id, alpha_runtime=alpha_runtime)
+    framework_runner = FrameworkRunner(
+        sleeve_id=sleeve_config.sleeve_id,
+        alpha_runtime=alpha_runtime,
+        portfolio_engine=portfolio_engine,
+    )
     if sleeve_config.universe.fine.enabled:
         fine_runtime = FineUniverseRuntime(
             universe=coarse_universe,
@@ -255,6 +267,26 @@ def _build_alpha_runtime(
     return AlphaRuntime(active_models=tuple(models))
 
 
+def _build_portfolio_engine(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_config: SleeveRuntimeConfig,
+    portfolio_model_loader: PythonPortfolioConstructionModelLoader,
+) -> PortfolioConstructionEngine:
+    portfolio_config = sleeve_config.portfolio
+    model_ref = _resolve_model_reference(snapshot, portfolio_config.model.ref)
+    model_result = portfolio_model_loader.load(model_ref, parameters=portfolio_config.parameters)
+    rebalance_config = portfolio_config.rebalance
+    return PortfolioConstructionEngine(
+        model=model_result.model,
+        rebalance_policy=RebalancePolicy(
+            cash_reserve_pct=rebalance_config.cash_reserve_pct,
+            min_order_notional=rebalance_config.min_order_notional,
+            min_quantity_delta=rebalance_config.min_quantity_delta,
+            allow_exit_below_min_notional=rebalance_config.allow_exit_below_min_notional,
+        ),
+    )
+
+
 def _build_selection_model(reference: ModuleReference, sleeve_config: SleeveRuntimeConfig) -> UniverseSelectionModel:
     loaded = _load_reference(reference)
     if not inspect.isclass(loaded) and hasattr(loaded, "select"):
@@ -305,6 +337,13 @@ def _load_module(module_name_or_path: str) -> ModuleType:
 
 def _resolve_path(snapshot: RuntimeConfigSnapshot, path: Path) -> Path:
     return resolve_runtime_path(snapshot, path)
+
+
+def _resolve_model_reference(snapshot: RuntimeConfigSnapshot, ref: str) -> str:
+    path = Path(ref)
+    if path.suffix == ".py" or path.exists():
+        return str(resolve_runtime_path(snapshot, path))
+    return ref
 
 
 def _data_slice_from_indicator_snapshot(snapshot: IndicatorSnapshot) -> DataSlice:

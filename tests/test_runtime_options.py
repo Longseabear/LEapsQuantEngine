@@ -57,6 +57,15 @@ def _runtime_payload():
                         }
                     ]
                 },
+                "portfolio": {
+                    "model": "examples/portfolio_models/equal_weight.py",
+                    "parameters": {"max_portfolio_pct": 0.8},
+                    "rebalance": {
+                        "cash_reserve_pct": 0.1,
+                        "min_order_notional": 1000,
+                        "min_quantity_delta": 2,
+                    },
+                },
                 "worker": {
                     "cycle_interval_seconds": 60,
                     "min_success": 2,
@@ -80,6 +89,11 @@ def test_runtime_config_keeps_logic_as_module_references():
         "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"
     )
     assert sleeve.alpha.modules == (ModuleReference("examples/alpha/price_above_sma_alpha.py"),)
+    assert sleeve.portfolio.model == ModuleReference("examples/portfolio_models/equal_weight.py")
+    assert dict(sleeve.portfolio.parameters) == {"max_portfolio_pct": 0.8}
+    assert sleeve.portfolio.rebalance.cash_reserve_pct == 0.1
+    assert sleeve.portfolio.rebalance.min_order_notional == 1000
+    assert sleeve.portfolio.rebalance.min_quantity_delta == 2
     assert sleeve.worker.cycle_interval_seconds == 60
     assert sleeve.indicators.min_ready_ratio == 0.9
 
@@ -95,6 +109,14 @@ def test_runtime_config_validation_rejects_invalid_operational_settings():
 def test_runtime_config_validation_rejects_negative_sleeve_cash():
     payload = _runtime_payload()
     payload["sleeves"][0]["cash"] = -1
+
+    with pytest.raises(ConfigurationValidationError):
+        parse_runtime_config(payload)
+
+
+def test_runtime_config_validation_rejects_invalid_portfolio_rebalance():
+    payload = _runtime_payload()
+    payload["sleeves"][0]["portfolio"]["rebalance"]["cash_reserve_pct"] = 1.0
 
     with pytest.raises(ConfigurationValidationError):
         parse_runtime_config(payload)

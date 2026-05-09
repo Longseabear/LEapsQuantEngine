@@ -19,6 +19,13 @@ This document records what is currently implemented and what should come next. I
 
 - `VirtualMarketDataProvider` for deterministic replay.
 - `run_backtest(...)` with immediate fill simulation.
+- `run_framework_backtest(...)` for LEAN-style alpha framework replay:
+  - historical `DataSlice`
+  - `IndicatorEngine`
+  - `IndicatorSnapshot`
+  - `FrameworkRunner`
+  - immediate fills
+  - `BacktestMetrics`
 - Aggregate and per-sleeve metrics:
   - CAGR
   - Sharpe
@@ -171,6 +178,8 @@ Implemented contracts:
 - `ActiveUniverseRuntimeConfig`
 - `IndicatorRuntimeConfig`
 - `AlphaRuntimeConfig`
+- `PortfolioRuntimeConfig`
+- `RebalancePolicyRuntimeConfig`
 - `WorkerRuntimeConfig`
 - `SleeveRuntimeConfig`
 - `RuntimeConfig`
@@ -198,6 +207,7 @@ Runtime bootstrap is also implemented. `bootstrap_sleeve_runtime(...)` takes a v
 - configured `UniverseSelectionModel`
 - active `UniverseDefinition`
 - `AlphaRuntime` from alpha module references
+- `PortfolioConstructionEngine` from Portfolio Construction Model references and rebalance policy settings
 - sleeve `Portfolio` with configured cash allocation
 - `FrameworkRunner` for alpha, insight state, portfolio construction, risk, and execution
 - `BackgroundSnapshotWorker`
@@ -227,7 +237,7 @@ py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/live_us_smoke.j
 
 ### Alpha Runtime
 
-Python alpha plugins are supported directly.
+Python Alpha Models are supported directly.
 
 Implemented alpha contracts:
 
@@ -257,7 +267,7 @@ Python alpha module formats:
 - `ALPHA_MODEL`
 - module-level `generate(context)` with optional `ALPHA_ID` and `VERSION`
 
-Alpha models are direct Python code and therefore trusted in-process plugins. They must still dry-run against a snapshot before activation, and `AlphaRuntime` swaps pending models only at snapshot boundaries.
+Alpha models are direct Python code and therefore trusted in-process model modules. They must still dry-run against a snapshot before activation, and `AlphaRuntime` swaps pending models only at snapshot boundaries.
 
 Alpha output is intentionally not an order. `Insight` is the next deterministic pipeline artifact before portfolio construction and risk.
 
@@ -306,7 +316,8 @@ The first LEAN-style framework runner is implemented:
 IndicatorSnapshot
   -> AlphaRuntime
   -> InsightManager
-  -> PortfolioConstructionModel
+  -> PortfolioConstructionEngine
+  -> PortfolioTargetBatch
   -> RiskManagementModel
   -> ExecutionModel
   -> OrderIntent
@@ -317,7 +328,11 @@ Implemented framework contracts:
 - `FrameworkRunner`
 - `FrameworkCycleResult`
 - `StageTiming`
+- `PortfolioTargetBatch`
+- `RebalancePolicy`
+- `PythonPortfolioConstructionModelLoader`
 - `PortfolioConstructionContext`
+- `PortfolioConstructionEngine`
 - `PortfolioConstructionModel`
 - `EqualWeightPortfolioConstructionModel`
 - `RiskManagementContext`
@@ -330,7 +345,10 @@ Current v0 behavior:
 
 - Alpha emits new insights only.
 - `InsightManager` maintains active/inactive signal state.
-- Portfolio construction reads active insights and produces `PortfolioTarget` records.
+- `PortfolioConstructionEngine` reads active insights and produces auditable `PortfolioTargetBatch` records.
+- `EqualWeightPortfolioConstructionModel` remains the first model implementation.
+- `RebalancePolicy` can reserve cash, filter tiny quantity deltas, and suppress tiny non-exit order notionals.
+- Portfolio Construction Models can be loaded from Python model modules through `PythonPortfolioConstructionModelLoader`.
 - When previously managed insights expire, portfolio construction can emit flatten targets.
 - Risk runs every framework cycle and currently passes targets through.
 - Execution turns approved targets into `OrderIntent` records using the existing immediate execution model.
@@ -568,6 +586,102 @@ framework:
   framework total: about 0.252 ms
 ```
 
+Recent Korean minute framework backtest smoke:
+
+```text
+date: 2026-05-08
+symbols: 005930, 000660, 035420
+resolution: 1 minute
+loaded bars: 1,143
+data slices: 381
+indicator snapshots: 381
+framework cycles: 381
+alpha: price-above-sma-demo
+insights: 424
+orders: 21
+buy orders: 11
+sell orders: 10
+history load: about 2,979 ms
+framework backtest loop: about 158 ms
+framework stage total: about 59 ms
+```
+
+Single-day intraday CAGR is not meaningful because the existing metric annualizes the very short test window. For minute-level smoke interpretation, prefer total return, drawdown, turnover, exposure, win rate, trade count, order count, and stage timing.
+
+Recent Korean five-year daily framework backtest smoke:
+
+```text
+source: FinanceDataReader
+period: 2021-05-10 -> 2026-05-08
+symbols: 005930, 000660, 035420
+loaded bars: 3,672
+data slices: 1,224
+indicator snapshots: 1,224
+framework cycles: 1,224
+alpha: price-above-sma-demo
+insights: 1,600
+orders: 991
+buy orders: 509
+sell orders: 482
+history load: about 791 ms
+framework backtest loop: about 681 ms
+framework stage total: about 520 ms
+total return: 243.20%
+CAGR: 28.01%
+Sharpe: 1.00
+MDD: 42.45%
+turnover: 17.20
+average holding days: 267.24
+average exposure: 97.19%
+win rate: 55.81%
+trade count: 482
+```
+
+KIS/broker-engine daily cache limitation observed on 2026-05-09:
+
+```text
+requested period: 2021-05-10 -> 2026-05-08
+returned period: 2026-03-26 -> 2026-05-08
+returned sessions per symbol: 30
+```
+
+The legacy broker operation currently applies `start_date` / `end_date` filtering after receiving the KIS daily payload. If the provider payload contains only recent rows, the new engine cannot expand that into a five-year replay. Treat KIS daily cache as a recent-cache smoke until a paged KIS history path or a dedicated historical provider adapter is implemented.
+
+Recent Korean 200-symbol five-year daily framework load test:
+
+```text
+source: FinanceDataReader
+period: 2021-05-10 -> 2026-05-08
+universe: benchmark_kor_200
+symbols with data: 200
+partial-history symbols: 30
+indicator count per symbol: 31
+loaded bars: 225,051
+estimated indicator updates: 6,976,581
+data slices: 1,224
+average symbols per slice: 183.87
+framework cycles: 1,224
+alpha: momentum-strategy-demo
+insights: 56,914
+orders: 101,627
+buy orders: 48,604
+sell orders: 53,023
+history load: about 53,043 ms
+feed build: about 48 ms
+framework backtest loop: about 38,786 ms
+framework stage total: about 4,094 ms
+average framework cycle: about 3.34 ms
+p95 framework cycle: about 8.72 ms
+max framework cycle: about 21.02 ms
+alpha avg: about 0.68 ms
+insight manager avg: about 0.34 ms
+portfolio avg: about 2.10 ms
+risk avg: about 0.08 ms
+execution avg: about 0.16 ms
+```
+
+This load test first exposed a severe `InsightManager` scaling issue: active/supersede lookups were scanning all historical insight records, causing the same run's framework loop to take about 431 seconds. `InsightManager` now maintains active indexes by sleeve/symbol/alpha/type and tracked-symbol indexes by sleeve. After the fix, the framework loop dropped to about 38.8 seconds for the same 200-symbol five-year replay.
+
 ### Logging
 
 Global CLI options:
@@ -624,7 +738,7 @@ py -3 -m pytest -q
 Expected current result:
 
 ```text
-103 passed
+113 passed
 ```
 
 Run sample:
@@ -645,7 +759,8 @@ py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live
 
 - `BackgroundSnapshotWorker` exists, but it is not yet wrapped by a production process supervisor.
 - Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, but formal risk gates are not wired yet.
-- `PortfolioConstructionModel` and `RiskManagementModel` interfaces exist, but only v0 equal-weight and pass-through implementations are available.
+- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading, a v0 equal-weight model, and rebalance policy. Risk still only has a pass-through implementation.
+- Framework alpha backtesting exists, but n-1 minute delayed indicator snapshot modeling is not implemented yet.
 - Universe selection exists, but is not yet automatically scheduled into the live worker loop.
 - No order ticket/order event state machine yet.
 - Live 200-symbol polling is bounded by external KIS/market-data-engine throughput and should not be used as a high-frequency strategy loop.
@@ -730,7 +845,8 @@ After that:
 
 1. Define minimal `RiskManagementModel` quality gates.
 2. Add configurable portfolio construction and risk module references.
-3. Persist and replay portfolio/risk state snapshots across process restarts.
-4. Simulate n-1 minute indicator snapshots in backtests.
-5. Add idempotent order intent lineage before broker submission.
-6. Add order ticket/order event state machine.
+3. Add risk quality gates and max exposure / max position clamps.
+4. Persist and replay portfolio/risk state snapshots across process restarts.
+5. Simulate n-1 minute delayed indicator snapshots in backtests.
+6. Add idempotent order intent lineage before broker submission.
+7. Add order ticket/order event state machine.

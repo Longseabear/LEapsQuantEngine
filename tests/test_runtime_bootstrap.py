@@ -3,6 +3,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
+from leaps_quant_engine.framework import EqualWeightPortfolioConstructionModel
 from leaps_quant_engine.models import Bar, Symbol
 from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, bootstrap_sleeve_runtime
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
@@ -60,6 +61,23 @@ class FakeAlphaLoader:
             version="1.0",
             path=path,
             content_hash="abc",
+        )
+
+
+class FakePortfolioModelLoader:
+    def __init__(self):
+        self.calls = []
+
+    def load(self, ref, *, parameters=None):
+        params = dict(parameters or {})
+        self.calls.append((ref, params))
+        return SimpleNamespace(
+            model=EqualWeightPortfolioConstructionModel(
+                max_portfolio_pct=float(params.get("max_portfolio_pct", 1.0))
+            ),
+            ref=ref,
+            parameters=params,
+            model_name="EqualWeightPortfolioConstructionModel",
         )
 
 
@@ -127,6 +145,16 @@ def _write_runtime_config(path, universe_path):
                         "alpha": {
                             "modules": [{"ref": "alpha.py"}],
                         },
+                        "portfolio": {
+                            "module": "portfolio.py",
+                            "params": {
+                                "max_portfolio_pct": 0.5,
+                            },
+                            "rebalance": {
+                                "cash_reserve_pct": 0.1,
+                                "min_order_notional": 1000,
+                            },
+                        },
                         "worker": {
                             "cycle_interval_seconds": 0,
                             "min_success": 2,
@@ -148,6 +176,7 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
     symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
     live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
     alpha_loader = FakeAlphaLoader()
+    portfolio_model_loader = FakePortfolioModelLoader()
     provider_calls = {}
 
     def live_provider_factory(universe, rate_limit_per_second):
@@ -162,12 +191,16 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
             live_provider_factory=live_provider_factory,
             history_provider_factory=lambda: FakeHistoryProvider(),
             alpha_loader=alpha_loader,
+            portfolio_model_loader=portfolio_model_loader,
         ),
         held_symbols=(Symbol("IBM", "US"),),
     )
 
     assert provider_calls == {"universe_id": "us-coarse", "rate_limit_per_second": 20}
     assert alpha_loader.paths == [tmp_path / "alpha.py"]
+    assert portfolio_model_loader.calls == [(str(tmp_path / "portfolio.py"), {"max_portfolio_pct": 0.5})]
+    assert runtime.framework_runner.portfolio_engine.rebalance_policy.cash_reserve_pct == 0.1
+    assert runtime.framework_runner.portfolio_engine.rebalance_policy.min_order_notional == 1000
     assert runtime.fine_refresh_report is not None
     assert runtime.fine_refresh_report.updated_symbol_count == 2
     assert runtime.active_result.selection.selected_symbols == (Symbol("NVDA", "US"),)
@@ -196,6 +229,7 @@ def test_bootstrapped_runtime_can_run_one_worker_cycle(tmp_path):
             live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
             history_provider_factory=lambda: FakeHistoryProvider(),
             alpha_loader=FakeAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
         ),
         held_symbols=(Symbol("IBM", "US"),),
     )

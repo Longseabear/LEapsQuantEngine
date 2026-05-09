@@ -350,7 +350,7 @@ The running process should use its in-memory `RuntimeConfigSnapshot` during norm
 
 ## Alpha Model Direction
 
-Alpha models are Python plugins in v0.
+Alpha models are Python model modules in v0.
 
 The runtime contract is:
 

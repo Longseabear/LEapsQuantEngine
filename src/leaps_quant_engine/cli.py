@@ -12,11 +12,14 @@ from leaps_quant_engine.adapters.kis import (
     MarketDataEngineLiveQuoteProvider,
 )
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader, SnapshotContext
+from leaps_quant_engine.backtesting import run_framework_backtest
 from leaps_quant_engine.benchmark import run_daily_indicator_benchmark
+from leaps_quant_engine.framework import FrameworkRunner
 from leaps_quant_engine.logging import configure_logging
 from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
 from leaps_quant_engine.models import OrderIntent
 from leaps_quant_engine.models import Symbol
+from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.runtime import build_indicator_engine_from_file, run_once_from_file
 from leaps_quant_engine.runtime_bootstrap import bootstrap_sleeve_runtime, resolve_runtime_path
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
@@ -82,6 +85,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     benchmark_indicators.add_argument("--source", default="kis-cache", choices=("kis-cache",))
     benchmark_indicators.add_argument("--refresh-history", action="store_true")
     benchmark_indicators.add_argument("--include-daily", action="store_true")
+
+    framework_backtest = subparsers.add_parser("framework-backtest-daily")
+    framework_backtest.add_argument("universe", type=Path)
+    framework_backtest.add_argument("alpha", type=Path)
+    framework_backtest.add_argument("--sleeve-id", required=True)
+    framework_backtest.add_argument("--start")
+    framework_backtest.add_argument("--end")
+    framework_backtest.add_argument("--cash", type=float, default=100_000.0)
+    framework_backtest.add_argument("--source", default="kis-cache", choices=("kis-cache",))
+    framework_backtest.add_argument("--refresh-history", action="store_true")
+    framework_backtest.add_argument("--summary-only", action="store_true")
 
     warmup_indicators = subparsers.add_parser("warmup-indicators-daily")
     warmup_indicators.add_argument("universe", type=Path)
@@ -290,6 +304,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_daily=args.include_daily,
             source=args.source,
         )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "framework-backtest-daily":
+        provider = KISCachedMarketDataProvider.from_env()
+        universe = load_universe_definition(args.universe)
+        alpha_load = PythonAlphaLoader().load(args.alpha)
+        result = run_framework_backtest(
+            universe,
+            provider,
+            sleeve_id=args.sleeve_id,
+            framework_runner=FrameworkRunner(
+                sleeve_id=args.sleeve_id,
+                alpha_runtime=AlphaRuntime(active_models=(alpha_load.model,)),
+            ),
+            portfolio=Portfolio(cash=args.cash),
+            start=_parse_cli_datetime(args.start),
+            end=_parse_cli_datetime(args.end),
+            refresh_history=args.refresh_history,
+        )
+        report = result.to_report(include_orders=not args.summary_only)
+        report["source"] = args.source
+        report["alpha"] = {
+            "alpha_id": alpha_load.alpha_id,
+            "version": alpha_load.version,
+            "path": str(alpha_load.path),
+            "content_hash": alpha_load.content_hash,
+        }
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if args.command == "warmup-indicators-daily":

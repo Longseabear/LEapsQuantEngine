@@ -27,7 +27,7 @@ The v0 skeleton has moved past the initial engine loop. The active milestone is 
 - `SnapshotFreshnessPolicy` and quality reports for `fresh/degraded/stale/invalid` snapshot states.
 - `WarmupPolicy` and daily cache-first indicator warmup reports.
 - `BackgroundSnapshotWorker` bounded/background cycle runner.
-- Python alpha plugin loading, `AlphaRuntime`, and `InsightBatch` publication.
+- Python Alpha Model loading, `AlphaRuntime`, and `InsightBatch` publication.
 - Universe selection domain with momentum/liquidity active selector and forced watchlist merge.
 - Fine universe cache refresh runtime between coarse and active selection.
 - Daily 200-symbol indicator benchmark.

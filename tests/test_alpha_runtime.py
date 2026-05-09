@@ -80,6 +80,7 @@ def test_alpha_runtime_swaps_pending_models_at_snapshot_boundary():
     runtime.stage([FixedAlpha("new", "new_reason")], validation_context=context)
     second_batch = runtime.run(context)
 
+    assert first_batch.generated_at == context.as_of
     assert first_batch.alpha_ids == ("old",)
     assert first_batch.insights[0].reason == "old_reason"
     assert second_batch.alpha_ids == ("new",)

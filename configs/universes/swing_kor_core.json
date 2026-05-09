@@ -4,6 +4,12 @@
   "symbols": ["005930", "000660", "035420"],
   "indicators": [
     {
+      "name": "close",
+      "type": "close",
+      "period": 1,
+      "field": "close"
+    },
+    {
       "name": "sma_3_close",
       "type": "sma",
       "period": 3,

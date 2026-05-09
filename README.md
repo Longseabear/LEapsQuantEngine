@@ -68,8 +68,9 @@ flowchart LR
     IndicatorSnapshot --> Framework["FrameworkRunner"]
     Framework --> AlphaRuntime["AlphaRuntime"]
     AlphaRuntime --> InsightManager["InsightManager"]
-    InsightManager --> Portfolio["EqualWeightPortfolioConstructionModel"]
-    Portfolio --> Risk["PassThroughRiskManagementModel"]
+    InsightManager --> Portfolio["PortfolioConstructionEngine<br/>EqualWeightPortfolioConstructionModel"]
+    Portfolio --> TargetBatch["PortfolioTargetBatch"]
+    TargetBatch --> Risk["PassThroughRiskManagementModel"]
     Risk --> Execution["ImmediateExecutionModel"]
     Execution --> Intent["OrderIntent"]
 ```
@@ -78,14 +79,13 @@ Implemented now:
 
 - Universe: coarse file, fine cache refresh, active selection, and forced inclusion for held/open-order/exit-watch/manual symbols.
 - Indicators: sleeve-namespaced in-memory state, warmup, 30+ indicator catalog, live snapshot updates, and immutable `IndicatorSnapshot`.
-- Alpha: Python plugin loader, `AlphaRuntime`, `Insight`, `InsightBatch`, and example alpha modules.
-- Framework: `InsightManager`, equal-weight portfolio construction, pass-through risk, immediate execution, and order-intent output.
+- Alpha: Python Alpha Model loader, `AlphaRuntime`, `Insight`, `InsightBatch`, and example alpha modules.
+- Framework: `InsightManager`, `PortfolioConstructionEngine`, equal-weight portfolio model, pass-through risk, immediate execution, and order-intent output.
 - Runtime: config validation, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
-- Backtesting: existing classic `Algorithm.on_data` backtest with immediate fills and report metrics.
+- Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills and report metrics.
 
 Not complete yet:
 
-- Framework alpha backtesting over historical replay.
 - Real risk gates beyond pass-through approval.
 - Order ticket, order event, fill, cancel, reject, and reconciliation state machine.
 - Broker submission and idempotent live order command handling.
@@ -103,8 +103,9 @@ Not complete yet:
 - `MarketDataSnapshot` / `IndicatorSnapshot`: stable read models for live/replay consumers.
 - `WarmupPolicy`: startup/restart indicator preparation from cached history.
 - `BackgroundSnapshotWorker`: bounded/background snapshot update loop.
-- `AlphaRuntime`: Python alpha plugin runner that emits insights from snapshots.
+- `AlphaRuntime`: Python Alpha Model runner that emits insights from snapshots.
 - `InsightManager`: LEAN-style active/expired/cancelled insight state.
+- `PortfolioConstructionEngine`: turns active insights into auditable `PortfolioTargetBatch` records through a pluggable model and rebalance policy.
 - `FrameworkRunner`: deterministic `Alpha -> Portfolio -> Risk -> Execution` v0 pipeline.
 - `UniverseSelectionModel`: sleeve-level active universe selection with forced watchlist inclusion.
 - `RuntimeConfig` / `RuntimeControlCommand`: option snapshots and command-based reload for future UI/control-plane flows.
@@ -118,7 +119,7 @@ py -3 -m pytest -q
 Current expected result:
 
 ```text
-103 passed
+113 passed
 ```
 
 ## Run Sample
@@ -160,7 +161,7 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/live_us_smoke.json --sleeve-id us-live --held IBM --skip-warmup --summary-only
 ```
 
-The first sample lives at `configs/runtime/live_us_smoke.json`. It references the coarse universe file, the active selection module, alpha module path, sleeve cash, market-data provider choice, rate limit, warmup settings, and worker cadence. `bootstrap_sleeve_runtime(...)` turns the snapshot into provider adapters, optional fine refresh, active universe selection, alpha runtime, sleeve portfolio, `FrameworkRunner`, and `BackgroundSnapshotWorker`. The running process should keep the parsed `RuntimeConfigSnapshot` in memory and only reload the file after a control command.
+The first sample lives at `configs/runtime/live_us_smoke.json`. It references the coarse universe file, the active selection module, alpha module path, portfolio construction module path, sleeve cash, market-data provider choice, rate limit, warmup settings, rebalance settings, and worker cadence. `bootstrap_sleeve_runtime(...)` turns the snapshot into provider adapters, optional fine refresh, active universe selection, alpha runtime, portfolio construction engine, sleeve portfolio, `FrameworkRunner`, and `BackgroundSnapshotWorker`. The running process should keep the parsed `RuntimeConfigSnapshot` in memory and only reload the file after a control command.
 
 `runtime-run-once` returns both worker and framework sections: worker covers market snapshot collection and indicator publication; framework covers `Alpha -> InsightManager -> Portfolio -> Risk -> Execution -> OrderIntent`.
 
@@ -199,6 +200,30 @@ provider = VirtualMarketDataProvider.from_bars([
 ```
 
 `run_backtest(...)` returns report-ready metrics: CAGR, Sharpe, MDD, turnover, average holding days, average exposure, win rate, trade count, and order count. Metrics are available at both aggregate and sleeve levels through `result.metrics` and `result.metrics_by_sleeve`.
+
+Framework alpha backtests use the newer LEAN-style path:
+
+```text
+Historical DataSlice replay
+  -> IndicatorEngine
+  -> IndicatorSnapshot
+  -> FrameworkRunner
+  -> AlphaRuntime
+  -> InsightManager
+  -> PortfolioConstructionEngine
+  -> PortfolioTargetBatch
+  -> RiskManagement
+  -> Execution
+  -> immediate fill model
+  -> BacktestMetrics
+```
+
+CLI smoke:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli framework-backtest-daily configs/universes/swing_kor_core.json examples/alpha/price_above_sma_alpha.py --sleeve-id swing-kor --summary-only
+```
 
 ## Indicators
 
@@ -279,7 +304,7 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli alpha-run-snapshot configs/universes/swing_kor_core.json examples/alpha/price_above_sma_alpha.py --sleeve-id swing-kor --min-success 2 --rate-limit-per-second 20 --summary-only
 ```
 
-Alpha plugins are normal Python files. A module can expose `create_alpha_model()`, `ALPHA_MODEL`, or a module-level `generate(context)` function. Alpha reads `SnapshotContext`, emits `Insight` records, and never creates orders directly.
+Alpha Models are normal Python files. A module can expose `create_alpha_model()`, `ALPHA_MODEL`, or a module-level `generate(context)` function. Alpha reads `SnapshotContext`, emits `Insight` records, and never creates orders directly.
 
 Example alpha modules:
 
@@ -296,13 +321,35 @@ Framework pipeline v0:
 IndicatorSnapshot
   -> AlphaRuntime
   -> InsightManager
-  -> EqualWeightPortfolioConstructionModel
+  -> PortfolioConstructionEngine
+  -> PortfolioTargetBatch
   -> PassThroughRiskManagementModel
   -> ImmediateExecutionModel
   -> OrderIntent
 ```
 
-This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights, creates `PortfolioTarget` records, and emits flatten targets when previously managed insights become inactive. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
+This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights, creates auditable `PortfolioTargetBatch` records, and emits flatten targets when previously managed insights become inactive. The v0 engine wraps the equal-weight model with `RebalancePolicy` support for cash reserve, minimum quantity delta, and minimum order notional filters. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
+
+Portfolio Construction Models can be injected as Python model modules, similar to Alpha Models:
+
+```json
+{
+  "portfolio": {
+    "model": "examples/portfolio_models/equal_weight.py",
+    "parameters": {
+      "max_portfolio_pct": 1.0,
+      "long_only": true
+    },
+    "rebalance": {
+      "cash_reserve_pct": 0.0,
+      "min_order_notional": 0.0,
+      "min_quantity_delta": 1
+    }
+  }
+}
+```
+
+Portfolio Construction Model modules should expose `create_portfolio_model(params)`, `create_model(params)`, or `PORTFOLIO_MODEL`. Config chooses model references and numeric settings; target construction logic stays in Python.
 
 Active universe selection smoke:
 
@@ -351,6 +398,83 @@ runtime-run-once live_us_smoke:
   framework Alpha -> OrderIntent: about 0.252 ms
   result: 3 insights, 3 approved risk decisions, 3 buy order intents
 ```
+
+Recent Korean minute framework backtest smoke:
+
+```text
+date: 2026-05-08
+symbols: 005930, 000660, 035420
+resolution: 1 minute
+loaded bars: 1,143
+data slices: 381
+indicator snapshots: 381
+framework cycles: 381
+alpha: price-above-sma-demo
+insights: 424
+orders: 21
+history load: about 2,979 ms
+framework backtest loop: about 158 ms
+framework stage total: about 59 ms
+```
+
+The intraday smoke uses an annualized CAGR formula, so CAGR is not meaningful for a single trading day. For minute-level reports, prefer total return, drawdown, turnover, exposure, win rate, and trade count.
+
+Recent Korean five-year daily framework backtest smoke:
+
+```text
+source: FinanceDataReader
+period: 2021-05-10 -> 2026-05-08
+symbols: 005930, 000660, 035420
+loaded bars: 3,672
+data slices: 1,224
+indicator snapshots: 1,224
+framework cycles: 1,224
+alpha: price-above-sma-demo
+insights: 1,600
+orders: 991
+buy orders: 509
+sell orders: 482
+history load: about 791 ms
+framework backtest loop: about 681 ms
+framework stage total: about 520 ms
+total return: 243.20%
+CAGR: 28.01%
+Sharpe: 1.00
+MDD: 42.45%
+turnover: 17.20
+average holding days: 267.24
+average exposure: 97.19%
+win rate: 55.81%
+trade count: 482
+```
+
+The local KIS/broker-engine daily cache path currently returned only 30 recent trading sessions for the same requested five-year window because the legacy daily operation filters dates after receiving the provider payload. Use it as a cache smoke until a paged KIS history path or separate historical provider is wired into the new engine.
+
+Recent Korean 200-symbol five-year daily framework load test:
+
+```text
+source: FinanceDataReader
+period: 2021-05-10 -> 2026-05-08
+universe: benchmark_kor_200
+symbols with data: 200
+partial-history symbols: 30
+indicator count per symbol: 31
+loaded bars: 225,051
+estimated indicator updates: 6,976,581
+data slices: 1,224
+average symbols per slice: 183.87
+framework cycles: 1,224
+alpha: momentum-strategy-demo
+insights: 56,914
+orders: 101,627
+history load: about 53,043 ms
+framework backtest loop: about 38,786 ms
+framework stage total: about 4,094 ms
+average framework cycle: about 3.34 ms
+p95 framework cycle: about 8.72 ms
+```
+
+The load test exposed and fixed an `InsightManager` scaling issue. Active insights are now indexed by sleeve/symbol/alpha/type, so supersede/expire/active queries operate over active records instead of scanning all historical insight records.
 
 Server/debug logging can be enabled without changing the JSON report on stdout:
 

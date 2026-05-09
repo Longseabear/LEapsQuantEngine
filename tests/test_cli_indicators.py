@@ -127,6 +127,77 @@ def test_cli_benchmark_indicators_daily_outputs_report(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["updated_symbol_count"] == 200
 
 
+def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, capsys):
+    class FakeProvider:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+    class FakeAlphaLoader:
+        def load(self, path):
+            captured["alpha_path"] = path
+            return SimpleNamespace(
+                model=object(),
+                alpha_id="fake-alpha",
+                version="1.0",
+                path=path,
+                content_hash="abc",
+            )
+
+    captured = {}
+    universe = object()
+
+    def fake_run_framework_backtest(universe_arg, provider_arg, **kwargs):
+        captured["universe"] = universe_arg
+        captured["provider"] = provider_arg
+        captured.update(kwargs)
+        return SimpleNamespace(
+            to_report=lambda include_orders=True: {
+                "framework_cycle_count": 3,
+                "insight_count": 2,
+                "order_count": 1,
+                "include_orders": include_orders,
+            }
+        )
+
+    monkeypatch.setattr(cli, "KISCachedMarketDataProvider", FakeProvider)
+    monkeypatch.setattr(cli, "load_universe_definition", lambda path: universe)
+    monkeypatch.setattr(cli, "PythonAlphaLoader", FakeAlphaLoader)
+    monkeypatch.setattr(cli, "run_framework_backtest", fake_run_framework_backtest)
+
+    exit_code = cli.main(
+        [
+            "framework-backtest-daily",
+            "configs/universes/swing_kor_core.json",
+            "examples/alpha/price_above_sma_alpha.py",
+            "--sleeve-id",
+            "swing-kor",
+            "--start",
+            "2026-01-01",
+            "--end",
+            "2026-05-08",
+            "--cash",
+            "1000000",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["universe"] is universe
+    assert isinstance(captured["provider"], FakeProvider)
+    assert captured["sleeve_id"] == "swing-kor"
+    assert captured["portfolio"].cash == 1_000_000
+    assert captured["start"] == datetime(2026, 1, 1)
+    assert captured["end"] == datetime(2026, 5, 8)
+    assert captured["refresh_history"] is False
+    assert captured["framework_runner"].sleeve_id == "swing-kor"
+    output = json.loads(capsys.readouterr().out)
+    assert output["framework_cycle_count"] == 3
+    assert output["include_orders"] is False
+    assert output["source"] == "kis-cache"
+    assert output["alpha"]["alpha_id"] == "fake-alpha"
+
+
 def test_cli_warmup_indicators_daily_outputs_report(monkeypatch, capsys):
     class FakeProvider:
         @classmethod

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
@@ -26,7 +24,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
                     sleeve_id=context.sleeve_id,
                     symbol=context.symbol(symbol_key),
                     direction=InsightDirection.UP,
-                    generated_at=datetime.now(),
+                    generated_at=context.as_of,
                     source_snapshot_id=context.source_snapshot_id,
                     alpha_id=ALPHA_ID,
                     alpha_version=VERSION,

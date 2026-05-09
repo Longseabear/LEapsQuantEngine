@@ -75,7 +75,7 @@ flowchart LR
 - `IndicatorSnapshot` carries the quality report so future alpha/risk stages can gate new entries or risk checks without re-evaluating raw provider details.
 - `WarmupPolicy` is a startup/restart concern. It loads cache-first daily history, warms the in-memory `IndicatorEngine`, and reports readiness before live snapshot updates begin.
 - `BackgroundSnapshotWorker` is the first runtime orchestration object. It composes warmup, snapshot collection, freshness evaluation, indicator update, and active snapshot publication.
-- `AlphaRuntime` runs trusted Python alpha plugins against immutable `SnapshotContext` inputs and emits `InsightBatch` outputs.
+- `AlphaRuntime` runs trusted Python Alpha Models against immutable `SnapshotContext` inputs and emits `InsightBatch` outputs.
 - Alpha hot reload should happen by staging a pending model and activating it at the next snapshot boundary.
 - `InsightManager` stores active insight state. Alpha models only emit new insights; portfolio construction consumes the current active insight set.
 - `FrameworkRunner` is the first deterministic model pipeline runner for `Alpha -> PortfolioConstruction -> RiskManagement -> Execution`.
