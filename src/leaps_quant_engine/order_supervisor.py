@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.order_status import OrderRuntimeStatusReport, build_order_runtime_status
+from leaps_quant_engine.orders import OrderEvent, OrderTicket, OrderTicketStatus
 from leaps_quant_engine.order_worker import (
     ExecutionHistoryReconcileReport,
     ExecutionHistoryReconcileWorker,
@@ -14,6 +15,39 @@ from leaps_quant_engine.order_worker import (
     OpenTicketPollWorker,
 )
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
+
+
+@dataclass(frozen=True, slots=True)
+class OrderMaintenancePolicy:
+    stale_after_seconds: float = 0.0
+    cancel_stale: bool = False
+    cancel_partially_filled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class OrderMaintenanceReport:
+    checked_at: datetime
+    stale_tickets: tuple[OrderTicket, ...]
+    cancel_events: tuple[OrderEvent, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def stale_ticket_count(self) -> int:
+        return len(self.stale_tickets)
+
+    @property
+    def cancel_event_count(self) -> int:
+        return len(self.cancel_events)
+
+    def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
+        return {
+            "checked_at": self.checked_at.isoformat(),
+            "stale_ticket_count": self.stale_ticket_count,
+            "cancel_event_count": self.cancel_event_count,
+            "stale_tickets": [ticket.to_dict() for ticket in self.stale_tickets] if include_details else [],
+            "cancel_events": [event.to_dict() for event in self.cancel_events] if include_details else [],
+            "warnings": list(self.warnings),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +59,7 @@ class OrderSupervisorRunReport:
     poll_enabled: bool
     reconcile_enabled: bool
     poll_reports: tuple[OpenTicketPollReport, ...]
+    maintenance_report: OrderMaintenanceReport | None
     reconcile_report: ExecutionHistoryReconcileReport | None
     final_status: OrderRuntimeStatusReport
     errors: tuple[str, ...] = ()
@@ -60,6 +95,9 @@ class OrderSupervisorRunReport:
             "poll_event_count": self.poll_event_count,
             "poll_fill_event_count": self.poll_fill_event_count,
             "poll_reports": [report.to_dict(include_details=include_details) for report in self.poll_reports],
+            "maintenance_report": self.maintenance_report.to_dict(include_details=include_details)
+            if self.maintenance_report is not None
+            else None,
             "reconcile_report": self.reconcile_report.to_dict(include_details=include_details)
             if self.reconcile_report is not None
             else None,
@@ -83,6 +121,7 @@ class OrderRuntimeSupervisor:
     broker_account_id: str | None = None
     market_scope: str | None = None
     currency: str = "KRW"
+    maintenance_policy: OrderMaintenancePolicy = field(default_factory=OrderMaintenancePolicy)
 
     def run_once(
         self,
@@ -105,6 +144,7 @@ class OrderRuntimeSupervisor:
         started_at = run_at or datetime.now()
         errors: list[str] = list(initial_errors)
         poll_reports: list[OpenTicketPollReport] = []
+        maintenance_report: OrderMaintenanceReport | None = None
         reconcile_report: ExecutionHistoryReconcileReport | None = None
 
         poll_enabled = poll and self.poll_worker is not None
@@ -112,6 +152,8 @@ class OrderRuntimeSupervisor:
             errors.append("poll_requested_without_poll_worker")
         if poll_enabled:
             poll_reports.extend(self._poll_open_tickets(started_at, errors))
+
+        maintenance_report = self._maintain_open_tickets(started_at, errors)
 
         reconcile_enabled = reconcile and self.reconcile_worker is not None
         if reconcile and self.reconcile_worker is None:
@@ -156,6 +198,7 @@ class OrderRuntimeSupervisor:
             poll_enabled=poll_enabled,
             reconcile_enabled=reconcile_enabled,
             poll_reports=tuple(poll_reports),
+            maintenance_report=maintenance_report,
             reconcile_report=reconcile_report,
             final_status=final_status,
             errors=tuple(errors),
@@ -173,3 +216,46 @@ class OrderRuntimeSupervisor:
                 suffix = f":{sleeve_id}" if sleeve_id else ""
                 errors.append(f"poll_failed{suffix}: {exc}")
         return tuple(reports)
+
+    def _maintain_open_tickets(self, checked_at: datetime, errors: list[str]) -> OrderMaintenanceReport | None:
+        policy = self.maintenance_policy
+        if policy.stale_after_seconds <= 0:
+            return None
+        snapshot = self.order_state_store.snapshot(captured_at=checked_at)
+        stale = tuple(
+            ticket for ticket in snapshot.open_tickets
+            if _is_stale_ticket(ticket, checked_at, policy=policy)
+        )
+        if not stale:
+            return OrderMaintenanceReport(checked_at=checked_at, stale_tickets=())
+        if not policy.cancel_stale:
+            return OrderMaintenanceReport(checked_at=checked_at, stale_tickets=stale)
+        if self.poll_worker is None:
+            warning = "cancel_stale_requested_without_poll_worker"
+            errors.append(warning)
+            return OrderMaintenanceReport(checked_at=checked_at, stale_tickets=stale, warnings=(warning,))
+        try:
+            cancel_result = self.poll_worker.broker.cancel(
+                stale,
+                reason="stale_ticket_cancel",
+                occurred_at=checked_at,
+            )
+            self.order_state_store.record_events(cancel_result.events, recorded_at=checked_at)
+            for event in cancel_result.events:
+                self.account_store.apply_order_event(event)
+            return OrderMaintenanceReport(
+                checked_at=checked_at,
+                stale_tickets=stale,
+                cancel_events=cancel_result.events,
+            )
+        except Exception as exc:  # noqa: BLE001
+            warning = f"cancel_stale_failed: {exc}"
+            errors.append(warning)
+            return OrderMaintenanceReport(checked_at=checked_at, stale_tickets=stale, warnings=(warning,))
+
+
+def _is_stale_ticket(ticket: OrderTicket, checked_at: datetime, *, policy: OrderMaintenancePolicy) -> bool:
+    if ticket.status is OrderTicketStatus.PARTIALLY_FILLED and not policy.cancel_partially_filled:
+        return False
+    age = (checked_at - ticket.created_at).total_seconds()
+    return age >= policy.stale_after_seconds

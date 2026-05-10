@@ -1,0 +1,52 @@
+{
+  "id": "us-etf-rotation-core",
+  "market": "US",
+  "tags": [
+    "research",
+    "overseas",
+    "usd",
+    "etf",
+    "rotation"
+  ],
+  "symbols": [
+    {"ticker": "SPY", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "us_large_cap"},
+    {"ticker": "QQQ", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "us_growth"},
+    {"ticker": "IWM", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "us_small_cap"},
+    {"ticker": "DIA", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "us_blue_chip"},
+    {"ticker": "SMH", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "semiconductor"},
+    {"ticker": "XLK", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "technology"},
+    {"ticker": "XLF", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "financials"},
+    {"ticker": "XLV", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "health_care"},
+    {"ticker": "XLE", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "energy"},
+    {"ticker": "XLI", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "industrials"},
+    {"ticker": "XLP", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "consumer_staples"},
+    {"ticker": "XLU", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "utilities"},
+    {"ticker": "USMV", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "minimum_volatility"},
+    {"ticker": "TLT", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "long_duration_treasury"},
+    {"ticker": "IEF", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "intermediate_treasury"},
+    {"ticker": "GLD", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "gold"}
+  ],
+  "indicators": [
+    {"name": "close", "type": "close", "period": 1, "field": "close"},
+    {"name": "identity_close", "type": "identity", "period": 1, "field": "close"},
+    {"name": "sma_5_close", "type": "sma", "period": 5, "field": "close"},
+    {"name": "sma_20_close", "type": "sma", "period": 20, "field": "close"},
+    {"name": "sma_100_close", "type": "sma", "period": 100, "field": "close"},
+    {"name": "sma_200_close", "type": "sma", "period": 200, "field": "close"},
+    {"name": "ema_8_close", "type": "ema", "period": 8, "field": "close"},
+    {"name": "momentum_5_close", "type": "momentum", "period": 5, "field": "close"},
+    {"name": "roc_20_close", "type": "roc", "period": 20, "field": "close"},
+    {"name": "roc_63_close", "type": "roc", "period": 63, "field": "close"},
+    {"name": "roc_126_close", "type": "roc", "period": 126, "field": "close"},
+    {"name": "roc_252_close", "type": "roc", "period": 252, "field": "close"},
+    {"name": "rolling_max_20_close", "type": "rolling_max", "period": 20, "field": "close"},
+    {"name": "rolling_min_20_close", "type": "rolling_min", "period": 20, "field": "close"},
+    {"name": "stddev_20_close", "type": "stddev", "period": 20, "field": "close"},
+    {"name": "stddev_63_close", "type": "stddev", "period": 63, "field": "close"},
+    {"name": "atr_14", "type": "atr", "period": 14},
+    {"name": "volume", "type": "volume", "period": 1},
+    {"name": "rolling_volume_20", "type": "rolling_volume", "period": 20},
+    {"name": "rolling_dollar_volume_20", "type": "rolling_dollar_volume", "period": 20},
+    {"name": "vwap_20", "type": "vwap", "period": 20}
+  ]
+}

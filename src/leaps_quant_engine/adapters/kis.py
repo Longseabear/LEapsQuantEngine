@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import requests
 
+from leaps_quant_engine.adapters.kis_direct import KISDirectClient
 from leaps_quant_engine.market_data import MarketDataError, MarketDataProvider
 from leaps_quant_engine.models import Bar, Symbol
 from leaps_quant_engine.settings import KISSettings, load_kis_settings
@@ -309,25 +310,30 @@ class MarketDataEngineClient:
 
 @dataclass(slots=True)
 class KISBrokerEngineMarketDataProvider(MarketDataProvider):
-    """MarketDataProvider adapter backed by the local legacy broker-engine."""
+    """Legacy-compatible KIS provider name backed by an in-process KIS boundary by default."""
 
     client: BrokerEngineClient
+    exchange_by_symbol: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_env(cls) -> "KISBrokerEngineMarketDataProvider":
-        return cls(client=BrokerEngineClient.from_settings(load_kis_settings()))
+    def from_env(
+        cls,
+        exchange_by_symbol: Mapping[str, str] | None = None,
+    ) -> "KISBrokerEngineMarketDataProvider":
+        return cls(
+            client=KISDirectClient.from_settings(load_kis_settings()),
+            exchange_by_symbol=dict(exchange_by_symbol or {}),
+        )
 
     def health_check(self) -> dict[str, Any]:
         return self.client.health_check()
 
     def get_latest_bar(self, symbol: Symbol) -> Bar:
+        arguments = _latest_quote_arguments(symbol, exchange_by_symbol=self.exchange_by_symbol)
+        arguments.setdefault("exchange", None)
         result = self.client.call_operation(
             "get_stock_price",
-            {
-                "market": _kis_market(symbol.market),
-                "symbol": symbol.ticker,
-                "exchange": _kis_exchange(symbol.market),
-            },
+            arguments,
         )
         price = _extract_price(result)
         return Bar(
@@ -349,14 +355,12 @@ class KISBrokerEngineMarketDataProvider(MarketDataProvider):
     ) -> list[Bar]:
         result = self.client.call_operation(
             "get_daily_ohlcv",
-            {
-                "market": _kis_market(symbol.market),
-                "symbol": symbol.ticker,
-                "period_code": "D",
-                "adjusted_price": True,
-                "start_date": start.strftime("%Y%m%d") if start else None,
-                "end_date": end.strftime("%Y%m%d") if end else None,
-            },
+            _daily_history_arguments(
+                symbol,
+                start=start,
+                end=end,
+                exchange_by_symbol=self.exchange_by_symbol,
+            ),
         )
         rows = _extract_history_rows(result)
         return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
@@ -372,12 +376,8 @@ class KISBrokerEngineMarketDataProvider(MarketDataProvider):
         result = self.client.call_operation(
             "get_or_cache_daily_ohlcv",
             {
-                "market": _kis_market(symbol.market),
-                "symbol": symbol.ticker,
-                "period_code": "D",
-                "adjusted_price": True,
-                "start_date": start.strftime("%Y%m%d") if start else None,
-                "end_date": end.strftime("%Y%m%d") if end else None,
+                **_daily_history_arguments(symbol, start=start, end=end),
+                **_exchange_argument(symbol, self.exchange_by_symbol),
                 "refresh": refresh,
             },
         )
@@ -387,13 +387,20 @@ class KISBrokerEngineMarketDataProvider(MarketDataProvider):
 
 @dataclass(slots=True)
 class KISCachedMarketDataProvider(MarketDataProvider):
-    """Cache-first historical KIS provider backed by local market-data-engine."""
+    """Cache-first KIS provider backed by an in-process file cache by default."""
 
     client: MarketDataEngineClient
+    exchange_by_symbol: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_env(cls) -> "KISCachedMarketDataProvider":
-        return cls(client=MarketDataEngineClient.from_settings(load_kis_settings()))
+    def from_env(
+        cls,
+        exchange_by_symbol: Mapping[str, str] | None = None,
+    ) -> "KISCachedMarketDataProvider":
+        return cls(
+            client=KISDirectClient.from_settings(load_kis_settings()),
+            exchange_by_symbol=dict(exchange_by_symbol or {}),
+        )
 
     def health_check(self) -> dict[str, Any]:
         return self.client.health_check()
@@ -401,10 +408,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
     def get_latest_bar(self, symbol: Symbol) -> Bar:
         result = self.client.call_tool(
             "get_stock_price",
-            {
-                "market": _kis_market(symbol.market),
-                "symbol": symbol.ticker,
-            },
+            _latest_quote_arguments(symbol, exchange_by_symbol=self.exchange_by_symbol),
         )
         price = _extract_price(result)
         return Bar(
@@ -426,7 +430,12 @@ class KISCachedMarketDataProvider(MarketDataProvider):
     ) -> list[Bar]:
         result = self.client.call_tool(
             "get_daily_ohlcv",
-            _daily_history_arguments(symbol, start=start, end=end),
+            _daily_history_arguments(
+                symbol,
+                start=start,
+                end=end,
+                exchange_by_symbol=self.exchange_by_symbol,
+            ),
         )
         rows = _extract_history_rows(result)
         return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
@@ -443,6 +452,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
             "get_or_cache_daily_ohlcv",
             {
                 **_daily_history_arguments(symbol, start=start, end=end),
+                **_exchange_argument(symbol, self.exchange_by_symbol),
                 "refresh": refresh,
             },
         )
@@ -481,7 +491,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
 
 @dataclass(slots=True)
 class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
-    """Live quote adapter backed by the local market-data-engine tier."""
+    """Live quote adapter backed by an in-process KIS boundary by default."""
 
     client: MarketDataEngineClient
     exchange_by_symbol: Mapping[str, str] = field(default_factory=dict)
@@ -492,7 +502,7 @@ class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
         exchange_by_symbol: Mapping[str, str] | None = None,
         rate_limit_per_second: int | None = None,
     ) -> "MarketDataEngineLiveQuoteProvider":
-        client = MarketDataEngineClient.from_settings(load_kis_settings())
+        client = KISDirectClient.from_settings(load_kis_settings())
         if rate_limit_per_second is not None:
             client.rate_limit_per_second = _cap_kis_rate(rate_limit_per_second)
         return cls(
@@ -525,8 +535,9 @@ def _daily_history_arguments(
     *,
     start: datetime | None = None,
     end: datetime | None = None,
+    exchange_by_symbol: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    arguments: dict[str, Any] = {
         "market": _kis_market(symbol.market),
         "symbol": symbol.ticker,
         "period_code": "D",
@@ -534,6 +545,15 @@ def _daily_history_arguments(
         "start_date": start.strftime("%Y%m%d") if start else None,
         "end_date": end.strftime("%Y%m%d") if end else None,
     }
+    exchange = _resolve_optional_exchange(symbol, exchange_by_symbol or {})
+    if exchange:
+        arguments["exchange"] = exchange
+    return arguments
+
+
+def _exchange_argument(symbol: Symbol, exchange_by_symbol: Mapping[str, str]) -> dict[str, str]:
+    exchange = _resolve_optional_exchange(symbol, exchange_by_symbol)
+    return {"exchange": exchange} if exchange else {}
 
 
 def _safe_market_data_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -588,6 +608,18 @@ def _resolve_exchange(symbol: Symbol, exchange_by_symbol: Mapping[str, str]) -> 
     raise MarketDataError(f"Exchange is required for overseas symbol {symbol.key}.")
 
 
+def _resolve_optional_exchange(symbol: Symbol, exchange_by_symbol: Mapping[str, str]) -> str | None:
+    if _kis_market(symbol.market) == "domestic":
+        return None
+    normalized_market = symbol.market.strip().upper()
+    if normalized_market in {"NAS", "NYS", "AMS"}:
+        return normalized_market
+    exchange = exchange_by_symbol.get(symbol.key) or exchange_by_symbol.get(symbol.ticker)
+    if exchange:
+        return str(exchange).strip().upper()
+    return _kis_exchange(symbol.market)
+
+
 def _is_kis_rate_limit_error(detail: Any) -> bool:
     text = str(detail)
     return "EGW00201" in text or "초당 거래건수" in text
@@ -603,6 +635,8 @@ def _kis_market(market: str) -> str:
 def _kis_exchange(market: str) -> str | None:
     normalized = market.strip().upper()
     if normalized in {"KR", "KRX", "KOR", "DOMESTIC"}:
+        return None
+    if normalized in {"US", "USA", "OVERSEAS", "MIXED"}:
         return None
     return normalized
 

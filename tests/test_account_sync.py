@@ -36,6 +36,53 @@ def test_execution_to_virtual_fill_normalizes_kis_execution():
     assert fill.filled_at == datetime(2026, 5, 8, 9, 30)
 
 
+def test_execution_to_virtual_fill_prefers_explicit_execution_id_for_fill_level_rows():
+    fill = execution_to_virtual_fill(
+        {
+            "order_id": "12345",
+            "execution_id": "fill-0001",
+            "symbol": "005930",
+            "side": "buy",
+            "execution_quantity": "3",
+            "execution_price": "70000",
+            "execution_timestamp": "20260508T093000",
+        },
+        market="domestic",
+    )
+
+    assert fill.fill_id == "kis:domestic:fill:12345:fill-0001"
+
+
+def test_execution_to_virtual_fill_uses_stable_order_summary_id_without_quantity_or_price():
+    first = execution_to_virtual_fill(
+        {
+            "order_id": "12345",
+            "symbol": "005930",
+            "side": "buy",
+            "execution_quantity": "2",
+            "execution_price": "70000",
+            "execution_timestamp": "20260508T093000",
+            "source_granularity": "order_execution_summary",
+        },
+        market="domestic",
+    )
+    revised = execution_to_virtual_fill(
+        {
+            "order_id": "12345",
+            "symbol": "005930",
+            "side": "buy",
+            "execution_quantity": "3",
+            "execution_price": "70050",
+            "execution_timestamp": "20260508T093000",
+            "source_granularity": "order_execution_summary",
+        },
+        market="domestic",
+    )
+
+    assert first.fill_id == "kis:domestic:order-summary:12345:20260508T093000"
+    assert revised.fill_id == first.fill_id
+
+
 def test_kis_account_sync_imports_owned_and_unassigned_fills(tmp_path):
     store = VirtualSleeveAccountStore(tmp_path / "accounts.json", default_cash_by_sleeve={"LEaps": 1_000_000})
     store.register_order_intent(
@@ -168,3 +215,59 @@ def test_kis_account_sync_can_sync_cash_to_default_sleeve(tmp_path):
 
     assert report.cash_reconciliation["status"] == "matched"
     assert store.current_portfolio("default sleeve").cash == 900_000
+
+
+def test_kis_account_sync_does_not_double_apply_revised_order_summary(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json", default_cash_by_sleeve={"LEaps": 1_000_000})
+    store.register_order_intent(
+        OrderIntent(
+            sleeve_id="LEaps",
+            symbol=Symbol("005930", "KRX"),
+            side=OrderSide.BUY,
+            quantity=3,
+            reference_price=70_000,
+        ),
+        order_id="owned-order",
+        broker_order_id="owned-order",
+    )
+    fake_broker = FakeBroker(
+        {
+            "get_account_balance_summary": {},
+            "get_account_holdings": {"holdings": []},
+            "get_account_execution_history": {
+                "executions": [
+                    {
+                        "order_id": "owned-order",
+                        "symbol": "005930",
+                        "side": "buy",
+                        "execution_quantity": "2",
+                        "execution_price": "70000",
+                        "execution_timestamp": "20260508T093000",
+                        "source_granularity": "order_execution_summary",
+                    },
+                ],
+            },
+        }
+    )
+    sync = KISVirtualAccountSync(KISAccountClient(fake_broker))
+
+    first = sync.sync(store, start_date="20260508", end_date="20260508")
+    fake_broker.result_by_operation["get_account_execution_history"] = {
+        "executions": [
+            {
+                "order_id": "owned-order",
+                "symbol": "005930",
+                "side": "buy",
+                "execution_quantity": "3",
+                "execution_price": "70050",
+                "execution_timestamp": "20260508T093000",
+                "source_granularity": "order_execution_summary",
+            },
+        ],
+    }
+    second = sync.sync(store, start_date="20260508", end_date="20260508")
+
+    assert first.imported_fill_count == 1
+    assert second.imported_fill_count == 0
+    assert second.duplicate_fill_count == 1
+    assert store.current_portfolio("LEaps").quantity(Symbol("005930", "KRX")) == 2

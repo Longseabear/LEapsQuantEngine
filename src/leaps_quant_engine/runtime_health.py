@@ -7,6 +7,7 @@ from typing import Any
 
 from leaps_quant_engine.cycle_journal import CycleJournalEntry, CycleJournalStore
 from leaps_quant_engine.order_status import OrderRuntimeStatusReport
+from leaps_quant_engine.runtime_integrity import current_engine_source_fingerprint
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +58,8 @@ class RuntimeHealthReport:
                 actions.append("refresh_snapshot_worker")
             elif check.name == "unsupported_broker_route":
                 actions.append("use_paper_or_supported_broker_route")
+            elif check.name in {"engine_code_changed_since_last_cycle", "latest_cycle_missing_code_identity"}:
+                actions.append("reload_runtime_or_run_preflight")
         return tuple(dict.fromkeys(actions))
 
     def to_dict(self) -> dict[str, Any]:
@@ -85,6 +88,7 @@ def build_runtime_health_report(
 ) -> RuntimeHealthReport:
     generated_at = generated_at or datetime.now()
     checks: list[RuntimeHealthCheck] = []
+    current_engine_hash = current_engine_source_fingerprint().digest
     latest_by_sleeve: dict[str, CycleJournalEntry | None] = {}
     if journal_path is not None and not journal_path.exists():
         checks.append(RuntimeHealthCheck("missing_journal_store", "warning", metadata={"path": str(journal_path)}))
@@ -113,6 +117,29 @@ def build_runtime_health_report(
                     "snapshot_quality",
                     "critical" if latest.snapshot_status == "invalid" else "warning",
                     reason=str(latest.snapshot_status),
+                    metadata={"sleeve_id": sleeve_id, "entry_id": latest.entry_id},
+                )
+            )
+        latest_engine_hash = latest.metadata.get("engine_source_hash")
+        if latest_engine_hash:
+            if latest_engine_hash != current_engine_hash:
+                checks.append(
+                    RuntimeHealthCheck(
+                        "engine_code_changed_since_last_cycle",
+                        "warning",
+                        metadata={
+                            "sleeve_id": sleeve_id,
+                            "latest": latest_engine_hash,
+                            "current": current_engine_hash,
+                            "entry_id": latest.entry_id,
+                        },
+                    )
+                )
+        else:
+            checks.append(
+                RuntimeHealthCheck(
+                    "latest_cycle_missing_code_identity",
+                    "warning",
                     metadata={"sleeve_id": sleeve_id, "entry_id": latest.entry_id},
                 )
             )

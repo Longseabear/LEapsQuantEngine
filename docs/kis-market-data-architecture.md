@@ -2,30 +2,29 @@
 
 ## Decision
 
-The new engine must not call KIS directly from algorithms, alpha models, universe selection, or execution logic.
+The new engine must not call KIS directly from algorithms, alpha models, universe selection, portfolio, risk, execution model logic, or indicators.
 
-KIS access goes through the local broker-engine gateway.
+KIS access now goes through the engine-owned adapter boundary. The default boundary is the in-process `KISDirectClient`; the old broker-engine and market-data-engine servers remain reference/compatibility concepts, not required runtime servers.
 
 ```text
 new engine core
   -> MarketDataProvider port
-  -> KIS broker-engine adapter
-  -> local broker-engine
+  -> KIS adapter / local cache
   -> KIS
 ```
 
-This mirrors the most important StockProgram lesson: one local broker-facing process should own KIS credentials, token reuse, websocket approval, request pacing, broker errors, and broker-specific payload normalization.
+This keeps the most important StockProgram lesson without requiring separate local servers: one explicit broker-facing boundary owns KIS credentials, token reuse, request pacing, broker errors, and broker-specific payload normalization.
 
-## Why Broker-Engine Is Mandatory
+## Why The Adapter Boundary Is Mandatory
 
 KIS has a low request throughput budget. Treat the AppKey as a shared rate-limited lane. The practical operating rule is:
 
 - never let multiple local processes independently spend the same KIS quota
 - never let alpha/universe code call KIS directly
-- route broker-backed quotes, account reads, order actions, and historical KIS calls through broker-engine
-- keep the broker-engine rate limit configured at or below the KIS limit, with headroom for retries and operational calls
+- route broker-backed quotes, account reads, order actions, and historical KIS calls through the adapter boundary
+- keep adapter rate limits at or below the KIS limit, with headroom for retries and operational calls
 
-StockProgram already implements the right boundary:
+StockProgram remains the reference for the operational details:
 
 - `broker-engine` owns direct KIS REST/websocket communication
 - `BrokerEngineService` owns per-lane `RateLimitedSession`
@@ -33,15 +32,15 @@ StockProgram already implements the right boundary:
 - `/broker/call` exposes whitelisted broker operations
 - `/broker/commands` handles command queue/idempotency for submitted order workflows
 
-The new engine should consume this as a local adapter, not copy the broker implementation into the core.
+The new engine now takes ownership of the subset it needs inside `leaps_quant_engine.adapters.kis_direct`. The deterministic core still only sees normalized providers and order lifecycle records.
 
 ## Layering
 
 Use separate responsibilities:
 
 ```text
-broker-engine
-  KIS auth, token, rate limit, broker REST/websocket mechanics
+KISDirectClient
+  KIS auth, token, rate limit, REST mechanics, local cache
 
 market-data adapter
   normalized Bar/DataSlice/Quote objects, cache policy, history replay conversion
@@ -76,7 +75,7 @@ The new engine should preserve this split:
 
 ```text
 KIS historical operation
-  -> broker-engine /broker/call
+  -> KISDirectClient
   -> market-data adapter
   -> local history cache
   -> normalized Bars
@@ -146,6 +145,8 @@ Current new-engine adapters and snapshot path:
 - `leaps_quant_engine.adapters.kis.KISBrokerEngineMarketDataProvider`
 - `leaps_quant_engine.adapters.kis.KISCachedMarketDataProvider`
 - `leaps_quant_engine.adapters.kis.MarketDataEngineLiveQuoteProvider`
+- `leaps_quant_engine.adapters.kis_direct.KISDirectClient`
+- `leaps_quant_engine.mcp_market_data_stdio`
 - `leaps_quant_engine.backtesting.VirtualMarketDataProvider`
 - `leaps_quant_engine.market_data_snapshot.MarketDataSnapshotEngine`
 - `leaps_quant_engine.snapshots.IndicatorSnapshotStore`
@@ -153,7 +154,7 @@ Current new-engine adapters and snapshot path:
 Live quote flow:
 
 ```text
-local market-data-engine get_stock_price
+KISDirectClient get_stock_price
   -> MarketDataEngineLiveQuoteProvider
   -> normalized Bar
   -> MarketDataSnapshot
@@ -164,7 +165,7 @@ local market-data-engine get_stock_price
 Historical benchmark flow:
 
 ```text
-local market-data-engine get_or_cache_daily_ohlcv
+KISDirectClient get_or_cache_daily_ohlcv
   -> KISCachedMarketDataProvider
   -> daily Bars
   -> daily replay DataSlice feed
@@ -251,11 +252,43 @@ Important events:
 - `indicator_snapshot.publish`
 - `live_indicator_snapshot.complete`
 
+## Codex MCP Boundary
+
+The global Codex market-data MCP entry should point at the new engine-local
+stdio server:
+
+```text
+codex global MCP
+  -> leaps_quant_engine.mcp_market_data_stdio
+  -> KISDirectClient
+  -> local KIS cache / KIS REST
+```
+
+This replaces the old StockProgram `market_data_engine.server.app serve-mcp`
+entry. The MCP server is intentionally thin: it exposes quote/history/cache
+tools and delegates broker-specific work to `KISDirectClient`. It must not be
+used from alpha, portfolio, risk, or execution model code.
+
+Supported MCP tools include:
+
+- `health_check`
+- `get_stock_price`
+- `get_daily_ohlcv`
+- `get_or_cache_daily_ohlcv`
+- `get_overseas_daily_ohlcv`
+- `get_intraday_bars`
+- `get_or_cache_domestic_minute_bars`
+- `build_whitelist_live_facts`
+- `get_market_session_status`
+
+`get_market_session_status` is a local lightweight estimate and does not apply
+holiday calendars yet.
+
 ## Operating Rules
 
-- KIS direct calls are forbidden outside broker-engine.
-- New code may call broker-engine only through an adapter.
+- KIS direct calls are forbidden outside the adapter boundary.
+- Strategy and model code may call market-data ports only, never `KISDirectClient`.
 - Default historical workflows are cache-first.
 - Live polling is allowed only for small active watchlists or execution checks.
 - Backtests should use cached or virtual providers, not live KIS calls.
-- Any new KIS operation must be documented as broker-engine-backed and rate-limit aware.
+- Any new KIS operation must be documented as adapter-backed and rate-limit aware.

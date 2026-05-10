@@ -124,6 +124,32 @@ def test_background_snapshot_worker_warms_up_then_publishes_cycles():
     assert active.quality_report.status == SnapshotQualityStatus.FRESH
 
 
+def test_background_snapshot_worker_degrades_cycle_quality_when_warmup_is_not_ready():
+    universe = _worker_universe()
+    history = {
+        universe.symbols[0].key: [_bar(universe.symbols[0], 0)],
+        universe.symbols[1].key: [],
+    }
+    worker = BackgroundSnapshotWorker(
+        universe=universe,
+        sleeve_id="swing-kor",
+        live_provider=SequentialLiveProvider(),
+        history_provider=FakeHistoryProvider(history),
+        interval_seconds=0.0,
+    )
+
+    report = worker.run(max_cycles=1, warmup=True)
+
+    assert report.warmup is not None
+    assert report.warmup.is_ready is False
+    assert report.cycles[0].snapshot_quality.status == SnapshotQualityStatus.DEGRADED
+    assert "warmup_not_ready" in report.cycles[0].snapshot_quality.reasons
+    active = worker.stores_by_sleeve["swing-kor"].active()
+    assert active is not None
+    assert active.quality_report is not None
+    assert "warmup_not_ready" in active.quality_report.reasons
+
+
 def test_background_snapshot_worker_attaches_degraded_quality_to_partial_cycle():
     universe = _worker_universe()
     worker = BackgroundSnapshotWorker(

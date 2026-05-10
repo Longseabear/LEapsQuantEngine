@@ -80,6 +80,7 @@ class UniverseSelectionResult:
     universe_id: str
     generated_at: datetime
     source_snapshot_id: str | None
+    selection_id: str
     selected_symbols: tuple[Symbol, ...]
     forced_symbols: tuple[Symbol, ...]
     live_symbols: tuple[Symbol, ...]
@@ -97,6 +98,7 @@ class UniverseSelectionResult:
         payload: dict[str, Any] = {
             "sleeve_id": self.sleeve_id,
             "universe_id": self.universe_id,
+            "selection_id": self.selection_id,
             "generated_at": self.generated_at.isoformat(),
             "source_snapshot_id": self.source_snapshot_id,
             "selected_count": len(self.selected_symbols),
@@ -144,6 +146,68 @@ class UniverseSelectionModel(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class CompositeUniverseSelectionResult:
+    sleeve_id: str
+    universe_id: str
+    generated_at: datetime
+    source_snapshot_id: str | None
+    selections: Mapping[str, UniverseSelectionResult]
+    selected_symbols: tuple[Symbol, ...]
+    forced_symbols: tuple[Symbol, ...]
+    live_symbols: tuple[Symbol, ...]
+    added_symbols: tuple[Symbol, ...]
+    removed_symbols: tuple[Symbol, ...]
+    retained_symbols: tuple[Symbol, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "selections", MappingProxyType(dict(self.selections)))
+
+    def symbols_for_selection(self, selection_id: str) -> tuple[Symbol, ...]:
+        selection = self.selections.get(selection_id)
+        return selection.selected_symbols if selection is not None else ()
+
+    def to_dict(self, *, include_candidates: bool = True) -> dict[str, Any]:
+        return {
+            "sleeve_id": self.sleeve_id,
+            "universe_id": self.universe_id,
+            "generated_at": self.generated_at.isoformat(),
+            "source_snapshot_id": self.source_snapshot_id,
+            "selection_ids": list(self.selections),
+            "selected_count": len(self.selected_symbols),
+            "forced_count": len(self.forced_symbols),
+            "live_count": len(self.live_symbols),
+            "added_count": len(self.added_symbols),
+            "removed_count": len(self.removed_symbols),
+            "retained_count": len(self.retained_symbols),
+            "selected_symbols": [symbol.key for symbol in self.selected_symbols],
+            "forced_symbols": [symbol.key for symbol in self.forced_symbols],
+            "live_symbols": [symbol.key for symbol in self.live_symbols],
+            "added_symbols": [symbol.key for symbol in self.added_symbols],
+            "removed_symbols": [symbol.key for symbol in self.removed_symbols],
+            "retained_symbols": [symbol.key for symbol in self.retained_symbols],
+            "selections": {
+                selection_id: selection.to_dict(include_candidates=include_candidates)
+                for selection_id, selection in self.selections.items()
+            },
+        }
+
+    def to_universe_definition(self, base_universe: UniverseDefinition, *, universe_id: str | None = None) -> UniverseDefinition:
+        properties = {
+            symbol.key: dict(base_universe.properties_for(symbol))
+            for symbol in self.live_symbols
+            if base_universe.properties_for(symbol)
+        }
+        return UniverseDefinition(
+            id=universe_id or f"{base_universe.id}-active",
+            market=base_universe.market,
+            symbols=self.live_symbols,
+            indicators=base_universe.indicators,
+            tags=(*base_universe.tags, "active"),
+            symbol_properties=properties,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StaticUniverseSelectionModel:
     max_active_symbols: int = 60
     selection_id: str = "static-top-n"
@@ -162,7 +226,13 @@ class StaticUniverseSelectionModel:
             )
             for symbol in context.universe.symbols
         }
-        return build_universe_selection_result(context, selected, candidates=candidates, rejected={})
+        return build_universe_selection_result(
+            context,
+            selected,
+            selection_id=self.selection_id,
+            candidates=candidates,
+            rejected={},
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +261,13 @@ class MomentumUniverseSelectionModel:
                 symbol.key: ("missing_indicator_snapshot",)
                 for symbol in context.universe.symbols
             }
-            return build_universe_selection_result(context, (), candidates={}, rejected=rejected)
+            return build_universe_selection_result(
+                context,
+                (),
+                selection_id=self.selection_id,
+                candidates={},
+                rejected=rejected,
+            )
 
         eligible: list[dict[str, Any]] = []
         rejected: dict[str, tuple[str, ...]] = {}
@@ -263,7 +339,13 @@ class MomentumUniverseSelectionModel:
             )
             for symbol_key, candidate in candidates.items()
         }
-        return build_universe_selection_result(context, selected, candidates=candidates, rejected=rejected)
+        return build_universe_selection_result(
+            context,
+            selected,
+            selection_id=self.selection_id,
+            candidates=candidates,
+            rejected=rejected,
+        )
 
     def _candidate_values(self, snapshot: IndicatorSnapshot, symbol: Symbol) -> tuple[dict[str, Any], list[str]]:
         reasons: list[str] = []
@@ -314,6 +396,7 @@ def build_universe_selection_result(
     context: UniverseSelectionContext,
     selected_symbols: tuple[Symbol, ...],
     *,
+    selection_id: str = "selection",
     candidates: Mapping[str, UniverseSelectionCandidate],
     rejected: Mapping[str, tuple[str, ...]],
 ) -> UniverseSelectionResult:
@@ -346,6 +429,7 @@ def build_universe_selection_result(
         universe_id=context.universe.id,
         generated_at=context.generated_at,
         source_snapshot_id=context.source_snapshot_id,
+        selection_id=selection_id,
         selected_symbols=selected,
         forced_symbols=forced,
         live_symbols=live,
@@ -354,6 +438,45 @@ def build_universe_selection_result(
         retained_symbols=retained,
         candidates=enriched_candidates,
         rejected=rejected,
+    )
+
+
+def build_composite_universe_selection_result(
+    context: UniverseSelectionContext,
+    selections: tuple[UniverseSelectionResult, ...] | list[UniverseSelectionResult],
+) -> CompositeUniverseSelectionResult:
+    selections_by_id: dict[str, UniverseSelectionResult] = {}
+    selected_inputs: list[Symbol] = []
+    for selection in selections:
+        if selection.sleeve_id != context.sleeve_id:
+            raise ValueError("Selection result sleeve_id does not match context.")
+        if selection.universe_id != context.universe.id:
+            raise ValueError("Selection result universe_id does not match context.")
+        if selection.selection_id in selections_by_id:
+            raise ValueError(f"Duplicate selection_id: {selection.selection_id}")
+        selections_by_id[selection.selection_id] = selection
+        selected_inputs.extend(selection.selected_symbols)
+
+    selected = _dedupe_symbols(selected_inputs)
+    forced = context.forced_symbols
+    live = _dedupe_symbols([*selected, *forced])
+    previous_keys = {symbol.key for symbol in context.previous_live_symbols}
+    live_keys = {symbol.key for symbol in live}
+    added = tuple(symbol for symbol in live if symbol.key not in previous_keys)
+    retained = tuple(symbol for symbol in live if symbol.key in previous_keys)
+    removed = tuple(symbol for symbol in context.previous_live_symbols if symbol.key not in live_keys)
+    return CompositeUniverseSelectionResult(
+        sleeve_id=context.sleeve_id,
+        universe_id=context.universe.id,
+        generated_at=context.generated_at,
+        source_snapshot_id=context.source_snapshot_id,
+        selections=selections_by_id,
+        selected_symbols=selected,
+        forced_symbols=forced,
+        live_symbols=live,
+        added_symbols=added,
+        removed_symbols=removed,
+        retained_symbols=retained,
     )
 
 

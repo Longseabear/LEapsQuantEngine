@@ -39,3 +39,11 @@ Alpha models must not:
 
 `AlphaRuntime.stage(...)` can dry-run pending models against a validation context. Activation happens at a snapshot/framework boundary, not halfway through a cycle.
 
+`AlphaRuntime.run(...)` can receive `symbols_by_alpha`, a runtime wiring map from
+`alpha_id` to the symbol keys selected for that model. The runtime scopes
+`SnapshotContext.symbol_keys` before calling each model. Alpha code still sees
+only `SnapshotContext`; it does not know which `SelectionModel` produced those
+symbols and should not call selection code directly.
+
+Runtime config exposes this as `alpha.input_selections`, mapping `alpha_id` to a
+selection result id such as `stock_momentum_top_40` or `etf_rotation_top_20`.

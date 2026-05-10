@@ -75,7 +75,7 @@ def test_portfolio_construction_engine_creates_target_batch_with_cash_reserve():
         "US:AAA": pytest.approx(400),
         "US:BBB": pytest.approx(400),
     }
-    sized = OrderSizingEngine().size(
+    sized = OrderSizingEngine(rebalance_policy=engine.rebalance_policy).size(
         OrderSizingContext(
             sleeve_id="test-sleeve",
             data=data,
@@ -92,6 +92,114 @@ def test_portfolio_construction_engine_creates_target_batch_with_cash_reserve():
     assert batch.metadata["target_portfolio_value"] == pytest.approx(800)
     assert batch.metadata["raw_plan_count"] == 2
     assert batch.metadata["filtered_plan_count"] == 2
+
+
+def test_order_sizing_recomputes_reused_percent_target_from_current_portfolio_state():
+    symbol = Symbol("AAA", "US")
+    first_data = _slice(_bar(symbol, 100.0))
+    second_data = _slice(_bar(symbol, 200.0))
+    batch = PortfolioConstructionEngine(
+        model=EqualWeightPortfolioConstructionModel(max_portfolio_pct=0.5),
+    ).create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=first_data,
+            portfolio=Portfolio(cash=1_000),
+            active_insights=(_insight(symbol),),
+            managed_symbols=(),
+        )
+    )
+    first_sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=first_data,
+            portfolio=Portfolio(cash=1_000),
+            portfolio_targets=batch,
+        )
+    )
+
+    updated_portfolio = Portfolio(
+        cash=500,
+        holdings={symbol.key: Holding(symbol, quantity=5, average_price=100.0)},
+    )
+    second_sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=second_data,
+            portfolio=updated_portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert batch.plans[0].desired_value == pytest.approx(500.0)
+    assert batch.plans[0].current_price == pytest.approx(100.0)
+    assert first_sized.targets == (PortfolioTarget(symbol=symbol, quantity=5, tag="framework:alpha-a:up"),)
+    assert second_sized.plans[0].current_price == pytest.approx(200.0)
+    assert second_sized.plans[0].desired_value == pytest.approx(750.0)
+    assert second_sized.plans[0].target_quantity == 3
+    assert second_sized.plans[0].delta_quantity == -2
+    assert second_sized.metadata["recomputed_from_current_state"] is True
+
+
+def test_order_sizing_lot_optimizer_recovers_meaningful_fractional_targets():
+    expensive = Symbol("EXP", "US")
+    cheaper = Symbol("CHP", "US")
+    data = _slice(_bar(expensive, 160.0), _bar(cheaper, 90.0))
+    batch = PortfolioConstructionEngine(
+        model=EqualWeightPortfolioConstructionModel(max_portfolio_pct=0.6),
+    ).create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=data,
+            portfolio=Portfolio(cash=500),
+            active_insights=(_insight(expensive), _insight(cheaper)),
+            managed_symbols=(),
+        )
+    )
+
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=data,
+            portfolio=Portfolio(cash=500),
+            portfolio_targets=batch,
+        )
+    )
+
+    plans_by_symbol = {plan.allocation.symbol.key: plan for plan in sized.plans}
+    assert plans_by_symbol["US:EXP"].target_quantity == 1
+    assert plans_by_symbol["US:CHP"].target_quantity == 1
+    assert sized.metadata["lot_optimizer_adjustment_count"] == 1
+    assert sized.metadata["lot_optimizer_deployed_notional"] == pytest.approx(160.0)
+    assert sized.metadata["raw_rounding_loss"] > sized.metadata["rounding_loss"]
+
+
+def test_order_sizing_lot_optimizer_ignores_tiny_fractional_targets():
+    symbol = Symbol("EXP", "US")
+    data = _slice(_bar(symbol, 500.0))
+    batch = PortfolioConstructionEngine(
+        model=EqualWeightPortfolioConstructionModel(max_portfolio_pct=0.1),
+    ).create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=data,
+            portfolio=Portfolio(cash=1_000),
+            active_insights=(_insight(symbol),),
+            managed_symbols=(),
+        )
+    )
+
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=data,
+            portfolio=Portfolio(cash=1_000),
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["lot_optimizer_adjustment_count"] == 0
 
 
 def test_rebalance_policy_filters_small_target_delta():

@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
 from leaps_quant_engine.models import DataSlice, PortfolioTarget
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
 from leaps_quant_engine.snapshots import SnapshotQualityReport, SnapshotQualityStatus
 
 
@@ -118,7 +118,12 @@ class BasicRiskManagementModel:
     limits: RiskLimits = field(default_factory=RiskLimits)
 
     def manage_risk(self, context: RiskManagementContext) -> RiskDecisionBatch:
-        available_cash = max(0.0, context.portfolio.cash * (1.0 - self.limits.cash_buffer_pct))
+        target_currencies = _target_currencies(context)
+        cash_by_currency = context.portfolio.cash_by_currency_for(target_currencies)
+        available_cash_by_currency: dict[str, float] = {
+            currency: max(0.0, cash_by_currency.get(currency, 0.0) * (1.0 - self.limits.cash_buffer_pct))
+            for currency in target_currencies
+        }
         decisions: list[RiskDecision] = []
         approved_quantities = {
             holding.symbol.key: holding.quantity
@@ -129,9 +134,10 @@ class BasicRiskManagementModel:
             decision, available_cash = self._evaluate_target(
                 context,
                 target,
-                available_cash,
+                available_cash_by_currency,
                 approved_quantities,
             )
+            available_cash_by_currency[currency_for_symbol(target.symbol)] = available_cash
             if decision.approved_target is not None:
                 approved_quantities[decision.approved_target.symbol.key] = decision.approved_target.quantity
             decisions.append(decision)
@@ -141,9 +147,11 @@ class BasicRiskManagementModel:
         self,
         context: RiskManagementContext,
         target: PortfolioTarget,
-        available_cash: float,
+        available_cash_by_currency: dict[str, float],
         approved_quantities: dict[str, int],
     ) -> tuple[RiskDecision, float]:
+        currency = currency_for_symbol(target.symbol)
+        available_cash = available_cash_by_currency.get(currency, 0.0)
         if self.limits.long_only and target.quantity < 0:
             return (
                 RiskDecision(
@@ -194,6 +202,7 @@ class BasicRiskManagementModel:
                         "requested_quantity": target.quantity,
                         "position_limited_quantity": quantity_after_position_limit,
                         "available_cash": available_cash,
+                        "currency": currency,
                         "price": price,
                     },
                 ),
@@ -220,6 +229,7 @@ class BasicRiskManagementModel:
                     "max_total_exposure_pct": self.limits.max_total_exposure_pct,
                     "cash_buffer_pct": self.limits.cash_buffer_pct,
                     "available_cash_after": available_cash,
+                    "currency": currency,
                     "snapshot_quality_status": context.snapshot_quality.status.value
                     if context.snapshot_quality is not None
                     else None,
@@ -263,7 +273,8 @@ class BasicRiskManagementModel:
     ) -> PortfolioTarget:
         if self.limits.max_position_pct >= 1.0:
             return target
-        equity = context.portfolio.equity(context.data)
+        currency = currency_for_symbol(target.symbol)
+        equity = context.portfolio.equity_by_currency(context.data, (currency,)).get(currency, 0.0)
         if equity <= 0:
             return PortfolioTarget(symbol=target.symbol, quantity=0, tag=target.tag)
         max_abs_quantity = int((equity * self.limits.max_position_pct) // price)
@@ -281,13 +292,16 @@ class BasicRiskManagementModel:
     ) -> PortfolioTarget:
         if self.limits.max_total_exposure_pct >= 1.0:
             return target
-        equity = context.portfolio.equity(context.data)
+        target_currency = currency_for_symbol(target.symbol)
+        equity = context.portfolio.equity_by_currency(context.data, (target_currency,)).get(target_currency, 0.0)
         if equity <= 0:
             return PortfolioTarget(symbol=target.symbol, quantity=0, tag=target.tag)
         max_total_exposure = equity * self.limits.max_total_exposure_pct
         exposure_without_target = 0.0
         for holding in context.portfolio.holdings.values():
             if holding.symbol.key == target.symbol.key:
+                continue
+            if currency_for_symbol(holding.symbol) != target_currency:
                 continue
             quantity = approved_quantities.get(holding.symbol.key, holding.quantity)
             mark = context.portfolio.mark_price(holding.symbol, context.data)
@@ -316,3 +330,9 @@ class BasicRiskManagementModel:
         if affordable_delta >= delta:
             return target_quantity, available_cash - (delta * price)
         return current_quantity + affordable_delta, available_cash - (affordable_delta * price)
+
+
+def _target_currencies(context: RiskManagementContext) -> tuple[str, ...]:
+    currencies = {currency_for_symbol(target.symbol) for target in context.targets}
+    currencies.update(context.portfolio.currencies())
+    return tuple(sorted(currencies))

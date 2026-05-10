@@ -6,10 +6,10 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-etf-rotation"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HORIZON = timedelta(days=20)
-MAX_SELECTED = 3
-MIN_MOMENTUM = 0.0
+MAX_SELECTED = 4
+MIN_RISK_ADJUSTED_SCORE = 0.0
 EMIT_FLAT_FOR_UNSELECTED = True
 
 
@@ -20,24 +20,33 @@ def generate(context: SnapshotContext) -> list[Insight]:
     candidates: list[dict[str, float | str]] = []
     rejected_symbols: list[str] = []
     for symbol_key in context.symbol_keys:
+        close = _first_value(context, symbol_key, ("identity_close", "close"))
+        slow_average = _first_value(context, symbol_key, ("sma_20_close", "sma_5_close"))
         momentum = _first_value(context, symbol_key, ("roc_20_close", "momentum_20_close", "momentum_5_close"))
         volatility = _first_value(context, symbol_key, ("stddev_20_close", "volatility_20_close"))
         liquidity = _first_value(context, symbol_key, ("rolling_dollar_volume_20", "dollar_volume_1"))
-        if momentum is None:
+        if close is None or slow_average is None or momentum is None:
             rejected_symbols.append(symbol_key)
             continue
-        if momentum < MIN_MOMENTUM:
+        if close < slow_average:
             rejected_symbols.append(symbol_key)
             continue
-        volatility_penalty = 0.0 if volatility is None else volatility * 0.1
+        normalized_volatility = 0.0 if volatility is None or close <= 0 else volatility / close
+        volatility_penalty = min(normalized_volatility, 0.30) * 0.45
         liquidity_bonus = 0.0 if liquidity is None else min(liquidity / 1_000_000_000.0, 0.05)
+        score = momentum - volatility_penalty + liquidity_bonus
+        if score < MIN_RISK_ADJUSTED_SCORE:
+            rejected_symbols.append(symbol_key)
+            continue
         candidates.append(
             {
                 "symbol_key": symbol_key,
+                "close": close,
+                "moving_average": slow_average,
                 "momentum": momentum,
-                "volatility": volatility or 0.0,
+                "volatility": normalized_volatility,
                 "liquidity": liquidity or 0.0,
-                "score": momentum - volatility_penalty + liquidity_bonus,
+                "score": score,
             }
         )
 
@@ -45,11 +54,13 @@ def generate(context: SnapshotContext) -> list[Insight]:
         :MAX_SELECTED
     ]
     selected_keys = {str(item["symbol_key"]) for item in selected}
-    selected_weight = 1.0 / len(selected) if selected else 0.0
+    total_score = sum(max(float(item["score"]), 0.0) for item in selected)
 
     insights: list[Insight] = []
-    for item in selected:
+    for rank, item in enumerate(selected, start=1):
         symbol_key = str(item["symbol_key"])
+        score = float(item["score"])
+        selected_weight = (max(score, 0.0) / total_score) if total_score > 0 else (1.0 / len(selected))
         insights.append(
             Insight(
                 sleeve_id=context.sleeve_id,
@@ -61,14 +72,17 @@ def generate(context: SnapshotContext) -> list[Insight]:
                 alpha_id=ALPHA_ID,
                 alpha_version=VERSION,
                 magnitude=float(item["momentum"]),
-                confidence=min(0.9, 0.55 + max(float(item["score"]), 0.0)),
+                confidence=min(0.9, 0.55 + max(score, 0.0) * 2.0),
                 weight=selected_weight,
-                score=float(item["score"]),
-                reason="selected_by_etf_rotation_score",
+                score=score,
+                reason="risk_adjusted_etf_rotation_score",
                 metadata={
+                    "close": item["close"],
+                    "moving_average": item["moving_average"],
                     "momentum": item["momentum"],
                     "volatility": item["volatility"],
                     "liquidity": item["liquidity"],
+                    "rank": rank,
                     "rank_count": len(selected),
                 },
             )

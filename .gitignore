@@ -9,8 +9,10 @@ build/
 *.egg-info/
 logs/
 data/
+artifacts/
 runtime/
 !configs/runtime/
 !configs/runtime/*.json
+configs/runtime/artifacts/
 .git_legacy_backup*/
 reference/stockprogram_legacy/

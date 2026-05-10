@@ -8,6 +8,8 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
 from uuid import uuid4
 
+from leaps_quant_engine.runtime_integrity import current_engine_source_fingerprint
+
 
 CYCLE_JOURNAL_SCHEMA_VERSION = "cycle_journal.v1"
 
@@ -172,6 +174,7 @@ class CycleJournalEntry:
             warnings=all_warnings,
             errors=all_errors,
             metadata={
+                "engine_source_hash": current_engine_source_fingerprint().digest,
                 "coarse_universe_id": getattr(report, "coarse_universe_id", ""),
                 "active_universe_id": getattr(report, "active_universe_id", ""),
             },
@@ -221,6 +224,7 @@ class CycleJournalEntry:
             warnings=tuple(warnings),
             errors=all_errors,
             metadata={
+                "engine_source_hash": current_engine_source_fingerprint().digest,
                 "source_snapshot_id": cycle.source_snapshot_id,
                 "indicator_snapshot_id": cycle.indicator_snapshot_id,
             },

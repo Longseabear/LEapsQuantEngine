@@ -155,11 +155,13 @@ def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, caps
         captured["provider"] = provider_arg
         captured.update(kwargs)
         return SimpleNamespace(
-            to_report=lambda include_orders=True: {
+            to_report=lambda include_orders=True, include_insights=False, include_selection_details=None: {
                 "framework_cycle_count": 3,
                 "insight_count": 2,
                 "order_count": 1,
                 "include_orders": include_orders,
+                "include_insights": include_insights,
+                "include_selection_details": include_selection_details,
             }
         )
 
@@ -198,6 +200,8 @@ def test_cli_framework_backtest_daily_outputs_framework_report(monkeypatch, caps
     output = json.loads(capsys.readouterr().out)
     assert output["framework_cycle_count"] == 3
     assert output["include_orders"] is False
+    assert output["include_insights"] is False
+    assert output["include_selection_details"] is False
     assert output["source"] == "finance-datareader"
     assert output["alpha"]["alpha_id"] == "fake-alpha"
 

@@ -20,6 +20,27 @@ raw market universe
 - `selection.py`: active selection context/results and selection models.
 - `runtime.py`: active universe runtime and forced-symbol invariant.
 
+## Multi-Model Selection
+
+Selection is independent from alpha model code. A runtime config can wire one
+selection result into one or more alpha models, but the selector must not import
+or call the alpha. This keeps the dependency as runtime wiring:
+
+```text
+SelectionModel
+  -> UniverseSelectionResult(selection_id, selected_symbols)
+  -> CompositeUniverseSelectionResult
+  -> AlphaRuntime symbols_by_alpha
+```
+
+`CompositeUniverseSelectionRuntime` runs multiple `UniverseSelectionModel`
+instances, preserves each `selection_id`, and builds one live universe from the
+union of model-selected symbols plus forced operational symbols.
+
+Runtime config can declare either the legacy single `universe.active.selection_model`
+or a multi-model `universe.active.selection_models` list. The selected symbols
+remain attributable by `selection_id` for alpha input wiring and status reports.
+
 ## Forced Live Universe
 
 Selection models may rank or reject candidates, but the engine must force operational symbols back into the live universe:
@@ -44,4 +65,3 @@ exit_watch_symbols subset live_universe
 ## Responsibility Boundary
 
 Universe selection chooses symbols. It should not emit insights, create targets, place orders, or mutate portfolio state.
-

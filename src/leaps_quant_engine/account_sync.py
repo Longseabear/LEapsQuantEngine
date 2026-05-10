@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from leaps_quant_engine.adapters.kis import BrokerEngineClient
+from leaps_quant_engine.adapters.kis_direct import KISDirectClient
 from leaps_quant_engine.broker_routing import currency_for_market_scope
 from leaps_quant_engine.models import OrderSide, Symbol
 from leaps_quant_engine.settings import load_kis_settings
@@ -13,13 +13,13 @@ from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAc
 
 @dataclass(slots=True)
 class KISAccountClient:
-    """Read-only KIS account operations through the local broker-engine."""
+    """Read-only KIS account operations through the configured KIS adapter boundary."""
 
-    broker: BrokerEngineClient
+    broker: Any
 
     @classmethod
     def from_env(cls) -> "KISAccountClient":
-        return cls(BrokerEngineClient.from_settings(load_kis_settings()))
+        return cls(KISDirectClient.from_settings(load_kis_settings()))
 
     def get_balance_summary(self, *, market: str = "domestic") -> dict[str, Any]:
         _require_domestic_account_market(market)
@@ -216,7 +216,14 @@ def execution_to_virtual_fill(
         market=_symbol_market(market, execution),
     )
     filled_at = _parse_execution_datetime(execution)
-    fill_id = f"kis:{market}:{order_id}:{filled_at.strftime('%Y%m%dT%H%M%S')}:{quantity}:{price:g}"
+    fill_id = _execution_fill_id(
+        execution,
+        market=market,
+        order_id=order_id,
+        filled_at=filled_at,
+        quantity=quantity,
+        price=price,
+    )
     return VirtualFillEvent(
         fill_id=fill_id,
         order_id=order_id,
@@ -295,6 +302,52 @@ def _parse_kis_datetime(value: str) -> datetime:
     if len(text) == 8 and text.isdigit():
         return datetime.strptime(text, "%Y%m%d")
     return datetime.fromisoformat(text)
+
+
+def _execution_fill_id(
+    execution: dict[str, Any],
+    *,
+    market: str,
+    order_id: str,
+    filled_at: datetime,
+    quantity: int,
+    price: float,
+) -> str:
+    explicit_execution_id = _first_text(
+        execution,
+        (
+            "execution_id",
+            "execution_no",
+            "execution_number",
+            "fill_id",
+            "fill_no",
+            "fill_number",
+            "trade_id",
+            "trade_no",
+            "contract_id",
+            "contract_no",
+            "ccno",
+            "cntr_no",
+            "odno_exec_no",
+        ),
+    )
+    if explicit_execution_id:
+        return f"kis:{market}:fill:{order_id}:{explicit_execution_id}"
+
+    timestamp = filled_at.strftime("%Y%m%dT%H%M%S")
+    granularity = str(execution.get("source_granularity") or "").strip().lower()
+    if granularity == "order_execution_summary":
+        return f"kis:{market}:order-summary:{order_id}:{timestamp}"
+
+    return f"kis:{market}:{order_id}:{timestamp}:{quantity}:{price:g}"
+
+
+def _first_text(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        text = str(payload.get(key) or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:

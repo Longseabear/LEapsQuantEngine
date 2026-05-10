@@ -10,6 +10,7 @@ from leaps_quant_engine.framework import BasicRiskManagementModel, RiskLimits
 from leaps_quant_engine.models import Bar, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Holding, Portfolio, StaticPortfolioProvider
 from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, bootstrap_sleeve_runtime
+from leaps_quant_engine.runtime_bootstrap import _FallbackHistoryProvider
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
@@ -28,11 +29,22 @@ class FakeLiveProvider:
 
 
 class FakeHistoryProvider:
+    def __init__(self, history_by_key=None):
+        self.history_by_key = history_by_key or {}
+
     def get_latest_bar(self, symbol):
         return Bar(symbol, datetime(2026, 5, 9), 1, 1, 1, 1, 1)
 
     def get_history(self, symbol, *, start=None, end=None):
-        return []
+        return list(self.history_by_key.get(symbol.key, []))
+
+
+class FailingHistoryProvider:
+    def get_latest_bar(self, symbol):
+        raise RuntimeError("primary unavailable")
+
+    def get_history(self, symbol, *, start=None, end=None):
+        raise RuntimeError("primary unavailable")
 
 
 class FakeAlphaModel:
@@ -54,6 +66,26 @@ class FakeAlphaModel:
         ]
 
 
+class AllSymbolsAlphaModel:
+    alpha_id = "all-symbols"
+    version = "1.0"
+
+    def generate(self, context):
+        return [
+            Insight(
+                sleeve_id=context.sleeve_id,
+                symbol=context.symbol(symbol_key),
+                direction=InsightDirection.UP,
+                generated_at=context.as_of,
+                source_snapshot_id=context.source_snapshot_id,
+                alpha_id=self.alpha_id,
+                alpha_version=self.version,
+                reason="runtime_bootstrap_selected_input",
+            )
+            for symbol_key in context.symbol_keys
+        ]
+
+
 class FakeAlphaLoader:
     def __init__(self):
         self.paths = []
@@ -63,6 +95,17 @@ class FakeAlphaLoader:
         return SimpleNamespace(
             model=FakeAlphaModel(),
             alpha_id="fake-alpha",
+            version="1.0",
+            path=path,
+            content_hash="abc",
+        )
+
+
+class AllSymbolsAlphaLoader:
+    def load(self, path):
+        return SimpleNamespace(
+            model=AllSymbolsAlphaModel(),
+            alpha_id="all-symbols",
             version="1.0",
             path=path,
             content_hash="abc",
@@ -131,6 +174,18 @@ def _bar(symbol: Symbol, close: float) -> Bar:
         low=close,
         close=close,
         volume=1000,
+    )
+
+
+def _daily_bar(symbol: Symbol, day: int, close: float) -> Bar:
+    return Bar(
+        symbol=symbol,
+        time=datetime(2026, 5, day),
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+        volume=1000 + day,
     )
 
 
@@ -329,6 +384,158 @@ def test_bootstrapped_runtime_can_run_one_worker_cycle(tmp_path):
     assert payload["framework"]["new_insights"]["insight_count"] == 1
     assert len(payload["framework"]["order_intents"]) == 1
     assert payload["portfolio_state"]["pending"]["order_intent_count"] == 1
+
+
+def test_runtime_wires_active_selection_symbols_into_alpha_context(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    _write_universe(universe_path)
+    _write_runtime_config(config_path, universe_path, worker_min_success=1, min_order_notional=0)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["sleeves"][0]["universe"]["active"]["selection_models"] = [
+        "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+        "leaps_quant_engine.universe.selection:MomentumUniverseSelectionModel",
+    ]
+    payload["sleeves"][0]["alpha"]["input_selections"] = {
+        "all-symbols": "static-top-n",
+    }
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
+
+    runtime = bootstrap_sleeve_runtime(
+        snapshot,
+        "us-live",
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
+            history_provider_factory=lambda: FakeHistoryProvider(),
+            alpha_loader=AllSymbolsAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+        ),
+        held_symbols=(Symbol("IBM", "US"),),
+    )
+    report = runtime.run_once()
+
+    assert list(runtime.active_result.selection.selections) == ["static-top-n", "momentum-active-selection"]
+    assert runtime.active_result.selection.live_symbols == (Symbol("NVDA", "US"), Symbol("IBM", "US"))
+    assert report.framework is not None
+    assert [insight.symbol.key for insight in report.framework.new_insight_batch.insights] == ["US:NVDA"]
+
+
+def test_bootstrap_warms_indicators_before_indicator_based_active_selection(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    selector_path = tmp_path / "selector.py"
+    _write_universe(universe_path)
+    universe_payload = json.loads(universe_path.read_text(encoding="utf-8"))
+    universe_payload["indicators"] = [
+        {"name": "close", "type": "close", "period": 1},
+        {"name": "momentum_2_close", "type": "momentum", "period": 2, "field": "close"},
+    ]
+    universe_path.write_text(json.dumps(universe_payload), encoding="utf-8")
+    selector_path.write_text(
+        """
+from leaps_quant_engine.universe.selection import UniverseSelectionCandidate, build_universe_selection_result
+
+
+class WarmupReadySelectionModel:
+    selection_id = "warmup-ready"
+
+    def select(self, context):
+        candidates = {}
+        rejected = {}
+        scored = []
+        for symbol in context.universe.symbols:
+            if context.indicator_snapshot is None:
+                rejected[symbol.key] = ("missing_indicator_snapshot",)
+                continue
+            momentum = context.indicator_snapshot.value(symbol.key, "momentum_2_close")
+            if momentum is None:
+                rejected[symbol.key] = ("missing_momentum_2_close",)
+                continue
+            scored.append((momentum, symbol))
+        selected = tuple(symbol for _, symbol in sorted(scored, key=lambda item: item[0], reverse=True)[:1])
+        selected_keys = {symbol.key for symbol in selected}
+        for score, symbol in scored:
+            candidates[symbol.key] = UniverseSelectionCandidate(
+                symbol=symbol,
+                score=score,
+                selected=symbol.key in selected_keys,
+                reasons=("warmup_ready",),
+            )
+        return build_universe_selection_result(
+            context,
+            selected,
+            selection_id=self.selection_id,
+            candidates=candidates,
+            rejected=rejected,
+        )
+""",
+        encoding="utf-8",
+    )
+    _write_runtime_config(config_path, universe_path, worker_min_success=1, min_order_notional=0)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["sleeves"][0]["universe"]["fine"]["enabled"] = False
+    payload["sleeves"][0]["universe"]["active"]["selection_models"] = [
+        f"{selector_path}:WarmupReadySelectionModel"
+    ]
+    payload["sleeves"][0]["indicators"] = {
+        "warmup_enabled": True,
+        "extra_bars": 0,
+        "min_ready_ratio": 1.0,
+    }
+    payload["sleeves"][0]["alpha"]["input_selections"] = {"all-symbols": "warmup-ready"}
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
+    history = {
+        symbols[0].key: [_daily_bar(symbols[0], 1, 100), _daily_bar(symbols[0], 2, 105), _daily_bar(symbols[0], 3, 115)],
+        symbols[1].key: [_daily_bar(symbols[1], 1, 100), _daily_bar(symbols[1], 2, 103), _daily_bar(symbols[1], 3, 104)],
+        symbols[2].key: [_daily_bar(symbols[2], 1, 100), _daily_bar(symbols[2], 2, 101), _daily_bar(symbols[2], 3, 102)],
+    }
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 120 + index) for index, symbol in enumerate(symbols)})
+
+    runtime = bootstrap_sleeve_runtime(
+        snapshot,
+        "us-live",
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
+            history_provider_factory=lambda: FakeHistoryProvider(history),
+            alpha_loader=AllSymbolsAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+        ),
+    )
+
+    assert runtime.selection_warmup_report is not None
+    assert runtime.selection_warmup_report.is_ready is True
+    assert runtime.selection_indicator_snapshot is not None
+    assert runtime.active_result.selection.selected_symbols == (Symbol("NVDA", "US"),)
+    assert runtime.worker.universe.symbol_keys == ("US:NVDA",)
+    assert [symbol.key for symbol in runtime.worker.indicator_engine.symbols_for_sleeve("us-live")] == ["US:NVDA"]
+    assert runtime.worker.indicator_engine.value("us-live", Symbol("NVDA", "US"), "momentum_2_close") is not None
+
+
+def test_fallback_history_provider_uses_secondary_history_when_primary_fails():
+    symbol = Symbol("NVDA", "US")
+    fallback = FakeHistoryProvider(
+        {
+            symbol.key: [
+                _daily_bar(symbol, 1, 100),
+                _daily_bar(symbol, 2, 105),
+                _daily_bar(symbol, 3, 110),
+            ]
+        }
+    )
+    provider = _FallbackHistoryProvider(primary=FailingHistoryProvider(), fallback=fallback)
+
+    history = provider.get_history(symbol, start=datetime(2026, 5, 1), end=datetime(2026, 5, 3))
+
+    assert [bar.close for bar in history] == [100, 105, 110]
 
 
 def test_runtime_fetches_current_portfolio_for_leaps_sleeve(tmp_path):

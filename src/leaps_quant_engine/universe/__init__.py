@@ -7,8 +7,9 @@ from leaps_quant_engine.universe.fine import (
     FineUniverseRuntime,
 )
 from leaps_quant_engine.universe.loader import load_universe_definition
-from leaps_quant_engine.universe.runtime import ActiveUniverseResult, UniverseSelectionRuntime
+from leaps_quant_engine.universe.runtime import ActiveUniverseResult, CompositeUniverseSelectionRuntime, UniverseSelectionRuntime
 from leaps_quant_engine.universe.selection import (
+    CompositeUniverseSelectionResult,
     MomentumUniverseSelectionModel,
     StaticUniverseSelectionModel,
     UniverseSelectionCandidate,
@@ -20,6 +21,8 @@ from leaps_quant_engine.universe.selection import (
 __all__ = [
     "IndicatorDefinition",
     "ActiveUniverseResult",
+    "CompositeUniverseSelectionResult",
+    "CompositeUniverseSelectionRuntime",
     "FineUniverseCache",
     "FineUniverseEntry",
     "FineUniverseRefreshFailure",

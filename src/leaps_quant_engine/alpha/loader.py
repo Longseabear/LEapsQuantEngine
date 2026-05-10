@@ -25,6 +25,8 @@ class FunctionAlphaModel:
     alpha_id: str
     version: str
     generate_fn: Callable[[SnapshotContext], list[Insight] | tuple[Insight, ...]]
+    evaluation_cadence: str = "every_cycle"
+    input_resolution: str = "any"
 
     def generate(self, context: SnapshotContext) -> list[Insight] | tuple[Insight, ...]:
         return self.generate_fn(context)
@@ -68,7 +70,15 @@ def _model_from_module(module: ModuleType) -> AlphaModel:
     if callable(generate):
         alpha_id = str(getattr(module, "ALPHA_ID", module.__name__))
         version = str(getattr(module, "VERSION", "0.1.0"))
-        return FunctionAlphaModel(alpha_id=alpha_id, version=version, generate_fn=generate)
+        evaluation_cadence = str(getattr(module, "EVALUATION_CADENCE", "every_cycle"))
+        input_resolution = str(getattr(module, "INPUT_RESOLUTION", "any"))
+        return FunctionAlphaModel(
+            alpha_id=alpha_id,
+            version=version,
+            generate_fn=generate,
+            evaluation_cadence=evaluation_cadence,
+            input_resolution=input_resolution,
+        )
     raise ValueError("Python alpha module must expose create_alpha_model(), ALPHA_MODEL, or generate(context).")
 
 

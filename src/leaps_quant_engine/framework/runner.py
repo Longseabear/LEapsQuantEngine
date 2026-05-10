@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 import time
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
 
 from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightBatch, InsightManager, InsightManagerUpdate, SnapshotContext
+from leaps_quant_engine.cadence import cadence_due, normalize_cadence
 from leaps_quant_engine.execution import ExecutionContext, ExecutionEngine, ImmediateExecutionModel, OrderIntentBatch
 from leaps_quant_engine.framework.portfolio_construction import (
     EqualWeightPortfolioConstructionModel,
@@ -20,8 +23,9 @@ from leaps_quant_engine.framework.risk import (
     RiskManagementContext,
     RiskManagementModel,
 )
-from leaps_quant_engine.models import DataSlice, OrderIntent, PortfolioTarget
+from leaps_quant_engine.models import DataSlice, OrderIntent, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.fundamentals import FundamentalSnapshot
 from leaps_quant_engine.snapshots import IndicatorSnapshot
 
 
@@ -71,6 +75,10 @@ class FrameworkCycleResult:
     execution_batch: OrderIntentBatch
     order_intents: tuple[OrderIntent, ...]
     timings: StageTiming
+    stage_decisions: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stage_decisions", MappingProxyType(dict(self.stage_decisions)))
 
     @property
     def active_insight_count(self) -> int:
@@ -154,6 +162,7 @@ class FrameworkCycleResult:
                 for order in self.order_intents
             ],
             "timings": self.timings.to_dict(),
+            "stage_decisions": dict(self.stage_decisions),
         }
 
 
@@ -168,6 +177,8 @@ class FrameworkRunner:
     order_sizing_engine: OrderSizingEngine = None  # type: ignore[assignment]
     execution_model: ImmediateExecutionModel = None  # type: ignore[assignment]
     execution_engine: ExecutionEngine = None  # type: ignore[assignment]
+    _last_portfolio_run_at: datetime | None = field(default=None, init=False)
+    _last_portfolio_target_batch: PortfolioTargetBatch | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.insight_manager is None:
@@ -189,14 +200,22 @@ class FrameworkRunner:
         self,
         *,
         indicator_snapshot: IndicatorSnapshot,
+        fundamental_snapshot: FundamentalSnapshot | None = None,
         data: DataSlice,
         portfolio: Portfolio,
+        alpha_symbols_by_model: Mapping[str, Iterable[Symbol | str]] | None = None,
     ) -> FrameworkCycleResult:
-        context = SnapshotContext.from_indicator_snapshot(indicator_snapshot)
+        context = SnapshotContext.from_indicator_snapshot(
+            indicator_snapshot,
+            fundamental_snapshot=fundamental_snapshot,
+        )
 
         started = time.perf_counter()
-        insight_batch = self.alpha_runtime.run(context)
+        insight_batch = self.alpha_runtime.run(context, symbols_by_alpha=alpha_symbols_by_model)
         alpha_ms = _elapsed_ms(started)
+        stage_decisions: dict[str, Any] = {
+            "alpha": dict(insight_batch.metadata),
+        }
 
         started = time.perf_counter()
         manager_update = self.insight_manager.ingest(insight_batch, as_of=context.as_of)
@@ -204,16 +223,37 @@ class FrameworkRunner:
         insight_manager_ms = _elapsed_ms(started)
 
         started = time.perf_counter()
-        portfolio_target_batch = self.portfolio_engine.create_targets(
-            PortfolioConstructionContext(
-                sleeve_id=self.sleeve_id,
-                data=data,
-                portfolio=portfolio,
-                active_insights=active_insights,
-                managed_symbols=self.insight_manager.tracked_symbols(self.sleeve_id),
-            )
+        portfolio_cadence = normalize_cadence(self.portfolio_engine.rebalance_policy.cadence)
+        portfolio_should_run = self._last_portfolio_target_batch is None or cadence_due(
+            portfolio_cadence,
+            data.time,
+            self._last_portfolio_run_at,
         )
+        if portfolio_should_run:
+            portfolio_target_batch = self.portfolio_engine.create_targets(
+                PortfolioConstructionContext(
+                    sleeve_id=self.sleeve_id,
+                    data=data,
+                    portfolio=portfolio,
+                    active_insights=active_insights,
+                    managed_symbols=self.insight_manager.tracked_symbols(self.sleeve_id),
+                )
+            )
+            self._last_portfolio_target_batch = portfolio_target_batch
+            self._last_portfolio_run_at = data.time
+        else:
+            portfolio_target_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
         portfolio_ms = _elapsed_ms(started)
+        stage_decisions["portfolio"] = {
+            "cadence": portfolio_cadence,
+            "ran": portfolio_should_run,
+            "last_run_at": self._last_portfolio_run_at.isoformat() if self._last_portfolio_run_at else None,
+            "reused_batch_id": (
+                portfolio_target_batch.metadata.get("source_batch_id")
+                if not portfolio_should_run
+                else None
+            ),
+        }
 
         started = time.perf_counter()
         order_sizing_batch = self.order_sizing_engine.size(
@@ -271,8 +311,26 @@ class FrameworkRunner:
                 risk_ms=risk_ms,
                 execution_ms=execution_ms,
             ),
+            stage_decisions=stage_decisions,
         )
 
 
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000
+
+
+def _reuse_portfolio_target_batch(batch: PortfolioTargetBatch, generated_at: datetime) -> PortfolioTargetBatch:
+    metadata = dict(batch.metadata)
+    metadata.update(
+        {
+            "reused": True,
+            "source_batch_id": batch.batch_id,
+            "source_generated_at": batch.generated_at.isoformat(),
+        }
+    )
+    return replace(
+        batch,
+        generated_at=generated_at,
+        reason=f"{batch.reason}:reused" if batch.reason else "portfolio_reused",
+        metadata=metadata,
+    )

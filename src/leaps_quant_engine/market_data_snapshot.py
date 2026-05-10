@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import logging
 import time
@@ -67,7 +67,7 @@ class MarketDataSnapshot:
         )
 
     def as_data_slice(self) -> DataSlice:
-        return DataSlice(time=self.time, bars=dict(self.bars))
+        return DataSlice(time=self.time, bars=dict(self.bars), resolution=_slice_resolution(self.bars.values()))
 
 
 @dataclass(slots=True)
@@ -86,7 +86,7 @@ class MarketDataSnapshotEngine:
         started = time.perf_counter()
         bars: dict[str, Bar] = {}
         for symbol in target_symbols:
-            bar = self.provider.get_latest_bar(symbol)
+            bar = _as_live_bar(self.provider.get_latest_bar(symbol))
             bars[bar.symbol.key] = bar
         snapshot = MarketDataSnapshot.from_bars(bars, source=self.source)
         logger.info(
@@ -131,6 +131,7 @@ class MarketDataSnapshotEngine:
                     extra={"source": self.source, "symbol": symbol.key, "error": str(exc)},
                 )
                 continue
+            bar = _as_live_bar(bar)
             bars[bar.symbol.key] = bar
         completed_at = datetime.now()
         report = MarketDataCollectionReport(
@@ -252,3 +253,16 @@ class MarketDataSnapshotEngine:
             publish_active=publish_active,
         )
         return snapshot, indicator_snapshots
+
+
+def _as_live_bar(bar: Bar) -> Bar:
+    if bar.resolution not in {"", "any", "unknown"}:
+        return bar
+    return replace(bar, resolution="live")
+
+
+def _slice_resolution(bars: object) -> str:
+    resolutions = {getattr(bar, "resolution", "any") for bar in bars}
+    if len(resolutions) == 1:
+        return next(iter(resolutions), "any")
+    return "mixed"

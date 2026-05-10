@@ -6,7 +6,7 @@ from leaps_quant_engine.brokerage import (
     PaperBrokerExecutionGateway,
 )
 from leaps_quant_engine.execution import OrderIntentBatch
-from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol, TimeInForce
 from leaps_quant_engine.orders import OrderCoordinator, OrderEventType, OrderTicketStatus
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 
@@ -113,6 +113,62 @@ def test_broker_engine_gateway_enqueues_domestic_order_with_stockprogram_dedupe_
 
     assert accepted[0].event_type is OrderEventType.ACCEPTED
     assert accepted[0].broker_order_id == "001:00012345"
+
+
+def test_broker_engine_gateway_maps_market_ioc_ticket_to_domestic_order_division():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 9, 9, 30),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.BUY,
+                2,
+                70_000,
+                order_type=OrderType.MARKET,
+                time_in_force=TimeInForce.IOC,
+            ),
+        ),
+        batch_id="batch-market",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 9, 9, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 9, 9, 32))
+
+    assert client.enqueued[0]["arguments"]["order_division"] == "13"
+    assert client.enqueued[0]["arguments"]["price"] == 0
+
+
+def test_broker_engine_gateway_uses_limit_price_for_domestic_limit_order():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 9, 9, 30),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.BUY,
+                2,
+                70_000,
+                order_type=OrderType.LIMIT,
+                limit_price=70_150.4,
+            ),
+        ),
+        batch_id="batch-limit",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 9, 9, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 9, 9, 32))
+
+    assert client.enqueued[0]["arguments"]["order_division"] == "00"
+    assert client.enqueued[0]["arguments"]["price"] == 70_200
 
 
 class _FakeBrokerEngineCallClient:

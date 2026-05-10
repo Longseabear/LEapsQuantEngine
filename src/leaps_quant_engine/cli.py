@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -12,14 +12,25 @@ from leaps_quant_engine.adapters.kis import (
     KISCachedMarketDataProvider,
     MarketDataEngineLiveQuoteProvider,
 )
-from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
+from leaps_quant_engine.adapters.finance_datareader import (
+    FinanceDataReaderFundamentalProvider,
+    FinanceDataReaderMarketDataProvider,
+)
 from leaps_quant_engine.account_sync import KISVirtualAccountSync
 from leaps_quant_engine.account_sync import KISAccountClient
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader, SnapshotContext
-from leaps_quant_engine.backtesting import run_framework_backtest
+from leaps_quant_engine.backtesting import (
+    load_minute_replay_feed,
+    run_framework_backtest,
+    run_framework_replay,
+    simulated_fill_model_for_costs,
+    universe_with_default_indicator_resolution,
+    warm_up_daily_indicators_for_backtest,
+)
 from leaps_quant_engine.benchmark import run_daily_indicator_benchmark
 from leaps_quant_engine.broker_routing import (
     configured_account_ids_for_sleeve,
+    currency_for_market,
     currency_for_market_scope,
     market_scope_from_market,
     split_batches_by_account_route,
@@ -27,10 +38,22 @@ from leaps_quant_engine.broker_routing import (
 from leaps_quant_engine.brokerage import BrokerEngineExecutionGateway, BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.cycle_journal import CycleJournalEntry, FileCycleJournalStore
 from leaps_quant_engine.framework import FrameworkRunner
+from leaps_quant_engine.fundamentals import (
+    DEFAULT_FUNDAMENTAL_ARTIFACT_ROOT,
+    FileFundamentalArtifactStore,
+    FundamentalArtifact,
+)
 from leaps_quant_engine.logging import configure_logging
+from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
+from leaps_quant_engine.minute_feed import YFinanceMinuteBarProvider, download_us_minute_feed
 from leaps_quant_engine.models import OrderIntent
 from leaps_quant_engine.models import Symbol
+from leaps_quant_engine.notifications import (
+    NotificationService,
+    notify_order_submit_report,
+    notify_order_supervisor_report,
+)
 from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrator
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.order_smoke import OrderRuntimePaperSmokeRunner
@@ -38,12 +61,15 @@ from leaps_quant_engine.order_status import build_order_runtime_status
 from leaps_quant_engine.order_submit import OrderRuntimeSubmitter, load_order_intent_batches, write_order_intent_batches
 from leaps_quant_engine.order_supervisor import OrderRuntimeSupervisor
 from leaps_quant_engine.order_worker import ExecutionHistoryReconcileWorker, OpenTicketPollWorker
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.portfolio import Portfolio, StaticPortfolioProvider
 from leaps_quant_engine.runtime import build_indicator_engine_from_file, run_once_from_file
-from leaps_quant_engine.runtime_bootstrap import bootstrap_sleeve_runtime, resolve_runtime_path
+from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, bootstrap_sleeve_runtime, resolve_runtime_path
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
 from leaps_quant_engine.runtime_health import build_runtime_health_report
+from leaps_quant_engine.runtime_integrity import build_runtime_code_identity
+from leaps_quant_engine.runtime_preflight import build_runtime_preflight_report
 from leaps_quant_engine.runtime_recovery import build_recovery_account_report, build_recovery_report
+from leaps_quant_engine.rl import train_ppo_portfolio_constructor
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
 from leaps_quant_engine.sleeve_workspace import (
     describe_sleeve_alpha_modules,
@@ -186,6 +212,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     order_runtime_submit.add_argument("--allow-symbol", action="append", default=[])
     order_runtime_submit.add_argument("--recent-events", type=int, default=10)
     order_runtime_submit.add_argument("--journal", type=Path)
+    order_runtime_submit.add_argument("--notify", action="store_true")
+    order_runtime_submit.add_argument("--notification-root", type=Path)
+    order_runtime_submit.add_argument("--notify-chat-id")
+    order_runtime_submit.add_argument("--notify-disable-notification", action="store_true")
     order_runtime_submit.add_argument("--summary-only", action="store_true")
 
     order_runtime_paper_smoke = subparsers.add_parser("order-runtime-paper-smoke")
@@ -223,7 +253,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     order_runtime_supervise.add_argument("--skip-holdings-reconcile", action="store_true")
     order_runtime_supervise.add_argument("--recent-events", type=int, default=10)
     order_runtime_supervise.add_argument("--journal", type=Path)
+    order_runtime_supervise.add_argument("--notify", action="store_true")
+    order_runtime_supervise.add_argument("--notification-root", type=Path)
+    order_runtime_supervise.add_argument("--notify-chat-id")
+    order_runtime_supervise.add_argument("--notify-disable-notification", action="store_true")
     order_runtime_supervise.add_argument("--summary-only", action="store_true")
+
+    notification_status = subparsers.add_parser("notification-status")
+    notification_status.add_argument("--root", type=Path)
+
+    notify_user_message = subparsers.add_parser("notify-user-message")
+    notify_user_message.add_argument("--category", default="status")
+    notify_user_message.add_argument("--title", required=True)
+    notify_user_message.add_argument("--message", required=True)
+    notify_user_message.add_argument("--root", type=Path)
+    notify_user_message.add_argument("--chat-id")
+    notify_user_message.add_argument("--disable-notification", action="store_true")
+    notify_user_message.add_argument("--summary-only", action="store_true")
 
     runtime_recovery = subparsers.add_parser("runtime-recovery-status")
     runtime_recovery.add_argument("config", type=Path)
@@ -247,6 +293,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_health.add_argument("--max-open-ticket-age-seconds", type=float, default=600.0)
     runtime_health.add_argument("--recent-events", type=int, default=10)
     runtime_health.add_argument("--summary-only", action="store_true")
+
+    runtime_preflight = subparsers.add_parser("runtime-preflight")
+    runtime_preflight.add_argument("config", type=Path)
+    runtime_preflight.add_argument("--sleeve-id", action="append", default=[])
+    runtime_preflight.add_argument("--account-id")
+    runtime_preflight.add_argument("--account-store", type=Path)
+    runtime_preflight.add_argument("--order-store", type=Path)
+    runtime_preflight.add_argument("--journal", type=Path)
+    runtime_preflight.add_argument("--include-order-status", action="store_true")
+    runtime_preflight.add_argument("--recent-events", type=int, default=10)
+    runtime_preflight.add_argument("--strict-live", action="store_true")
+    runtime_preflight.add_argument("--skip-bootstrap", action="store_true")
+    runtime_preflight.add_argument("--summary-only", action="store_true")
 
     indicators_kis = subparsers.add_parser("indicators-kis-once")
     indicators_kis.add_argument("config", type=Path)
@@ -273,11 +332,111 @@ def main(argv: Sequence[str] | None = None) -> int:
     framework_backtest.add_argument("--sleeve-id", required=True)
     framework_backtest.add_argument("--start")
     framework_backtest.add_argument("--end")
+    framework_backtest.add_argument("--warmup-start")
     framework_backtest.add_argument("--cash", type=float, default=100_000.0)
+    framework_backtest.add_argument("--slippage-bps", type=float, default=0.0)
+    framework_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
     framework_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
     framework_backtest.add_argument("--refresh-history", action="store_true")
+    framework_backtest.add_argument("--fundamentals-root", type=Path)
+    framework_backtest.add_argument("--fundamentals-market")
+    framework_backtest.add_argument("--fundamental-name", action="append", default=[])
     framework_backtest.add_argument("--journal", type=Path)
+    framework_backtest.add_argument("--include-insights", action="store_true")
     framework_backtest.add_argument("--summary-only", action="store_true")
+
+    runtime_backtest = subparsers.add_parser("runtime-backtest-daily")
+    runtime_backtest.add_argument("config", type=Path)
+    runtime_backtest.add_argument("--sleeve-id", required=True)
+    runtime_backtest.add_argument("--start")
+    runtime_backtest.add_argument("--end")
+    runtime_backtest.add_argument("--warmup-start")
+    runtime_backtest.add_argument("--cash", type=float)
+    runtime_backtest.add_argument("--currency")
+    runtime_backtest.add_argument("--slippage-bps", type=float, default=0.0)
+    runtime_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
+    runtime_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    runtime_backtest.add_argument("--refresh-history", action="store_true")
+    runtime_backtest.add_argument("--fundamentals-root", type=Path)
+    runtime_backtest.add_argument("--fundamentals-market")
+    runtime_backtest.add_argument("--fundamental-name", action="append", default=[])
+    runtime_backtest.add_argument("--journal", type=Path)
+    runtime_backtest.add_argument("--include-insights", action="store_true")
+    runtime_backtest.add_argument("--summary-only", action="store_true")
+
+    runtime_minute_backtest = subparsers.add_parser("runtime-backtest-minute")
+    runtime_minute_backtest.add_argument("config", type=Path)
+    runtime_minute_backtest.add_argument("--sleeve-id", required=True)
+    runtime_minute_backtest.add_argument("--minute-feed", type=Path, required=True)
+    runtime_minute_backtest.add_argument("--start")
+    runtime_minute_backtest.add_argument("--end")
+    runtime_minute_backtest.add_argument("--warmup-start")
+    runtime_minute_backtest.add_argument("--cash", type=float)
+    runtime_minute_backtest.add_argument("--currency")
+    runtime_minute_backtest.add_argument("--slippage-bps", type=float, default=0.0)
+    runtime_minute_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
+    runtime_minute_backtest.add_argument("--daily-source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    runtime_minute_backtest.add_argument("--refresh-history", action="store_true")
+    runtime_minute_backtest.add_argument("--fundamentals-root", type=Path)
+    runtime_minute_backtest.add_argument("--fundamentals-market")
+    runtime_minute_backtest.add_argument("--fundamental-name", action="append", default=[])
+    runtime_minute_backtest.add_argument("--journal", type=Path)
+    runtime_minute_backtest.add_argument("--include-insights", action="store_true")
+    runtime_minute_backtest.add_argument("--summary-only", action="store_true")
+
+    us_minute_feed = subparsers.add_parser("download-us-minute-feed")
+    us_minute_feed.add_argument("source", type=Path)
+    us_minute_feed.add_argument("--sleeve-id")
+    us_minute_feed.add_argument("--output", type=Path, required=True)
+    us_minute_feed.add_argument("--start", required=True)
+    us_minute_feed.add_argument("--end", required=True)
+    us_minute_feed.add_argument("--interval", default="1m")
+    us_minute_feed.add_argument("--provider", choices=("yfinance",), default="yfinance")
+    us_minute_feed.add_argument("--timezone", default="America/New_York")
+    us_minute_feed.add_argument("--include-prepost", action="store_true")
+    us_minute_feed.add_argument("--symbol", action="append", default=[])
+    us_minute_feed.add_argument("--max-symbols", type=int)
+    us_minute_feed.add_argument("--sleep-seconds", type=float, default=0.0)
+    us_minute_feed.add_argument("--overwrite", action="store_true")
+    us_minute_feed.add_argument("--summary-only", action="store_true")
+
+    train_rl_constructor = subparsers.add_parser("train-rl-portfolio-constructor")
+    train_rl_constructor.add_argument("config", type=Path)
+    train_rl_constructor.add_argument("--sleeve-id", required=True)
+    train_rl_constructor.add_argument("--start")
+    train_rl_constructor.add_argument("--end")
+    train_rl_constructor.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    train_rl_constructor.add_argument("--timesteps", type=int, default=10_000)
+    train_rl_constructor.add_argument("--seed", type=int, default=7)
+    train_rl_constructor.add_argument("--ensemble-seed", type=int, action="append", default=[])
+    train_rl_constructor.add_argument("--output-dir", type=Path, default=Path("data/rl"))
+    train_rl_constructor.add_argument("--training-cash", type=float, default=5_000_000.0)
+    train_rl_constructor.add_argument("--turnover-penalty", type=float)
+    train_rl_constructor.add_argument("--downside-penalty", type=float)
+    train_rl_constructor.add_argument("--volatility-penalty", type=float)
+    train_rl_constructor.add_argument("--drawdown-penalty", type=float)
+    train_rl_constructor.add_argument("--underwater-penalty", type=float)
+    train_rl_constructor.add_argument("--missed-upside-penalty", type=float)
+    train_rl_constructor.add_argument("--concentration-penalty", type=float)
+    train_rl_constructor.add_argument("--summary-only", action="store_true")
+
+    fundamentals_import = subparsers.add_parser("fundamentals-import-fdr")
+    fundamentals_import.add_argument("--root", type=Path, default=DEFAULT_FUNDAMENTAL_ARTIFACT_ROOT)
+    fundamentals_import.add_argument("--market")
+    fundamentals_import.add_argument("--universe", type=Path)
+    fundamentals_import.add_argument("--as-of")
+    fundamentals_import.add_argument("--symbol", action="append", default=[])
+    fundamentals_import.add_argument("--name", action="append", default=[])
+    fundamentals_import.add_argument("--include-naver-valuation", action="store_true")
+    fundamentals_import.add_argument("--overwrite", action="store_true")
+    fundamentals_import.add_argument("--summary-only", action="store_true")
+
+    fundamentals_status = subparsers.add_parser("fundamentals-status")
+    fundamentals_status.add_argument("--root", type=Path, default=DEFAULT_FUNDAMENTAL_ARTIFACT_ROOT)
+    fundamentals_status.add_argument("--market")
+    fundamentals_status.add_argument("--as-of")
+    fundamentals_status.add_argument("--include-artifacts", action="store_true")
+    fundamentals_status.add_argument("--summary-only", action="store_true")
 
     warmup_indicators = subparsers.add_parser("warmup-indicators-daily")
     warmup_indicators.add_argument("universe", type=Path)
@@ -420,6 +579,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             open_order_symbols=_parse_symbol_refs(args.open_order, default_market),
             exit_watch_symbols=_parse_symbol_refs(args.exit_watch, default_market),
             manual_symbols=_parse_symbol_refs(args.manual, default_market),
+            preselect_warmup=False if args.skip_warmup else None,
         )
         report = runtime.run_once(warmup=False if args.skip_warmup else None)
         journal_summary = None
@@ -436,6 +596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 route_id=account_id,
                 market_scope=market_scope,
             )
+            entry = _with_runtime_code_identity_metadata(snapshot, entry, (report.sleeve_id,))
             FileCycleJournalStore(journal_path).append(entry)
             journal_summary = {"path": str(journal_path.resolve()), "entry_id": entry.entry_id}
         order_batch_artifact = None
@@ -652,6 +813,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if len(routed_batches) > 1:
             reports = []
+            notifications = []
             for route, route_batches in routed_batches:
                 report = _run_order_runtime_submit_for_route(
                     snapshot,
@@ -677,10 +839,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     errors=report.errors,
                     warnings=report.warnings,
                 )
+                notification = _maybe_notify_order_submit(args, report)
+                if notification is not None:
+                    notifications.append(notification)
                 reports.append(report)
+            payload = _multi_submit_payload(snapshot, reports, include_details=not args.summary_only)
+            if notifications:
+                payload["notifications"] = notifications
             print(
                 json.dumps(
-                    _multi_submit_payload(snapshot, reports, include_details=not args.summary_only),
+                    payload,
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -711,7 +879,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 errors=report.errors,
                 warnings=report.warnings,
             )
-            print(json.dumps(report.to_dict(include_details=not args.summary_only), ensure_ascii=False, indent=2))
+            payload = report.to_dict(include_details=not args.summary_only)
+            notification = _maybe_notify_order_submit(args, report)
+            if notification is not None:
+                payload["notification"] = notification
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "order-runtime-paper-smoke":
         snapshot = load_runtime_config_snapshot(args.config)
@@ -769,6 +941,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         routes = _resolve_order_runtime_routes(snapshot, args.account_id, args.account_store, args.order_store, sleeve_ids)
         journal_store = _runtime_journal_store(snapshot, args.journal)
         reports = []
+        notifications = []
         for route in routes:
             report = _run_order_runtime_supervisor_for_route(snapshot, args, route, sleeve_ids)
             _append_order_report_journal(
@@ -789,22 +962,52 @@ def main(argv: Sequence[str] | None = None) -> int:
                 errors=report.errors,
                 warnings=(),
             )
+            notification = _maybe_notify_order_supervisor(args, report)
+            if notification is not None:
+                notifications.append(notification)
             reports.append(report)
         if len(reports) == 1:
-            print(json.dumps(reports[0].to_dict(include_details=not args.summary_only), ensure_ascii=False, indent=2))
+            payload = reports[0].to_dict(include_details=not args.summary_only)
+            if notifications:
+                payload["notification"] = notifications[0]
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
+            payload = {
+                "status": "warnings" if any(report.status != "ok" for report in reports) else "ok",
+                "runtime_id": snapshot.config.runtime_id,
+                "route_count": len(reports),
+                "routes": [report.to_dict(include_details=not args.summary_only) for report in reports],
+            }
+            if notifications:
+                payload["notifications"] = notifications
             print(
                 json.dumps(
-                    {
-                        "status": "warnings" if any(report.status != "ok" for report in reports) else "ok",
-                        "runtime_id": snapshot.config.runtime_id,
-                        "route_count": len(reports),
-                        "routes": [report.to_dict(include_details=not args.summary_only) for report in reports],
-                    },
+                    payload,
                     ensure_ascii=False,
                     indent=2,
                 )
         )
+        return 0
+    if args.command == "notification-status":
+        service = NotificationService.from_env(root=args.root)
+        print(json.dumps(service.health_check(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "notify-user-message":
+        service = NotificationService.from_env(root=args.root)
+        result = service.notify_user_message(
+            category=args.category,
+            title=args.title,
+            message=args.message,
+            chat_id=args.chat_id,
+            disable_notification=args.disable_notification,
+        )
+        if args.summary_only:
+            result = {
+                "record_id": result["record_id"],
+                "delivery_mode": result["delivery_mode"],
+                "delivery_status": result["delivery_status"],
+            }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "runtime-recovery-status":
         snapshot = load_runtime_config_snapshot(args.config)
@@ -877,6 +1080,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                     indent=2,
                 )
             )
+        return 0
+    if args.command == "runtime-preflight":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_ids = _status_sleeve_ids(snapshot, args.sleeve_id)
+        journal_path = _runtime_journal_path(snapshot, args.journal)
+        journal_store = FileCycleJournalStore(journal_path) if journal_path is not None else None
+        order_statuses = []
+        if args.include_order_status:
+            for route in _resolve_order_runtime_routes(snapshot, args.account_id, args.account_store, args.order_store, sleeve_ids):
+                order_statuses.append(
+                    _build_order_runtime_status_for_route(
+                        snapshot,
+                        route,
+                        sleeve_ids,
+                        recent_events=args.recent_events,
+                    )
+                )
+        report = build_runtime_preflight_report(
+            snapshot=snapshot,
+            sleeve_ids=sleeve_ids,
+            journal_store=journal_store,
+            journal_path=journal_path,
+            order_statuses=tuple(order_statuses),
+            strict_live=args.strict_live,
+            check_bootstrap=not args.skip_bootstrap,
+        )
+        print(json.dumps(report.to_dict(include_details=not args.summary_only), ensure_ascii=False, indent=2))
         return 0
     if args.command == "virtual-account-allocate-fill":
         snapshot = load_runtime_config_snapshot(args.config)
@@ -955,8 +1185,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(_indicator_values_to_json(indicator_engine, args.sleeve_id), ensure_ascii=False, indent=2))
         return 0
     if args.command == "benchmark-indicators-daily":
-        provider = KISCachedMarketDataProvider.from_env()
         universe = load_universe_definition(args.universe)
+        provider = KISCachedMarketDataProvider.from_env()
+        _attach_exchange_map(provider, universe)
         report = run_daily_indicator_benchmark(
             universe,
             provider,
@@ -970,11 +1201,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if args.command == "framework-backtest-daily":
-        provider = _daily_backtest_provider(args.source)
         universe = load_universe_definition(args.universe)
+        provider = _daily_backtest_provider(args.source)
+        _attach_exchange_map(provider, universe)
         alpha_load = PythonAlphaLoader().load(args.alpha)
         journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
         universe_market = getattr(universe, "market", None)
+        fundamentals_store = None
+        fundamentals_report = None
+        fundamental_names = tuple(args.fundamental_name) if args.fundamental_name else None
+        if args.fundamentals_root is not None:
+            fundamentals_store, fundamentals_report = _load_fundamentals_for_backtest(
+                args.fundamentals_root,
+                market=args.fundamentals_market or universe_market,
+                end=_parse_cli_datetime(args.end),
+                names=fundamental_names,
+            )
         result = run_framework_backtest(
             universe,
             provider,
@@ -986,13 +1228,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             portfolio=Portfolio(cash=args.cash),
             start=_parse_cli_datetime(args.start),
             end=_parse_cli_datetime(args.end),
+            warmup_start=_parse_cli_datetime(args.warmup_start),
             refresh_history=args.refresh_history,
             cycle_journal_store=journal_store,
             runtime_id=f"framework-backtest:{args.sleeve_id}",
             market_scope=market_scope_from_market(universe_market) if universe_market else None,
+            fundamental_store=fundamentals_store,
+            fundamental_names=fundamental_names,
+            fill_model=simulated_fill_model_for_costs(slippage_bps=args.slippage_bps, fee_model=args.fee_model),
         )
-        report = result.to_report(include_orders=not args.summary_only)
+        report = result.to_report(
+            include_orders=not args.summary_only,
+            include_insights=args.include_insights,
+            include_selection_details=(not args.summary_only or args.include_insights),
+        )
         report["source"] = args.source
+        report["fill_model"] = {"slippage_bps": float(args.slippage_bps or 0.0), "fee_model": args.fee_model}
+        if fundamentals_report is not None:
+            report["fundamentals"] = fundamentals_report
         if args.journal is not None:
             report["cycle_journal"] = {"path": str(args.journal.resolve())}
         report["alpha"] = {
@@ -1003,9 +1256,423 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "runtime-backtest-daily":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        provider = _daily_backtest_provider(args.source)
+        currency = str(args.currency or currency_for_market(_runtime_sleeve_universe_market(snapshot, sleeve_config))).strip().upper()
+        portfolio = _backtest_portfolio_from_sleeve(sleeve_config, cash=args.cash, currency=currency)
+        initial_cash = portfolio.cash
+        initial_cash_by_currency = dict(portfolio.cash_by_currency)
+        dependencies = RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: provider,
+            history_provider_factory=lambda: provider,
+            portfolio_provider=StaticPortfolioProvider(portfolios={args.sleeve_id: portfolio}),
+        )
+        runtime = bootstrap_sleeve_runtime(
+            snapshot,
+            args.sleeve_id,
+            dependencies=dependencies,
+            refresh_fine=False,
+        )
+        universe = runtime.coarse_universe
+        _attach_exchange_map(provider, universe)
+        universe_market = getattr(universe, "market", None)
+        journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
+        fundamentals_store = None
+        fundamentals_report = None
+        fundamental_names = tuple(args.fundamental_name) if args.fundamental_name else None
+        if args.fundamentals_root is not None:
+            fundamentals_store, fundamentals_report = _load_fundamentals_for_backtest(
+                args.fundamentals_root,
+                market=args.fundamentals_market or universe_market,
+                end=_parse_cli_datetime(args.end),
+                names=fundamental_names,
+            )
+        result = run_framework_backtest(
+            universe,
+            provider,
+            sleeve_id=args.sleeve_id,
+            framework_runner=runtime.framework_runner,
+            portfolio=portfolio,
+            start=_parse_cli_datetime(args.start),
+            end=_parse_cli_datetime(args.end),
+            warmup_start=_runtime_backtest_warmup_start(args, sleeve_config),
+            refresh_history=args.refresh_history,
+            cycle_journal_store=journal_store,
+            runtime_id=f"{snapshot.config.runtime_id}:backtest:{args.sleeve_id}",
+            config_version=snapshot.version,
+            account_id=sleeve_config.broker_account_id,
+            market_scope=market_scope_from_market(universe_market) if universe_market else None,
+            fundamental_store=fundamentals_store,
+            fundamental_names=fundamental_names,
+            selection_models=runtime.selection_models,
+            alpha_input_selections=sleeve_config.alpha.input_selections,
+            fill_model=simulated_fill_model_for_costs(slippage_bps=args.slippage_bps, fee_model=args.fee_model),
+        )
+        report = result.to_report(
+            include_orders=not args.summary_only,
+            include_insights=args.include_insights,
+            include_selection_details=(not args.summary_only or args.include_insights),
+        )
+        report["source"] = args.source
+        report["fill_model"] = {"slippage_bps": float(args.slippage_bps or 0.0), "fee_model": args.fee_model}
+        report["runtime"] = {
+            "runtime_id": snapshot.config.runtime_id,
+            "config_version": snapshot.version,
+            "config_path": str(args.config),
+            "sleeve_id": args.sleeve_id,
+            "configured_sleeves": [
+                {
+                    "sleeve_id": sleeve.sleeve_id,
+                    "cash": sleeve.cash,
+                    "cash_by_currency": dict(sleeve.cash_by_currency),
+                    "alpha_module_count": len(sleeve.alpha.modules),
+                    "selection_model_count": len(sleeve.universe.active.selection_models)
+                    if sleeve.universe.active.selection_models
+                    else 1,
+                }
+                for sleeve in snapshot.config.sleeves
+            ],
+        }
+        report["alpha"] = {
+            "alpha_ids": list(runtime.alpha_runtime.active_alpha_ids()),
+            "input_selections": dict(sleeve_config.alpha.input_selections),
+        }
+        report["portfolio"] = {
+            "initial_cash": initial_cash,
+            "initial_cash_by_currency": initial_cash_by_currency,
+            "model": sleeve_config.portfolio.model.to_dict(),
+        }
+        report["risk"] = {"model": sleeve_config.risk.model.to_dict()}
+        report["execution"] = {"model": sleeve_config.execution.model.to_dict()}
+        if fundamentals_report is not None:
+            report["fundamentals"] = fundamentals_report
+        if args.journal is not None:
+            report["cycle_journal"] = {"path": str(args.journal.resolve())}
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "runtime-backtest-minute":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        daily_provider = _daily_backtest_provider(args.daily_source)
+        currency = str(args.currency or currency_for_market(_runtime_sleeve_universe_market(snapshot, sleeve_config))).strip().upper()
+        portfolio = _backtest_portfolio_from_sleeve(sleeve_config, cash=args.cash, currency=currency)
+        initial_cash = portfolio.cash
+        initial_cash_by_currency = dict(portfolio.cash_by_currency)
+        dependencies = RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: daily_provider,
+            history_provider_factory=lambda: daily_provider,
+            portfolio_provider=StaticPortfolioProvider(portfolios={args.sleeve_id: portfolio}),
+        )
+        runtime = bootstrap_sleeve_runtime(
+            snapshot,
+            args.sleeve_id,
+            dependencies=dependencies,
+            refresh_fine=False,
+            preselect_warmup=False,
+        )
+        universe = universe_with_default_indicator_resolution(runtime.coarse_universe, default_resolution="daily")
+        _attach_exchange_map(daily_provider, universe)
+        start = _parse_cli_datetime(args.start)
+        end = _parse_cli_datetime(args.end)
+        feed = load_minute_replay_feed(args.minute_feed, universe=universe, start=start, end=end)
+        indicator_engine = IndicatorEngine()
+        indicator_engine.register_universe(args.sleeve_id, universe)
+        warmup_start = _runtime_backtest_warmup_start(args, sleeve_config)
+        warmup_end = _minute_backtest_warmup_end(feed, start=start)
+        daily_warmup_bar_count = 0
+        if warmup_start is not None:
+            daily_warmup_bar_count = warm_up_daily_indicators_for_backtest(
+                indicator_engine,
+                sleeve_id=args.sleeve_id,
+                universe=universe,
+                provider=daily_provider,
+                start=warmup_start,
+                end=warmup_end,
+                refresh_history=args.refresh_history,
+            )
+        universe_market = getattr(universe, "market", None)
+        journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
+        fundamentals_store = None
+        fundamentals_report = None
+        fundamental_names = tuple(args.fundamental_name) if args.fundamental_name else None
+        if args.fundamentals_root is not None:
+            fundamentals_store, fundamentals_report = _load_fundamentals_for_backtest(
+                args.fundamentals_root,
+                market=args.fundamentals_market or universe_market,
+                end=end,
+                names=fundamental_names,
+            )
+        result = run_framework_replay(
+            feed,
+            universe,
+            sleeve_id=args.sleeve_id,
+            framework_runner=runtime.framework_runner,
+            portfolio=portfolio,
+            indicator_engine=indicator_engine,
+            fundamental_store=fundamentals_store,
+            fundamental_names=fundamental_names,
+            selection_models=runtime.selection_models,
+            alpha_input_selections=sleeve_config.alpha.input_selections,
+            fill_model=simulated_fill_model_for_costs(slippage_bps=args.slippage_bps, fee_model=args.fee_model),
+            cycle_journal_store=journal_store,
+            runtime_id=f"{snapshot.config.runtime_id}:minute-backtest:{args.sleeve_id}",
+            config_version=snapshot.version,
+            account_id=sleeve_config.broker_account_id,
+            market_scope=market_scope_from_market(universe_market) if universe_market else None,
+            warmup_data_slice_count=daily_warmup_bar_count,
+        )
+        report = result.to_report(
+            include_orders=not args.summary_only,
+            include_insights=args.include_insights,
+            include_selection_details=(not args.summary_only or args.include_insights),
+        )
+        report["source"] = "minute-feed"
+        report["daily_source"] = args.daily_source
+        report["fill_model"] = {"slippage_bps": float(args.slippage_bps or 0.0), "fee_model": args.fee_model}
+        report["runtime"] = {
+            "runtime_id": snapshot.config.runtime_id,
+            "config_version": snapshot.version,
+            "config_path": str(args.config),
+            "sleeve_id": args.sleeve_id,
+            "configured_sleeves": [
+                {
+                    "sleeve_id": sleeve.sleeve_id,
+                    "cash": sleeve.cash,
+                    "cash_by_currency": dict(sleeve.cash_by_currency),
+                    "alpha_module_count": len(sleeve.alpha.modules),
+                    "selection_model_count": len(sleeve.universe.active.selection_models)
+                    if sleeve.universe.active.selection_models
+                    else 1,
+                }
+                for sleeve in snapshot.config.sleeves
+            ],
+        }
+        report["minute_backtest"] = {
+            "minute_feed": str(args.minute_feed),
+            "minute_data_slice_count": len(feed),
+            "daily_warmup_bar_count": daily_warmup_bar_count,
+            "daily_warmup_start": warmup_start.isoformat() if warmup_start else None,
+            "daily_warmup_end": warmup_end.isoformat() if warmup_end else None,
+            "indicator_default_resolution": "daily",
+        }
+        report["alpha"] = {
+            "alpha_ids": list(runtime.alpha_runtime.active_alpha_ids()),
+            "input_selections": dict(sleeve_config.alpha.input_selections),
+        }
+        report["portfolio"] = {
+            "initial_cash": initial_cash,
+            "initial_cash_by_currency": initial_cash_by_currency,
+            "model": sleeve_config.portfolio.model.to_dict(),
+        }
+        report["risk"] = {"model": sleeve_config.risk.model.to_dict()}
+        report["execution"] = {"model": sleeve_config.execution.model.to_dict()}
+        if fundamentals_report is not None:
+            report["fundamentals"] = fundamentals_report
+        if args.journal is not None:
+            report["cycle_journal"] = {"path": str(args.journal.resolve())}
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "download-us-minute-feed":
+        universe, source_info = _load_minute_feed_source_universe(args.source, args.sleeve_id)
+        start = _parse_cli_minute_start(args.start)
+        end = _parse_cli_minute_end(args.end)
+        if end < start:
+            raise RuntimeError("--end must be greater than or equal to --start.")
+        if args.provider != "yfinance":
+            raise RuntimeError(f"Unsupported US minute feed provider: {args.provider}")
+        requested_symbols = tuple(args.symbol or ())
+        if args.max_symbols is not None and not requested_symbols:
+            requested_symbols = tuple(symbol.key for symbol in universe.symbols[: max(int(args.max_symbols), 0)])
+        provider = YFinanceMinuteBarProvider(
+            timezone=args.timezone,
+            include_prepost=args.include_prepost,
+            sleep_seconds=float(args.sleep_seconds or 0.0),
+        )
+        report_obj = download_us_minute_feed(
+            universe,
+            provider=provider,
+            output_path=args.output,
+            start=start,
+            end=end,
+            interval=args.interval,
+            timezone=args.timezone,
+            symbols=requested_symbols,
+            overwrite=args.overwrite,
+        )
+        report = report_obj.to_dict()
+        report["source"] = source_info
+        report["runtime_backtest_minute_command"] = _runtime_minute_backtest_command_for_feed(
+            source_info,
+            output=args.output,
+            start=args.start,
+            end=args.end,
+        )
+        if args.summary_only:
+            report = {
+                key: report[key]
+                for key in (
+                    "status",
+                    "provider",
+                    "output_path",
+                    "requested_symbol_count",
+                    "downloaded_symbol_count",
+                    "row_count",
+                    "empty_symbols",
+                    "warnings",
+                    "runtime_backtest_minute_command",
+                )
+                if key in report
+            }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "train-rl-portfolio-constructor":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        universe = load_universe_definition(resolve_runtime_path(snapshot, sleeve_config.universe.coarse_path))
+        provider = _daily_backtest_provider(args.source)
+        _attach_exchange_map(provider, universe)
+        portfolio_parameters = dict(sleeve_config.portfolio.parameters)
+        result = train_ppo_portfolio_constructor(
+            universe,
+            provider,
+            output_dir=args.output_dir,
+            start=_parse_cli_datetime(args.start),
+            end=_parse_cli_datetime(args.end),
+            timesteps=args.timesteps,
+            seed=args.seed,
+            seeds=tuple(args.ensemble_seed) if args.ensemble_seed else None,
+            exposure_levels=tuple(
+                float(value)
+                for value in portfolio_parameters.get(
+                    "exposure_levels",
+                    (0.0, 0.10, 0.20, 0.35, 0.50),
+                )
+            ),
+            top_k=int(portfolio_parameters.get("top_k", 32)),
+            turnover_penalty=float(
+                args.turnover_penalty
+                if args.turnover_penalty is not None
+                else portfolio_parameters.get("turnover_penalty", 0.002)
+            ),
+            downside_penalty=float(
+                args.downside_penalty
+                if args.downside_penalty is not None
+                else portfolio_parameters.get("downside_penalty", 0.25)
+            ),
+            volatility_penalty=float(
+                args.volatility_penalty
+                if args.volatility_penalty is not None
+                else portfolio_parameters.get("volatility_penalty", 0.05)
+            ),
+            drawdown_penalty=float(
+                args.drawdown_penalty
+                if args.drawdown_penalty is not None
+                else portfolio_parameters.get("drawdown_penalty", 0.05)
+            ),
+            underwater_penalty=float(
+                args.underwater_penalty
+                if args.underwater_penalty is not None
+                else portfolio_parameters.get("underwater_penalty", 0.01)
+            ),
+            missed_upside_penalty=float(
+                args.missed_upside_penalty
+                if args.missed_upside_penalty is not None
+                else portfolio_parameters.get("missed_upside_penalty", 0.05)
+            ),
+            concentration_penalty=float(
+                args.concentration_penalty
+                if args.concentration_penalty is not None
+                else portfolio_parameters.get("concentration_penalty", 0.0)
+            ),
+            allocation_mode=str(portfolio_parameters.get("allocation_mode", "exposure")),
+            initial_cash=args.training_cash,
+        )
+        payload = {
+            "status": "trained",
+            "source": args.source,
+            "runtime": {
+                "runtime_id": snapshot.config.runtime_id,
+                "config_version": snapshot.version,
+                "config_path": str(args.config),
+                "sleeve_id": args.sleeve_id,
+            },
+            "rl": result.to_dict(),
+            "portfolio_model": {
+                "ref": sleeve_config.portfolio.model.to_dict(),
+                "parameters": dict(sleeve_config.portfolio.parameters),
+            },
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "fundamentals-import-fdr":
+        as_of = _parse_cli_datetime(args.as_of) or datetime.now()
+        universe = load_universe_definition(args.universe) if args.universe is not None else None
+        market = args.market or (universe.market if universe is not None else "KRX")
+        provider = FinanceDataReaderFundamentalProvider(
+            market=market,
+            include_naver_valuation=args.include_naver_valuation,
+        )
+        symbols = _fundamental_import_symbols(universe, args.symbol, market)
+        names = tuple(args.name) if args.name else None
+        values = provider.current_values(
+            symbols=symbols,
+            as_of=as_of,
+            names=names,
+            include_naver_valuation=args.include_naver_valuation,
+        )
+        source = provider.source_name(args.include_naver_valuation)
+        artifact = FundamentalArtifact.from_values(
+            market=market,
+            as_of=as_of,
+            source=source,
+            values=values,
+            metadata={
+                "provider": "FinanceDataReader",
+                "include_naver_valuation": args.include_naver_valuation,
+                "requested_symbols": [symbol.key for symbol in symbols] if symbols is not None else [],
+                "requested_names": list(names or []),
+                "universe_id": universe.id if universe is not None else None,
+                "universe_path": str(args.universe) if args.universe is not None else None,
+            },
+        )
+        store = FileFundamentalArtifactStore(args.root)
+        path = store.write(artifact, overwrite=args.overwrite)
+        payload: dict[str, object] = {
+            "status": "written",
+            "root": str(store.root),
+            "artifact": artifact.summary(path=path),
+        }
+        if not args.summary_only:
+            payload["values"] = artifact.to_dict()["values"]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "fundamentals-status":
+        store = FileFundamentalArtifactStore(args.root)
+        as_of = _parse_cli_datetime(args.as_of)
+        if as_of is not None:
+            if not args.market:
+                raise RuntimeError("--market is required when --as-of is provided.")
+            record = store.read(market=args.market, as_of=as_of)
+            payload = {
+                "status": "ok",
+                "root": str(store.root),
+                "artifact": record.summary(),
+            }
+            if not args.summary_only:
+                payload["values"] = record.artifact.to_dict()["values"]
+        else:
+            payload = store.status(
+                market=args.market,
+                include_artifacts=args.include_artifacts and not args.summary_only,
+            )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "warmup-indicators-daily":
-        provider = KISCachedMarketDataProvider.from_env()
         universe = load_universe_definition(args.universe)
+        provider = KISCachedMarketDataProvider.from_env()
+        _attach_exchange_map(provider, universe)
         result = run_daily_indicator_warmup(
             universe,
             provider,
@@ -1019,8 +1686,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result.report.to_dict(include_symbols=not args.summary_only), ensure_ascii=False, indent=2))
         return 0
     if args.command == "select-active-universe":
-        provider = KISCachedMarketDataProvider.from_env()
         universe = load_universe_definition(args.universe)
+        provider = KISCachedMarketDataProvider.from_env()
+        _attach_exchange_map(provider, universe)
         warmup_result = run_daily_indicator_warmup(
             universe,
             provider,
@@ -1112,6 +1780,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rate_limit_per_second=args.rate_limit_per_second,
         )
         history_provider = KISCachedMarketDataProvider.from_env()
+        _attach_exchange_map(history_provider, universe)
         worker = BackgroundSnapshotWorker(
             universe=universe,
             sleeve_id=args.sleeve_id,
@@ -1144,6 +1813,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "active-snapshot-worker-run":
         coarse_universe = load_universe_definition(args.universe)
         history_provider = KISCachedMarketDataProvider.from_env()
+        _attach_exchange_map(history_provider, coarse_universe)
         live_provider = MarketDataEngineLiveQuoteProvider.from_env(
             exchange_by_symbol=_exchange_map_from_universe(coarse_universe),
             rate_limit_per_second=args.rate_limit_per_second,
@@ -1241,6 +1911,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rate_limit_per_second=args.rate_limit_per_second,
         )
         history_provider = KISCachedMarketDataProvider.from_env()
+        _attach_exchange_map(history_provider, universe)
         alpha_load = PythonAlphaLoader().load(args.alpha)
         alpha_runtime = AlphaRuntime()
         worker = BackgroundSnapshotWorker(
@@ -1313,12 +1984,147 @@ def _parse_cli_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(text)
 
 
+def _parse_cli_minute_start(value: str) -> datetime:
+    parsed = _parse_cli_datetime(value)
+    if parsed is None:
+        raise RuntimeError("--start is required.")
+    return parsed
+
+
+def _parse_cli_minute_end(value: str) -> datetime:
+    parsed = _parse_cli_datetime(value)
+    if parsed is None:
+        raise RuntimeError("--end is required.")
+    text = value.strip()
+    if (len(text) == 8 and text.isdigit()) or (len(text) == 10 and "T" not in text and ":" not in text):
+        return parsed + timedelta(days=1) - timedelta(microseconds=1)
+    return parsed
+
+
+def _load_minute_feed_source_universe(source: Path, sleeve_id: str | None):
+    if sleeve_id:
+        snapshot = load_runtime_config_snapshot(source)
+        sleeve_config = snapshot.config.sleeve(sleeve_id)
+        universe_path = resolve_runtime_path(snapshot, sleeve_config.universe.coarse_path)
+        return load_universe_definition(universe_path), {
+            "source_type": "runtime_config",
+            "config_path": str(source),
+            "runtime_id": snapshot.config.runtime_id,
+            "config_version": snapshot.version,
+            "sleeve_id": sleeve_id,
+            "universe_path": str(universe_path),
+        }
+    universe_path = source
+    return load_universe_definition(universe_path), {
+        "source_type": "universe",
+        "universe_path": str(universe_path),
+    }
+
+
+def _runtime_minute_backtest_command_for_feed(
+    source_info: dict[str, object],
+    *,
+    output: Path,
+    start: str,
+    end: str,
+) -> list[str]:
+    if source_info.get("source_type") != "runtime_config":
+        return []
+    config_path = str(source_info.get("config_path") or "")
+    sleeve_id = str(source_info.get("sleeve_id") or "")
+    if not config_path or not sleeve_id:
+        return []
+    return [
+        "runtime-backtest-minute",
+        config_path,
+        "--sleeve-id",
+        sleeve_id,
+        "--minute-feed",
+        str(output),
+        "--start",
+        start,
+        "--end",
+        end,
+    ]
+
+
+def _runtime_backtest_warmup_start(args, sleeve_config) -> datetime | None:
+    explicit = _parse_cli_datetime(getattr(args, "warmup_start", None))
+    if explicit is not None:
+        return explicit
+    evaluation_start = _parse_cli_datetime(getattr(args, "start", None))
+    if evaluation_start is None:
+        return None
+    indicators = getattr(sleeve_config, "indicators", None)
+    if indicators is None or not getattr(indicators, "warmup_enabled", False):
+        return None
+    extra_bars = int(getattr(indicators, "extra_bars", 0) or 0)
+    if extra_bars <= 0:
+        return None
+    return evaluation_start - timedelta(days=max(extra_bars * 3, extra_bars + 7))
+
+
+def _minute_backtest_warmup_end(feed, *, start: datetime | None) -> datetime | None:
+    evaluation_start = start
+    if evaluation_start is None and feed:
+        evaluation_start = feed[0].time
+    if evaluation_start is None:
+        return None
+    return evaluation_start - timedelta(days=1)
+
+
 def _daily_backtest_provider(source: str):
     if source == "finance-datareader":
         return FinanceDataReaderMarketDataProvider()
     if source == "kis-cache":
         return KISCachedMarketDataProvider.from_env()
     raise ValueError(f"Unsupported daily backtest source: {source}")
+
+
+def _runtime_sleeve_universe_market(snapshot, sleeve_config) -> str:
+    universe = load_universe_definition(resolve_runtime_path(snapshot, sleeve_config.universe.coarse_path))
+    return universe.market
+
+
+def _backtest_portfolio_from_sleeve(sleeve_config, *, cash: float | None, currency: str) -> Portfolio:
+    code = str(currency or "KRW").strip().upper()
+    if cash is not None:
+        return Portfolio(cash=float(cash), cash_by_currency={code: float(cash)})
+    cash_by_currency = {
+        str(key).strip().upper(): float(value)
+        for key, value in dict(getattr(sleeve_config, "cash_by_currency", {}) or {}).items()
+        if float(value) != 0.0
+    }
+    if cash_by_currency:
+        return Portfolio(cash=sum(cash_by_currency.values()), cash_by_currency=cash_by_currency)
+    configured_cash = float(getattr(sleeve_config, "cash", 0.0) or 0.0)
+    return Portfolio(cash=configured_cash, cash_by_currency={code: configured_cash} if configured_cash else {})
+
+
+def _load_fundamentals_for_backtest(
+    root: Path,
+    *,
+    market: str | None,
+    end: datetime | None,
+    names: tuple[str, ...] | None,
+):
+    if not market:
+        raise RuntimeError("--fundamentals-market is required when the universe has no market.")
+    artifact_store = FileFundamentalArtifactStore(root)
+    pit_store, records = artifact_store.load_to_store(
+        market=market,
+        end=end,
+        names=names,
+    )
+    if not records:
+        raise RuntimeError(f"No fundamental artifacts found for market={market!r} under {root}.")
+    return pit_store, {
+        "root": str(root),
+        "market": str(market).strip().upper(),
+        "artifact_count": len(records),
+        "requested_names": list(names or []),
+        "artifacts": [record.summary() for record in records],
+    }
 
 
 def _exchange_map_from_universe(universe) -> dict[str, str]:
@@ -1329,6 +2135,11 @@ def _exchange_map_from_universe(universe) -> dict[str, str]:
             exchange_by_symbol[symbol.key] = str(exchange).strip().upper()
             exchange_by_symbol[symbol.ticker] = str(exchange).strip().upper()
     return exchange_by_symbol
+
+
+def _attach_exchange_map(provider, universe) -> None:
+    if hasattr(provider, "exchange_by_symbol"):
+        provider.exchange_by_symbol = _exchange_map_from_universe(universe)
 
 
 def _parse_symbol_refs(values: Sequence[str], default_market: str) -> tuple[Symbol, ...]:
@@ -1343,6 +2154,16 @@ def _parse_symbol_refs(values: Sequence[str], default_market: str) -> tuple[Symb
         else:
             symbols.append(Symbol(ticker=text, market=default_market))
     return tuple(symbols)
+
+
+def _fundamental_import_symbols(universe, symbol_refs: Sequence[str], default_market: str) -> tuple[Symbol, ...] | None:
+    symbols: dict[str, Symbol] = {}
+    if universe is not None:
+        for symbol in universe.symbols:
+            symbols[symbol.key] = symbol
+    for symbol in _parse_symbol_refs(symbol_refs, default_market):
+        symbols[symbol.key] = symbol
+    return tuple(symbols.values()) if symbols else None
 
 
 def _parse_fill_allocations(values: Sequence[str]) -> tuple[tuple[str, int], ...]:
@@ -1764,6 +2585,30 @@ def _run_order_runtime_supervisor_for_route(snapshot, args, route: _OrderRuntime
     )
 
 
+def _maybe_notify_order_submit(args, report) -> dict[str, object] | None:
+    if not getattr(args, "notify", False):
+        return None
+    service = NotificationService.from_env(root=getattr(args, "notification_root", None))
+    return notify_order_submit_report(
+        service,
+        report,
+        chat_id=getattr(args, "notify_chat_id", None),
+        disable_notification=getattr(args, "notify_disable_notification", False),
+    )
+
+
+def _maybe_notify_order_supervisor(args, report) -> dict[str, object] | None:
+    if not getattr(args, "notify", False):
+        return None
+    service = NotificationService.from_env(root=getattr(args, "notification_root", None))
+    return notify_order_supervisor_report(
+        service,
+        report,
+        chat_id=getattr(args, "notify_chat_id", None),
+        disable_notification=getattr(args, "notify_disable_notification", False),
+    )
+
+
 def _multi_route_payload(snapshot, reports, *, include_details: bool) -> dict[str, object]:
     return {
         "runtime_id": snapshot.config.runtime_id,
@@ -1818,6 +2663,7 @@ def _append_order_report_journal(
     if journal_store is None:
         return
     for sleeve_id in sleeve_ids:
+        metadata = _runtime_code_identity_metadata(snapshot, (sleeve_id,))
         journal_store.append(
             CycleJournalEntry(
                 runtime_id=snapshot.config.runtime_id,
@@ -1833,8 +2679,22 @@ def _append_order_report_journal(
                 counts=counts,
                 warnings=warnings,
                 errors=errors,
+                metadata=metadata,
             )
         )
+
+
+def _with_runtime_code_identity_metadata(snapshot, entry: CycleJournalEntry, sleeve_ids: tuple[str, ...]) -> CycleJournalEntry:
+    metadata = dict(entry.metadata)
+    metadata.update(_runtime_code_identity_metadata(snapshot, sleeve_ids))
+    return replace(entry, metadata=metadata)
+
+
+def _runtime_code_identity_metadata(snapshot, sleeve_ids: tuple[str, ...]) -> dict[str, object]:
+    try:
+        return build_runtime_code_identity(snapshot, sleeve_ids=sleeve_ids).journal_metadata()
+    except Exception as exc:  # noqa: BLE001 - journal writes should not fail the runtime cycle.
+        return {"runtime_code_identity_error": str(exc)}
 
 
 def _resolve_status_account_store_path(snapshot, explicit_path: Path | None, sleeve_ids: Sequence[str]) -> Path:

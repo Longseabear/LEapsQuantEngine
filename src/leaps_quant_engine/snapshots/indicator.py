@@ -16,6 +16,7 @@ class IndicatorValue:
     is_ready: bool
     samples: int
     time: datetime | None = None
+    resolution: str = "any"
 
 
 @dataclass(frozen=True, slots=True)

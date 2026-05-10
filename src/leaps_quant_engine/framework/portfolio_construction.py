@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.models import DataSlice, PortfolioTarget, Symbol
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,14 +20,32 @@ class PortfolioConstructionContext:
     managed_symbols: tuple[Symbol, ...]
     portfolio_equity: float = 0.0
     target_portfolio_value: float = 0.0
+    portfolio_equity_by_currency: Mapping[str, float] = field(default_factory=dict)
+    target_portfolio_value_by_currency: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def equity(self) -> float:
-        return self.portfolio_equity if self.portfolio_equity > 0 else _portfolio_equity(self.portfolio, self.data)
+        if self.portfolio_equity > 0:
+            return self.portfolio_equity
+        return _single_currency_value(
+            _portfolio_equity_by_currency(self.portfolio, self.data, _relevant_symbols(self))
+        )
 
     @property
     def target_value(self) -> float:
         return self.target_portfolio_value if self.target_portfolio_value > 0 else self.equity
+
+    def equity_for_symbol(self, symbol: Symbol) -> float:
+        currency = currency_for_symbol(symbol)
+        if currency in self.portfolio_equity_by_currency:
+            return float(self.portfolio_equity_by_currency[currency])
+        return self.portfolio.equity_for_currency(currency, self.data)
+
+    def target_value_for_symbol(self, symbol: Symbol) -> float:
+        currency = currency_for_symbol(symbol)
+        if currency in self.target_portfolio_value_by_currency:
+            return float(self.target_portfolio_value_by_currency[currency])
+        return self.equity_for_symbol(symbol)
 
     @property
     def held_symbols(self) -> tuple[Symbol, ...]:
@@ -137,6 +155,7 @@ class RebalancePolicy:
     min_order_notional: float = 0.0
     min_quantity_delta: int = 1
     allow_exit_below_min_notional: bool = True
+    cadence: str = "every_cycle"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.cash_reserve_pct < 1.0:
@@ -145,6 +164,8 @@ class RebalancePolicy:
             raise ValueError("min_order_notional cannot be negative.")
         if self.min_quantity_delta < 0:
             raise ValueError("min_quantity_delta cannot be negative.")
+        if not str(self.cadence).strip():
+            raise ValueError("cadence cannot be empty.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,12 +175,20 @@ class PortfolioConstructionEngine:
     reason: str = "portfolio_construction"
 
     def create_targets(self, context: PortfolioConstructionContext) -> PortfolioTargetBatch:
-        equity = _portfolio_equity(context.portfolio, context.data)
-        target_value = equity * (1.0 - self.rebalance_policy.cash_reserve_pct)
+        relevant_symbols = _relevant_symbols(context)
+        equity_by_currency = _portfolio_equity_by_currency(context.portfolio, context.data, relevant_symbols)
+        target_value_by_currency = {
+            currency: equity * (1.0 - self.rebalance_policy.cash_reserve_pct)
+            for currency, equity in equity_by_currency.items()
+        }
+        equity = _single_currency_value(equity_by_currency)
+        target_value = _single_currency_value(target_value_by_currency)
         prepared_context = replace(
             context,
             portfolio_equity=equity,
             target_portfolio_value=target_value,
+            portfolio_equity_by_currency=MappingProxyType(dict(equity_by_currency)),
+            target_portfolio_value_by_currency=MappingProxyType(dict(target_value_by_currency)),
         )
         raw_targets = tuple(
             _coerce_allocation_target(prepared_context, target)
@@ -181,9 +210,12 @@ class PortfolioConstructionEngine:
                 "filtered_plan_count": len(plans),
                 "portfolio_equity": equity,
                 "target_portfolio_value": target_value,
+                "portfolio_equity_by_currency": dict(equity_by_currency),
+                "target_portfolio_value_by_currency": dict(target_value_by_currency),
                 "cash_reserve_pct": self.rebalance_policy.cash_reserve_pct,
                 "min_order_notional": self.rebalance_policy.min_order_notional,
                 "min_quantity_delta": self.rebalance_policy.min_quantity_delta,
+                "cadence": self.rebalance_policy.cadence,
             },
         )
 
@@ -215,14 +247,13 @@ class EqualWeightPortfolioConstructionModel:
 
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
         latest_by_symbol = _latest_insight_by_symbol(context.active_insights)
-        actionable = tuple(
-            insight
-            for insight in latest_by_symbol.values()
-            if insight.direction is InsightDirection.UP
-            or (not self.long_only and insight.direction is InsightDirection.DOWN)
-        )
+        actionable_by_currency: dict[str, list[Insight]] = {}
+        for insight in latest_by_symbol.values():
+            if insight.direction is not InsightDirection.UP and (self.long_only or insight.direction is not InsightDirection.DOWN):
+                continue
+            actionable_by_currency.setdefault(currency_for_symbol(insight.symbol), []).append(insight)
         target_qty_by_symbol: dict[str, PortfolioTarget] = {}
-        if actionable:
+        for actionable in actionable_by_currency.values():
             equal_weight = self.max_portfolio_pct / len(actionable)
             for insight in actionable:
                 signed_weight = _target_weight(insight, equal_weight, long_only=self.long_only)
@@ -281,7 +312,7 @@ def _target_plan(
     current_quantity = context.portfolio.quantity(target.symbol)
     current_price = context.portfolio.mark_price(target.symbol, context.data)
     current_value = context.portfolio.position_value(target.symbol, context.data)
-    desired_value = context.target_value * target.target_percent
+    desired_value = context.target_value_for_symbol(target.symbol) * target.target_percent
     return PortfolioTargetPlan(
         target=target,
         current_quantity=current_quantity,
@@ -300,8 +331,35 @@ def _target_reason(target: PortfolioAllocationTarget) -> str:
     return "target"
 
 
-def _portfolio_equity(portfolio: Portfolio, data: DataSlice) -> float:
-    return portfolio.equity(data)
+def _portfolio_equity_by_currency(
+    portfolio: Portfolio,
+    data: DataSlice,
+    symbols: tuple[Symbol, ...],
+) -> dict[str, float]:
+    currencies = set(portfolio.currencies())
+    currencies.update(currency_for_symbol(symbol) for symbol in symbols)
+    if not currencies:
+        currencies = {"KRW"}
+    return portfolio.equity_by_currency(data, currencies)
+
+
+def _single_currency_value(values: Mapping[str, float]) -> float:
+    non_zero = {
+        currency: value
+        for currency, value in values.items()
+        if abs(value) > 1e-12
+    }
+    if len(non_zero) == 1:
+        return next(iter(non_zero.values()))
+    return 0.0
+
+
+def _relevant_symbols(context: PortfolioConstructionContext) -> tuple[Symbol, ...]:
+    symbols: list[Symbol] = []
+    symbols.extend(insight.symbol for insight in context.active_insights)
+    symbols.extend(context.managed_symbols)
+    symbols.extend(context.held_symbols)
+    return tuple(_symbols_by_key(tuple(symbols)).values())
 
 
 def _coerce_allocation_target(
@@ -315,7 +373,8 @@ def _coerce_allocation_target(
             target_percent = 0.0
         else:
             price = context.portfolio.mark_price(target.symbol, context.data)
-            target_percent = 0.0 if price is None or context.target_value <= 0 else (target.quantity * price) / context.target_value
+            target_value = context.target_value_for_symbol(target.symbol)
+            target_percent = 0.0 if price is None or target_value <= 0 else (target.quantity * price) / target_value
         return PortfolioAllocationTarget(
             symbol=target.symbol,
             target_percent=target_percent,

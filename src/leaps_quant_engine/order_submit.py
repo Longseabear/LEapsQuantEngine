@@ -8,7 +8,8 @@ from typing import Any, Iterable, Mapping
 
 from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.engine_guard import EngineGuard, EngineGuardReport
-from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.market_rules import MarketSession
+from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol, TimeInForce
 from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrationResult, MultiSleeveOrderOrchestrator
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.order_status import OrderRuntimeStatusReport, build_order_runtime_status
@@ -86,6 +87,8 @@ class OrderRuntimeSubmitter:
     currency: str = "KRW"
     coordinator: OrderCoordinator = OrderCoordinator()
     engine_guard: EngineGuard = EngineGuard()
+    require_orderable_session: bool = False
+    market_session: MarketSession | None = None
 
     def submit_batches(
         self,
@@ -123,6 +126,8 @@ class OrderRuntimeSubmitter:
             market_scope=self.market_scope,
             broker=broker,
             commit=commit,
+            require_orderable_session=self.require_orderable_session or (commit and broker == "broker-engine" and confirm_live_submit),
+            market_session=self.market_session,
             generated_at=generated_at,
         )
         errors = errors + guard.errors
@@ -248,6 +253,10 @@ def _parse_order_intent(payload: Mapping[str, Any], *, default_sleeve_id: str) -
         quantity=_positive_int(payload.get("quantity"), "quantity"),
         reference_price=_positive_float(payload.get("reference_price"), "reference_price"),
         tag=str(payload.get("tag") or ""),
+        order_type=_parse_order_type(payload.get("order_type")),
+        limit_price=_optional_float(payload.get("limit_price")),
+        time_in_force=_parse_time_in_force(payload.get("time_in_force")),
+        metadata=dict(_object(payload.get("metadata"), default={})),
     )
 
 
@@ -338,3 +347,30 @@ def _positive_float(value: Any, key: str) -> float:
     if number <= 0:
         raise ValueError(f"{key} must be positive.")
     return number
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def _parse_order_type(value: Any) -> OrderType:
+    text = str(value or OrderType.LIMIT.value).strip().lower()
+    return OrderType(text)
+
+
+def _parse_time_in_force(value: Any) -> TimeInForce:
+    text = str(value or TimeInForce.DAY.value).strip().lower()
+    return TimeInForce(text)
+
+
+def _object(value: Any, *, default: Mapping[str, Any]) -> Mapping[str, Any]:
+    if value is None:
+        return default
+    if not isinstance(value, Mapping):
+        raise ValueError("metadata must be an object.")
+    return value

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from leaps_quant_engine.models import OrderSide
+from leaps_quant_engine.models import OrderType
 from leaps_quant_engine.order_state import OrderRuntimeSnapshot, OrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderEvent, OrderEventType, OrderTicket, OrderTicketStatus
 from leaps_quant_engine.portfolio import Portfolio
@@ -23,7 +24,7 @@ class SleeveOrderRuntimeStatus:
     @property
     def pending_buy_notional(self) -> float:
         return sum(
-            ticket.remaining_quantity * ticket.reference_price
+            ticket.remaining_quantity * _cash_price(ticket)
             for ticket in self.open_tickets
             if ticket.side is OrderSide.BUY
         )
@@ -216,8 +217,14 @@ def _allocation_status_counts(statuses: tuple[FillAllocationStatus, ...]) -> dic
 
 def _ticket_to_status_dict(ticket: OrderTicket) -> dict[str, Any]:
     payload = ticket.to_dict()
-    payload["remaining_notional"] = ticket.remaining_quantity * ticket.reference_price
+    payload["remaining_notional"] = ticket.remaining_quantity * _cash_price(ticket)
     return payload
+
+
+def _cash_price(ticket: OrderTicket) -> float:
+    if ticket.order_type is OrderType.LIMIT and ticket.limit_price is not None:
+        return ticket.limit_price
+    return ticket.reference_price
 
 
 def _portfolio_to_dict(portfolio: Portfolio) -> dict[str, Any]:

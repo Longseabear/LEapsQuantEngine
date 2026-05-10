@@ -12,7 +12,12 @@ from leaps_quant_engine.alpha import AlphaRuntime, InsightBatch, SnapshotContext
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.market_data_snapshot import MarketDataSnapshotEngine
-from leaps_quant_engine.snapshots import IndicatorSnapshotStore, SnapshotFreshnessPolicy, SnapshotQualityReport
+from leaps_quant_engine.snapshots import (
+    IndicatorSnapshotStore,
+    SnapshotFreshnessPolicy,
+    SnapshotQualityReport,
+    SnapshotQualityStatus,
+)
 from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.warmup import WarmupPolicy, WarmupReport, run_daily_indicator_warmup
 
@@ -127,6 +132,7 @@ class BackgroundSnapshotWorker:
     alpha_runtime: AlphaRuntime | None = None
     freshness_policy: SnapshotFreshnessPolicy = field(default_factory=SnapshotFreshnessPolicy)
     warmup_policy: WarmupPolicy = field(default_factory=WarmupPolicy)
+    entry_block_reasons: tuple[str, ...] = ()
     snapshot_engine: MarketDataSnapshotEngine = field(init=False)
     _stop_event: Event = field(default_factory=Event, init=False)
     _thread: Thread | None = field(default=None, init=False)
@@ -214,6 +220,7 @@ class BackgroundSnapshotWorker:
             completed_at=collection.report.completed_at,
             elapsed_ms=collection.report.elapsed_ms,
         )
+        quality_report = _quality_with_entry_blocks(quality_report, self.entry_block_reasons)
         update_started = time.perf_counter()
         indicator_snapshots = self.snapshot_engine.update_indicators(
             collection.snapshot,
@@ -304,6 +311,8 @@ class BackgroundSnapshotWorker:
             if warmup
             else None
         )
+        if warmup_report is not None:
+            self.entry_block_reasons = _warmup_entry_block_reasons(warmup_report)
         cycles: list[SnapshotWorkerCycleReport] = []
         while not self._stop_event.is_set() and (max_cycles is None or len(cycles) < max_cycles):
             cycles.append(self.run_once())
@@ -352,3 +361,28 @@ class BackgroundSnapshotWorker:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+
+def _warmup_entry_block_reasons(report: WarmupReport) -> tuple[str, ...]:
+    return () if report.is_ready else ("warmup_not_ready",)
+
+
+def _quality_with_entry_blocks(
+    quality: SnapshotQualityReport,
+    entry_block_reasons: tuple[str, ...],
+) -> SnapshotQualityReport:
+    if not entry_block_reasons:
+        return quality
+    status = quality.status
+    if status is SnapshotQualityStatus.FRESH:
+        status = SnapshotQualityStatus.DEGRADED
+    return SnapshotQualityReport(
+        status=status,
+        complete_ratio=quality.complete_ratio,
+        age_seconds=quality.age_seconds,
+        collection_seconds=quality.collection_seconds,
+        requested_symbol_count=quality.requested_symbol_count,
+        collected_symbol_count=quality.collected_symbol_count,
+        failed_symbol_count=quality.failed_symbol_count,
+        reasons=tuple(dict.fromkeys((*quality.reasons, *entry_block_reasons))),
+    )

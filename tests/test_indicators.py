@@ -12,9 +12,9 @@ from leaps_quant_engine.indicators import (
 from leaps_quant_engine.models import Bar, Symbol
 
 
-def _bar(symbol: Symbol, day: int, close: float, volume: int = 10) -> Bar:
+def _bar(symbol: Symbol, day: int, close: float, volume: int = 10, resolution: str = "any") -> Bar:
     time = datetime(2026, 5, 1) + timedelta(days=day)
-    return Bar(symbol, time, close, close, close, close, volume)
+    return Bar(symbol, time, close, close, close, close, volume, resolution=resolution)
 
 
 def test_rolling_window_keeps_fixed_size_values():
@@ -84,3 +84,18 @@ def test_indicator_registry_updates_symbol_indicators_chronologically():
         "sma_2_close": pytest.approx(15),
         "momentum_1_close": pytest.approx(1.0),
     }
+
+
+def test_indicator_registry_does_not_advance_daily_indicator_from_live_bar():
+    symbol = Symbol("005930", "KRX")
+    registry = IndicatorRegistry()
+    registry.add(symbol, SimpleMovingAverage(2), resolution="daily")
+
+    registry.update(_bar(symbol, 0, 10, resolution="daily"))
+    registry.update(_bar(symbol, 1, 20, resolution="daily"))
+    ready = registry.ready_values(symbol)
+
+    registry.update(_bar(symbol, 2, 1_000, resolution="live"))
+
+    assert ready["sma_2_close"] == pytest.approx(15)
+    assert registry.ready_values(symbol)["sma_2_close"] == pytest.approx(15)

@@ -381,6 +381,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
 
     path: Path
     default_cash_by_sleeve: dict[str, float] | None = None
+    default_cash_by_currency_by_sleeve: dict[str, dict[str, float]] | None = None
     default_currency: str = "KRW"
 
     def current_portfolio(self, sleeve_id: str) -> Portfolio:
@@ -776,13 +777,40 @@ class VirtualSleeveAccountStore(PortfolioProvider):
     def _ensure_sleeve(self, state: dict[str, Any], sleeve_id: str) -> None:
         if sleeve_id in state["sleeves"]:
             _normalize_sleeve_cash(state["sleeves"][sleeve_id], self.default_currency)
+            self._ensure_configured_cash_buckets(state, sleeve_id)
             return
+        configured_cash = self._configured_cash_by_currency(sleeve_id)
         default_cash = (self.default_cash_by_sleeve or {}).get(sleeve_id, 0.0)
         code = _currency_code(self.default_currency)
         state["sleeves"][sleeve_id] = {
-            "cash": float(default_cash),
-            "cash_by_currency": {code: float(default_cash)} if default_cash else {},
+            "cash": sum(configured_cash.values()) if configured_cash else float(default_cash),
+            "cash_by_currency": configured_cash or ({code: float(default_cash)} if default_cash else {}),
             "holdings": {},
+        }
+
+    def _ensure_configured_cash_buckets(self, state: dict[str, Any], sleeve_id: str) -> None:
+        configured_cash = self._configured_cash_by_currency(sleeve_id)
+        if not configured_cash:
+            return
+        sleeve = state["sleeves"][sleeve_id]
+        if sleeve.get("holdings") or state.get("fills") or state.get("cash_transfers"):
+            return
+        cash_by_currency = _cash_by_currency_from_payload(sleeve, self.default_currency)
+        changed = False
+        for currency, amount in configured_cash.items():
+            if currency not in cash_by_currency and amount > 0:
+                cash_by_currency[currency] = amount
+                changed = True
+        if changed:
+            sleeve["cash_by_currency"] = cash_by_currency
+            sleeve["cash"] = sum(cash_by_currency.values())
+
+    def _configured_cash_by_currency(self, sleeve_id: str) -> dict[str, float]:
+        configured = (self.default_cash_by_currency_by_sleeve or {}).get(sleeve_id, {})
+        return {
+            _currency_code(currency): float(amount)
+            for currency, amount in configured.items()
+            if abs(float(amount)) > 1e-12
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -987,11 +1015,7 @@ def _adjust_sleeve_cash(payload: dict[str, Any], currency: str, delta: float) ->
 
 
 def _adjust_portfolio_cash(portfolio: Portfolio, currency: str, delta: float) -> None:
-    code = _currency_code(currency)
-    if not portfolio.cash_by_currency:
-        portfolio.cash_by_currency[code] = portfolio.cash
-    portfolio.cash_by_currency[code] = float(portfolio.cash_by_currency.get(code, 0.0)) + float(delta)
-    portfolio.cash = sum(portfolio.cash_by_currency.values())
+    portfolio.adjust_cash_for_currency(currency, delta)
 
 
 def _float_or_none(value: Any) -> float | None:

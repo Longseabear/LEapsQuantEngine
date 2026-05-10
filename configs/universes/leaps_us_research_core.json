@@ -1,0 +1,53 @@
+{
+  "id": "leaps-us-research-core",
+  "market": "US",
+  "tags": [
+    "research",
+    "overseas",
+    "usd",
+    "leaps"
+  ],
+  "symbols": [
+    {"ticker": "AAPL", "exchange": "NAS", "asset_type": "stock", "sector": "technology"},
+    {"ticker": "MSFT", "exchange": "NAS", "asset_type": "stock", "sector": "technology"},
+    {"ticker": "NVDA", "exchange": "NAS", "asset_type": "stock", "sector": "technology"},
+    {"ticker": "AMZN", "exchange": "NAS", "asset_type": "stock", "sector": "consumer_discretionary"},
+    {"ticker": "META", "exchange": "NAS", "asset_type": "stock", "sector": "communication_services"},
+    {"ticker": "GOOGL", "exchange": "NAS", "asset_type": "stock", "sector": "communication_services"},
+    {"ticker": "AVGO", "exchange": "NAS", "asset_type": "stock", "sector": "technology"},
+    {"ticker": "TSLA", "exchange": "NAS", "asset_type": "stock", "sector": "consumer_discretionary"},
+    {"ticker": "AMD", "exchange": "NAS", "asset_type": "stock", "sector": "technology"},
+    {"ticker": "LLY", "exchange": "NYS", "asset_type": "stock", "sector": "health_care"},
+    {"ticker": "JPM", "exchange": "NYS", "asset_type": "stock", "sector": "financials"},
+    {"ticker": "V", "exchange": "NYS", "asset_type": "stock", "sector": "financials"},
+    {"ticker": "MA", "exchange": "NYS", "asset_type": "stock", "sector": "financials"},
+    {"ticker": "COST", "exchange": "NAS", "asset_type": "stock", "sector": "consumer_staples"},
+    {"ticker": "UNH", "exchange": "NYS", "asset_type": "stock", "sector": "health_care"},
+    {"ticker": "XOM", "exchange": "NYS", "asset_type": "stock", "sector": "energy"},
+    {"ticker": "SPY", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "us_large_cap"},
+    {"ticker": "QQQ", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "us_growth"},
+    {"ticker": "IWM", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "us_small_cap"},
+    {"ticker": "SMH", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "semiconductor"},
+    {"ticker": "XLK", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "technology"},
+    {"ticker": "XLF", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "financials"},
+    {"ticker": "XLE", "exchange": "AMS", "asset_type": "etf", "is_etf": true, "segment": "energy"},
+    {"ticker": "TLT", "exchange": "NAS", "asset_type": "etf", "is_etf": true, "segment": "long_duration_treasury"}
+  ],
+  "indicators": [
+    {"name": "close", "type": "close", "period": 1, "field": "close"},
+    {"name": "identity_close", "type": "identity", "period": 1, "field": "close"},
+    {"name": "sma_5_close", "type": "sma", "period": 5, "field": "close"},
+    {"name": "sma_20_close", "type": "sma", "period": 20, "field": "close"},
+    {"name": "ema_8_close", "type": "ema", "period": 8, "field": "close"},
+    {"name": "momentum_5_close", "type": "momentum", "period": 5, "field": "close"},
+    {"name": "roc_20_close", "type": "roc", "period": 20, "field": "close"},
+    {"name": "rolling_max_20_close", "type": "rolling_max", "period": 20, "field": "close"},
+    {"name": "rolling_min_20_close", "type": "rolling_min", "period": 20, "field": "close"},
+    {"name": "stddev_20_close", "type": "stddev", "period": 20, "field": "close"},
+    {"name": "atr_14", "type": "atr", "period": 14},
+    {"name": "volume", "type": "volume", "period": 1},
+    {"name": "rolling_volume_20", "type": "rolling_volume", "period": 20},
+    {"name": "rolling_dollar_volume_20", "type": "rolling_dollar_volume", "period": 20},
+    {"name": "vwap_20", "type": "vwap", "period": 20}
+  ]
+}

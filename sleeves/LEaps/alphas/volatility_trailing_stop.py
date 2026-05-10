@@ -7,6 +7,8 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 ALPHA_ID = "leaps-volatility-trailing-stop"
 VERSION = "0.1.0"
+EVALUATION_CADENCE = "once_per_day"
+INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=1)
 ATR_MULTIPLIER = 2.5
 STDDEV_MULTIPLIER = 2.0
@@ -73,4 +75,3 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
-

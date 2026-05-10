@@ -7,9 +7,16 @@ from typing import Any, Iterable, Mapping
 
 from leaps_quant_engine.broker_routing import currency_for_market_scope, market_scope_for_symbol
 from leaps_quant_engine.execution import OrderIntentBatch
-from leaps_quant_engine.models import OrderIntent, OrderSide
+from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderTicketStatus
+from leaps_quant_engine.market_rules import (
+    MarketSession,
+    default_capability_for_market_scope,
+    is_domestic_symbol,
+    is_valid_krx_tick,
+    is_whole_share_quantity,
+)
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 
 
@@ -82,16 +89,36 @@ class EngineGuard:
         broker: str = "paper",
         commit: bool = False,
         require_account_route: bool = False,
+        require_orderable_session: bool = False,
+        market_session: MarketSession | Mapping[str, Any] | None = None,
         generated_at: datetime | None = None,
     ) -> EngineGuardReport:
         generated_at = generated_at or datetime.now()
         decisions: list[EngineGuardDecision] = []
         batches_tuple = tuple(batches)
+        session = _coerce_market_session(market_session)
+        capability = default_capability_for_market_scope(market_scope)
         if require_account_route and not account_id:
             decisions.append(_decision("rejected", "missing_account_route", "", metadata={"market_scope": market_scope}))
+        if require_orderable_session and session is None:
+            decisions.append(_decision("rejected", "missing_market_session", "", metadata={"market_scope": market_scope}))
+        if require_orderable_session and session is not None and not session.is_orderable:
+            decisions.append(
+                _decision(
+                    "rejected",
+                    "market_session_not_orderable",
+                    "",
+                    metadata={
+                        "market_scope": session.market_scope,
+                        "session_phase": session.session_phase,
+                        "source": session.source,
+                    },
+                )
+            )
         if commit and broker == "broker-engine" and market_scope == "overseas":
             decisions.append(_decision("rejected", "broker_engine_overseas_submit_not_supported", "", metadata={"account_id": account_id}))
 
+        decisions.extend(_duplicate_submit_decisions(batches_tuple, order_state_store, commit=commit))
         open_buy_notional, open_sell_quantities = _open_ticket_reservations(order_state_store)
         new_buy_notional: dict[str, float] = {}
         new_sell_quantities: dict[tuple[str, str], int] = {}
@@ -114,9 +141,43 @@ class EngineGuard:
                 decisions.append(_decision("rejected", "missing_or_invalid_reference_price", order.sleeve_id, order=order))
             if order.quantity <= 0:
                 decisions.append(_decision("rejected", "order_quantity_must_be_positive", order.sleeve_id, order=order))
+            if not capability.fractional_quantity and not is_whole_share_quantity(order.quantity):
+                decisions.append(_decision("rejected", "order_quantity_must_be_whole_share", order.sleeve_id, order=order))
+            if not capability.supports(order_type=order.order_type, time_in_force=order.time_in_force):
+                decisions.append(
+                    _decision(
+                        "rejected",
+                        "unsupported_order_style_for_route",
+                        order.sleeve_id,
+                        order=order,
+                        metadata={
+                            "order_type": order.order_type.value,
+                            "time_in_force": order.time_in_force.value,
+                            "market_scope": market_scope,
+                        },
+                    )
+                )
+            if order.order_type is OrderType.LIMIT and order.limit_price is not None and order.limit_price <= 0:
+                decisions.append(_decision("rejected", "missing_or_invalid_limit_price", order.sleeve_id, order=order))
+            if (
+                capability.enforce_tick_size
+                and order.order_type is OrderType.LIMIT
+                and order.limit_price is not None
+                and is_domestic_symbol(order.symbol)
+                and not is_valid_krx_tick(order.limit_price)
+            ):
+                decisions.append(
+                    _decision(
+                        "warning",
+                        "limit_price_not_on_krx_tick",
+                        order.sleeve_id,
+                        order=order,
+                        metadata={"limit_price": order.limit_price},
+                    )
+                )
 
             if order.side is OrderSide.BUY:
-                new_buy_notional[order.sleeve_id] = new_buy_notional.get(order.sleeve_id, 0.0) + order.notional
+                new_buy_notional[order.sleeve_id] = new_buy_notional.get(order.sleeve_id, 0.0) + _cash_notional(order)
                 continue
             key = (order.sleeve_id, order.symbol.key)
             new_sell_quantities[key] = new_sell_quantities.get(key, 0) + order.quantity
@@ -177,6 +238,55 @@ def _orders(batches: Iterable[OrderIntentBatch]) -> tuple[OrderIntent, ...]:
     return tuple(order for batch in batches for order in batch.order_intents)
 
 
+def _duplicate_submit_decisions(
+    batches: tuple[OrderIntentBatch, ...],
+    order_state_store: OrderRuntimeStateStore | None,
+    *,
+    commit: bool,
+) -> tuple[EngineGuardDecision, ...]:
+    if order_state_store is None:
+        return ()
+    try:
+        snapshot = order_state_store.snapshot()
+    except Exception as exc:  # noqa: BLE001
+        status = "rejected" if commit else "warning"
+        return (
+            _decision(
+                status,
+                "order_runtime_store_unavailable_for_duplicate_check",
+                "",
+                metadata={"error": str(exc)},
+            ),
+        )
+    existing_by_intent = {ticket.order_intent_id: ticket for ticket in snapshot.tickets}
+    existing_by_ticket = {ticket.ticket_id: ticket for ticket in snapshot.tickets}
+    decisions: list[EngineGuardDecision] = []
+    status = "rejected" if commit else "warning"
+    for batch in batches:
+        for index, order in enumerate(batch.order_intents, start=1):
+            order_intent_id = f"{batch.batch_id}:{index}"
+            ticket_id = f"ticket:{order_intent_id}"
+            existing = existing_by_intent.get(order_intent_id) or existing_by_ticket.get(ticket_id)
+            if existing is None:
+                continue
+            decisions.append(
+                _decision(
+                    status,
+                    "duplicate_order_intent_already_recorded",
+                    order.sleeve_id,
+                    order=order,
+                    metadata={
+                        "batch_id": batch.batch_id,
+                        "order_intent_id": order_intent_id,
+                        "ticket_id": ticket_id,
+                        "existing_status": existing.status.value,
+                        "existing_broker_order_id": existing.broker_order_id,
+                    },
+                )
+            )
+    return tuple(decisions)
+
+
 def _open_ticket_reservations(
     order_state_store: OrderRuntimeStateStore | None,
 ) -> tuple[dict[str, float], dict[tuple[str, str], int]]:
@@ -194,12 +304,30 @@ def _open_ticket_reservations(
         if ticket.side is OrderSide.BUY:
             buy_notional[ticket.sleeve_id] = (
                 buy_notional.get(ticket.sleeve_id, 0.0)
-                + ticket.remaining_quantity * ticket.reference_price
+                + ticket.remaining_quantity * _ticket_cash_price(ticket)
             )
             continue
         key = (ticket.sleeve_id, ticket.symbol.key)
         sell_quantities[key] = sell_quantities.get(key, 0) + ticket.remaining_quantity
     return buy_notional, sell_quantities
+
+
+def _cash_notional(order: OrderIntent) -> float:
+    price = order.limit_price if order.order_type is OrderType.LIMIT and order.limit_price is not None else order.reference_price
+    return order.quantity * price
+
+
+def _ticket_cash_price(ticket: Any) -> float:
+    price = ticket.limit_price if ticket.order_type is OrderType.LIMIT and ticket.limit_price is not None else ticket.reference_price
+    return float(price)
+
+
+def _coerce_market_session(value: MarketSession | Mapping[str, Any] | None) -> MarketSession | None:
+    if value is None:
+        return None
+    if isinstance(value, MarketSession):
+        return value
+    return MarketSession.from_mapping(value)
 
 
 def _decision(

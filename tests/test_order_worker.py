@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from leaps_quant_engine.brokerage import BrokerExecutionService, PaperBrokerExecutionGateway
+from leaps_quant_engine.brokerage import BrokerEngineExecutionGateway, BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
 from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrator
@@ -148,6 +148,118 @@ class FakeExecutionHistoryClient:
         if self.holdings_error is not None:
             raise self.holdings_error
         return self.holdings
+
+
+class FakeBrokerEngineQueueClient:
+    def __init__(self):
+        self.enqueued = []
+
+    def call_operation(self, operation, arguments=None):
+        raise AssertionError("queue mode should not call operation directly")
+
+    def enqueue_command(self, operation, *, arguments=None, metadata=None):
+        self.enqueued.append(
+            {
+                "operation": operation,
+                "arguments": dict(arguments or {}),
+                "metadata": dict(metadata or {}),
+            }
+        )
+        return {"command_id": "cmd-00000001", "sequence": 1, "status": "queued"}
+
+    def get_snapshots(self, *, consumer_id, snapshot_type="", resource_id="", limit=200):
+        return {
+            "consumer_id": consumer_id,
+            "snapshot_count": 1,
+            "snapshots": [
+                {
+                    "snapshot_id": f"{snapshot_type}:{resource_id}",
+                    "snapshot_type": snapshot_type,
+                    "resource_id": resource_id,
+                    "payload": {
+                        "status": "completed",
+                        "result": {
+                            "branch_no": "001",
+                            "order_no": "00012345",
+                        },
+                        "error": "",
+                    },
+                }
+            ],
+        }
+
+
+def test_broker_engine_accepted_order_alias_later_owns_execution_history_fill(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    broker_client = FakeBrokerEngineQueueClient()
+    orchestrator = MultiSleeveOrderOrchestrator(
+        broker=BrokerExecutionService(
+            BrokerEngineExecutionGateway(client=broker_client, consumer_id="test-consumer")
+        ),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+
+    submitted = orchestrator.run_batches(
+        (_batch(quantity=2),),
+        generated_at=datetime(2026, 5, 9, 9, 31),
+        poll_after_submit=True,
+    )
+    ticket = submitted.final_tickets[0]
+
+    assert submitted.submission.events[0].broker_order_id == "cmd-00000001"
+    assert submitted.polling.events[0].broker_order_id == "001:00012345"
+    assert account_store.current_portfolio("LEaps").holdings == {}
+    ownership = account_store.ownership_for_order(ticket.order_intent_id)
+    assert ownership is not None
+    assert ownership.sleeve_id == "LEaps"
+    assert ownership.broker_order_id == "001:00012345"
+    assert account_store.ownership_for_order("00012345").sleeve_id == "LEaps"
+
+    worker = ExecutionHistoryReconcileWorker(
+        account_client=FakeExecutionHistoryClient(
+            executions=[
+                {
+                    "order_id": "00012345",
+                    "symbol": "005930",
+                    "side": "buy",
+                    "execution_quantity": "2",
+                    "execution_price": "70000",
+                    "execution_timestamp": "20260509T093500",
+                    "source_granularity": "order_execution_summary",
+                }
+            ],
+            holdings={
+                "holdings": [
+                    {
+                        "symbol": "005930",
+                        "holding_quantity": 2,
+                        "average_purchase_price": 70_000,
+                    }
+                ]
+            },
+        ),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+
+    report = worker.reconcile_once(
+        start_date="20260509",
+        end_date="20260509",
+        reconciled_at=datetime(2026, 5, 9, 9, 40),
+    )
+
+    assert report.status == "ok"
+    assert report.imported_fill_count == 1
+    assert report.touched_sleeve_ids == ("LEaps",)
+    assert report.reconciliation["status"] == "matched"
+    portfolio = account_store.current_portfolio("LEaps")
+    assert portfolio.cash == 860_000
+    assert portfolio.quantity(Symbol("005930", "KRX")) == 2
 
 
 def test_execution_history_reconcile_worker_imports_owned_fill_by_broker_alias(tmp_path):

@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 
 import pytest
 
@@ -22,6 +23,47 @@ def test_virtual_sleeve_account_reads_default_current_portfolio(tmp_path):
 
     assert portfolio.cash == 1_000_000
     assert portfolio.holdings == {}
+
+
+def test_virtual_sleeve_account_reads_multi_currency_default_current_portfolio(tmp_path):
+    store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_currency_by_sleeve={"LEaps": {"KRW": 10_000_000, "USD": 3434.25}},
+        default_currency="USD",
+    )
+
+    portfolio = store.current_portfolio("LEaps")
+
+    assert portfolio.cash_by_currency == {"KRW": 10_000_000.0, "USD": 3434.25}
+
+
+def test_virtual_sleeve_account_repairs_missing_configured_cash_bucket_before_activity(tmp_path):
+    path = tmp_path / "accounts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sleeves": {"LEaps": {"cash": 3434.25, "cash_by_currency": {"USD": 3434.25}, "holdings": {}}},
+                "order_ownership": {},
+                "broker_order_index": {},
+                "fills": {},
+                "broker_fills": {},
+                "fill_allocations": {},
+                "account_cash_snapshots": {},
+                "cash_transfers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = VirtualSleeveAccountStore(
+        path,
+        default_cash_by_currency_by_sleeve={"LEaps": {"KRW": 10_000_000, "USD": 3434.25}},
+        default_currency="USD",
+    )
+
+    portfolio = store.current_portfolio("LEaps")
+
+    assert portfolio.cash_by_currency == {"USD": 3434.25, "KRW": 10_000_000.0}
 
 
 def test_virtual_sleeve_account_routes_fill_by_order_ownership(tmp_path):

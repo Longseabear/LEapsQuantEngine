@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from leaps_quant_engine.market_data import MarketDataProvider
@@ -16,7 +17,7 @@ def get_daily_history(
 ) -> list[Bar]:
     get_cached_daily_history = getattr(provider, "get_cached_daily_history", None)
     if get_cached_daily_history is not None:
-        return list(
+        return _as_daily_bars(
             get_cached_daily_history(
                 symbol,
                 start=start,
@@ -26,7 +27,7 @@ def get_daily_history(
         )
     if refresh_history:
         raise ValueError("refresh_history requires a provider with get_cached_daily_history().")
-    return list(provider.get_history(symbol, start=start, end=end))
+    return _as_daily_bars(provider.get_history(symbol, start=start, end=end))
 
 
 def load_daily_history(
@@ -47,3 +48,7 @@ def load_daily_history(
         )
         for symbol in symbols
     }
+
+
+def _as_daily_bars(bars: list[Bar] | tuple[Bar, ...]) -> list[Bar]:
+    return [replace(bar, resolution="daily") if bar.resolution != "daily" else bar for bar in bars]

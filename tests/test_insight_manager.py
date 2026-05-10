@@ -53,6 +53,21 @@ def test_insight_manager_ingests_and_returns_active_insights():
     assert manager.tracked_symbols("us-live") == (Symbol("NVDA", "US"),)
 
 
+def test_insight_manager_active_order_is_stable_for_same_timestamp():
+    manager = InsightManager()
+    first = _insight(symbol=Symbol("MSFT", "US"))
+    second = _insight(symbol=Symbol("AAPL", "US"))
+    third = _insight(symbol=Symbol("NVDA", "US"))
+
+    manager.ingest(_batch(first, second, third), as_of=datetime(2026, 5, 9, 9, 30))
+
+    assert [insight.symbol.key for insight in manager.active(datetime(2026, 5, 9, 9, 31))] == [
+        "US:AAPL",
+        "US:MSFT",
+        "US:NVDA",
+    ]
+
+
 def test_insight_manager_expires_old_insights_by_time():
     manager = InsightManager()
     insight = _insight(expires_at=datetime(2026, 5, 9, 9, 31))
@@ -88,4 +103,3 @@ def test_insight_manager_can_cancel_symbol_insights():
     assert update.cancelled_count == 1
     assert manager.active(datetime(2026, 5, 9, 9, 32)) == ()
     assert manager.state_for(insight.insight_id) is InsightState.CANCELLED
-

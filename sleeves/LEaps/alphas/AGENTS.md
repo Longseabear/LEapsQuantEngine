@@ -15,6 +15,12 @@ Alpha modules consume snapshot context and emit insights only.
 - Do not call KIS, broker-engine, market-data-engine, or adapter functions.
 - Use explicit `alpha_id`, version, confidence, expiry/horizon, and reason fields when available.
 - Exit or flat signals are acceptable as insights, but downstream layers decide sizing and orders.
+- Daily/swing LEaps alphas should declare `EVALUATION_CADENCE = "once_per_day"`
+  and `INPUT_RESOLUTION = "daily"` unless they are intentionally intraday.
+- Loop over `context.symbol_keys`, not the full snapshot, so runtime
+  `alpha.input_selections` can keep KOSPI, ETF, and operational inputs separate.
+- `InsightDirection.FLAT` is the correct shape for stop/exit alpha. Portfolio
+  construction and risk decide the final exit target and order intent.
 
 ## Tests
 

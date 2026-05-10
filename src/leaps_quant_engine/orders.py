@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
 from uuid import uuid4
 
-from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol, TimeInForce
 
 
 class OrderIntentBatchLike(Protocol):
@@ -112,6 +112,9 @@ class OrderTicket:
     quantity: int
     reference_price: float
     tag: str = ""
+    order_type: OrderType | str = OrderType.LIMIT
+    limit_price: float | None = None
+    time_in_force: TimeInForce | str = TimeInForce.DAY
     status: OrderTicketStatus = OrderTicketStatus.CREATED
     created_at: datetime = field(default_factory=datetime.now)
     broker_order_id: str | None = None
@@ -119,6 +122,13 @@ class OrderTicket:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        order_type = _coerce_order_type(self.order_type)
+        limit_price = None if self.limit_price is None else float(self.limit_price)
+        if order_type is OrderType.MARKET:
+            limit_price = None
+        object.__setattr__(self, "order_type", order_type)
+        object.__setattr__(self, "limit_price", limit_price)
+        object.__setattr__(self, "time_in_force", _coerce_time_in_force(self.time_in_force))
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     @classmethod
@@ -140,6 +150,10 @@ class OrderTicket:
             quantity=intent.quantity,
             reference_price=intent.reference_price,
             tag=intent.tag,
+            order_type=intent.order_type,
+            limit_price=intent.limit_price,
+            time_in_force=intent.time_in_force,
+            metadata=dict(intent.metadata),
             created_at=created_at,
         )
 
@@ -216,6 +230,9 @@ class OrderTicket:
             "quantity": self.quantity,
             "reference_price": self.reference_price,
             "tag": self.tag,
+            "order_type": self.order_type.value,
+            "limit_price": self.limit_price,
+            "time_in_force": self.time_in_force.value,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "broker_order_id": self.broker_order_id,
@@ -236,6 +253,9 @@ class OrderTicket:
             quantity=int(payload.get("quantity") or 0),
             reference_price=float(payload.get("reference_price") or 0.0),
             tag=str(payload.get("tag") or ""),
+            order_type=_coerce_order_type(payload.get("order_type") or OrderType.LIMIT),
+            limit_price=_float_or_none(payload.get("limit_price")),
+            time_in_force=_coerce_time_in_force(payload.get("time_in_force") or TimeInForce.DAY),
             status=OrderTicketStatus(str(payload.get("status") or OrderTicketStatus.CREATED.value)),
             created_at=datetime.fromisoformat(str(payload["created_at"])),
             broker_order_id=_text_or_none(payload.get("broker_order_id")),
@@ -288,6 +308,116 @@ class OrderCoordinationResult:
         }
 
 
+class SlippageModel(Protocol):
+    def fill_price(self, ticket: OrderTicket) -> float:
+        """Return the simulated fill price for a ticket."""
+
+
+@dataclass(frozen=True, slots=True)
+class FeeEstimate:
+    total: float = 0.0
+    commission: float = 0.0
+    taxes: float = 0.0
+    regulatory: float = 0.0
+    currency: str = ""
+    model_name: str = "zero_fee"
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "fee": self.total,
+            "commission": self.commission,
+            "taxes": self.taxes,
+            "regulatory_fee": self.regulatory,
+            "fee_currency": self.currency,
+            "fee_model": self.model_name,
+        }
+
+
+class FeeModel(Protocol):
+    def estimate(self, ticket: OrderTicket, *, fill_price: float, quantity: int) -> FeeEstimate:
+        """Return simulated transaction costs for a fill."""
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroFeeModel:
+    model_name: str = "zero_fee"
+
+    def estimate(self, ticket: OrderTicket, *, fill_price: float, quantity: int) -> FeeEstimate:
+        return FeeEstimate(currency=_currency_for_symbol(ticket.symbol), model_name=self.model_name)
+
+
+@dataclass(frozen=True, slots=True)
+class FixedRateFeeModel:
+    commission_bps: float = 0.0
+    buy_tax_bps: float = 0.0
+    sell_tax_bps: float = 0.0
+    regulatory_bps: float = 0.0
+    minimum_fee: float = 0.0
+    model_name: str = "fixed_rate_fee"
+
+    def estimate(self, ticket: OrderTicket, *, fill_price: float, quantity: int) -> FeeEstimate:
+        notional = max(float(fill_price) * int(quantity), 0.0)
+        commission = _bps_cost(notional, self.commission_bps)
+        tax_bps = self.buy_tax_bps if ticket.side is OrderSide.BUY else self.sell_tax_bps
+        taxes = _bps_cost(notional, tax_bps)
+        regulatory = _bps_cost(notional, self.regulatory_bps)
+        total_before_min = commission + taxes + regulatory
+        total = max(total_before_min, float(self.minimum_fee)) if total_before_min > 0 else 0.0
+        return FeeEstimate(
+            total=total,
+            commission=commission,
+            taxes=taxes,
+            regulatory=regulatory,
+            currency=_currency_for_symbol(ticket.symbol),
+            model_name=self.model_name,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class KisFeeModel:
+    """Configurable KIS-style fee preset for simulation only."""
+
+    domestic_commission_bps: float = 1.40527
+    domestic_sell_tax_bps: float = 20.0
+    overseas_us_commission_bps: float = 25.0
+    overseas_us_sell_regulatory_bps: float = 0.0
+    model_name: str = "kis_fee"
+
+    def estimate(self, ticket: OrderTicket, *, fill_price: float, quantity: int) -> FeeEstimate:
+        market = ticket.symbol.market.upper()
+        if market in {"KR", "KRX", "KOSPI", "KOSDAQ"}:
+            return FixedRateFeeModel(
+                commission_bps=self.domestic_commission_bps,
+                sell_tax_bps=self.domestic_sell_tax_bps,
+                model_name=self.model_name,
+            ).estimate(ticket, fill_price=fill_price, quantity=quantity)
+        return FixedRateFeeModel(
+            commission_bps=self.overseas_us_commission_bps,
+            regulatory_bps=self.overseas_us_sell_regulatory_bps if ticket.side is OrderSide.SELL else 0.0,
+            model_name=self.model_name,
+        ).estimate(ticket, fill_price=fill_price, quantity=quantity)
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroSlippageModel:
+    model_name: str = "zero_slippage"
+
+    def fill_price(self, ticket: OrderTicket) -> float:
+        return ticket.reference_price
+
+
+@dataclass(frozen=True, slots=True)
+class FixedBpsSlippageModel:
+    bps: float
+    model_name: str = "fixed_bps"
+
+    def fill_price(self, ticket: OrderTicket) -> float:
+        rate = max(float(self.bps), 0.0) / 10_000.0
+        if ticket.side is OrderSide.BUY:
+            return ticket.reference_price * (1.0 + rate)
+        return max(0.0, ticket.reference_price * (1.0 - rate))
+
+
 @dataclass(frozen=True, slots=True)
 class OrderCoordinator:
     def coordinate(
@@ -320,23 +450,76 @@ class OrderCoordinator:
 
 @dataclass(frozen=True, slots=True)
 class SimulatedFillModel:
+    slippage_model: SlippageModel = field(default_factory=ZeroSlippageModel)
+    fee_model: FeeModel = field(default_factory=ZeroFeeModel)
+    enforce_limit_price: bool = False
+
     def fill(
         self,
         tickets: Iterable[OrderTicket],
         *,
         occurred_at: datetime,
     ) -> tuple[OrderEvent, ...]:
-        return tuple(
-            ticket.event(
-                OrderEventType.FILLED,
-                occurred_at=occurred_at,
-                quantity=ticket.remaining_quantity,
-                fill_price=ticket.reference_price,
-                reason="simulated_immediate_fill",
+        events: list[OrderEvent] = []
+        for ticket in tickets:
+            if ticket.remaining_quantity <= 0 or ticket.status in {OrderTicketStatus.CANCELLED, OrderTicketStatus.REJECTED}:
+                continue
+            fill_price = self.slippage_model.fill_price(ticket)
+            if self.enforce_limit_price and not _is_marketable(ticket, fill_price):
+                continue
+            fee = self.fee_model.estimate(ticket, fill_price=fill_price, quantity=ticket.remaining_quantity)
+            events.append(
+                ticket.event(
+                    OrderEventType.FILLED,
+                    occurred_at=occurred_at,
+                    quantity=ticket.remaining_quantity,
+                    fill_price=fill_price,
+                    reason="simulated_immediate_fill",
+                    metadata={
+                        **_slippage_metadata(ticket, fill_price, self.slippage_model),
+                        **fee.to_metadata(),
+                    },
+                )
             )
-            for ticket in tickets
-            if ticket.remaining_quantity > 0 and ticket.status not in {OrderTicketStatus.CANCELLED, OrderTicketStatus.REJECTED}
-        )
+        return tuple(events)
+
+
+def _slippage_metadata(ticket: OrderTicket, fill_price: float, model: SlippageModel) -> dict[str, Any]:
+    reference_price = ticket.reference_price
+    if reference_price <= 0:
+        side_adjusted_per_share = 0.0
+        slippage_bps = 0.0
+    elif ticket.side is OrderSide.BUY:
+        side_adjusted_per_share = fill_price - reference_price
+        slippage_bps = (side_adjusted_per_share / reference_price) * 10_000.0
+    else:
+        side_adjusted_per_share = reference_price - fill_price
+        slippage_bps = (side_adjusted_per_share / reference_price) * 10_000.0
+    quantity = ticket.remaining_quantity
+    return {
+        "reference_price": reference_price,
+        "fill_price": fill_price,
+        "slippage_model": getattr(model, "model_name", type(model).__name__),
+        "slippage_per_share": side_adjusted_per_share,
+        "slippage_bps": slippage_bps,
+        "slippage_cost": side_adjusted_per_share * quantity,
+    }
+
+
+def _is_marketable(ticket: OrderTicket, fill_price: float) -> bool:
+    if ticket.order_type is OrderType.MARKET or ticket.limit_price is None:
+        return True
+    if ticket.side is OrderSide.BUY:
+        return fill_price <= ticket.limit_price + 1e-9
+    return fill_price >= ticket.limit_price - 1e-9
+
+
+def _bps_cost(notional: float, bps: float) -> float:
+    return max(float(notional), 0.0) * max(float(bps), 0.0) / 10_000.0
+
+
+def _currency_for_symbol(symbol: Symbol) -> str:
+    return "KRW" if symbol.market.upper() in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"} else "USD"
 
 
 def _detect_same_symbol_opposing_sleeves(tickets: list[OrderTicket]) -> tuple[OrderIntentCollision, ...]:
@@ -367,6 +550,18 @@ def _symbol_from_key(symbol_key: str) -> Symbol:
         return Symbol(symbol_key)
     market, ticker = symbol_key.split(":", 1)
     return Symbol(ticker=ticker, market=market)
+
+
+def _coerce_order_type(value: OrderType | str) -> OrderType:
+    if isinstance(value, OrderType):
+        return value
+    return OrderType(str(value or OrderType.LIMIT.value).strip().lower())
+
+
+def _coerce_time_in_force(value: TimeInForce | str) -> TimeInForce:
+    if isinstance(value, TimeInForce):
+        return value
+    return TimeInForce(str(value or TimeInForce.DAY.value).strip().lower())
 
 
 def _float_or_none(value: Any) -> float | None:

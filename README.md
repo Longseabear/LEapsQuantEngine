@@ -8,6 +8,12 @@ See [docs/agent-artifact-runtime.md](C:/Users/leap1/Documents/LEapsQuantEngine/d
 
 See [docs/current-status.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/current-status.md) for the latest implemented slices, benchmark results, logging events, and next development priorities.
 
+See [docs/model-authoring-guide.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/model-authoring-guide.md) for writing universe selection, alpha, portfolio construction, risk, and execution models.
+
+See [docs/runtime-cadence-resolution.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/runtime-cadence-resolution.md) for daily indicator resolution, alpha cadence, portfolio target persistence, and urgent exit rules.
+
+See [docs/backtesting-guide.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/backtesting-guide.md) for sleeve-specific backtest usage, warmup rules, debug options, fundamentals artifacts, fee/slippage simulation, and multi-market research caveats.
+
 ## Target Engine Structure
 
 The long-term engine target follows LEAN Algorithm Framework boundaries, with sleeves as first-class capital and policy compartments.
@@ -17,7 +23,7 @@ flowchart LR
     Config["RuntimeConfig / Control Command"] --> Bootstrap["Runtime Bootstrap"]
     Bootstrap --> Sleeve["Sleeve Runtime"]
 
-    Universe["Universe Selection<br/>Coarse -> Fine -> Active"] --> Data["Market Data Adapter<br/>broker-engine / market-data-engine / history cache"]
+    Universe["Universe Selection<br/>Coarse -> Fine -> Active"] --> Data["Market Data Adapter<br/>KISDirect / history cache / public data"]
     Data --> MarketSnapshot["MarketDataSnapshot"]
     MarketSnapshot --> Indicators["IndicatorEngine"]
     Indicators --> IndicatorSnapshot["IndicatorSnapshot"]
@@ -41,7 +47,7 @@ flowchart LR
     Sleeve --> PortfolioState
 ```
 
-The same strategy boundary should work in live, paper, and backtest modes. Live mode consumes broker-engine or market-data-engine adapters; backtests should consume deterministic virtual or cached historical feeds.
+The same strategy boundary should work in live, paper, and backtest modes. Live mode consumes explicit broker/market-data adapters such as `KISDirectClient`; backtests should consume deterministic virtual or cached historical feeds.
 
 ```mermaid
 flowchart TB
@@ -63,14 +69,16 @@ flowchart LR
     RuntimeConfig["RuntimeConfigSnapshot"] --> Bootstrap["bootstrap_sleeve_runtime"]
     Bootstrap --> Fine["FineUniverseRuntime"]
     Fine --> Active["UniverseSelectionRuntime<br/>selected + forced symbols"]
+    Active --> AlphaInputs["alpha.input_selections<br/>alpha_id -> selection_id"]
     Active --> Worker["BackgroundSnapshotWorker"]
     Worker --> MarketSnapshot["MarketDataSnapshot"]
     MarketSnapshot --> IndicatorEngine["IndicatorEngine"]
     IndicatorEngine --> IndicatorSnapshot["IndicatorSnapshotStore.active"]
     IndicatorSnapshot --> Framework["FrameworkRunner"]
+    AlphaInputs --> Framework
     Framework --> AlphaRuntime["AlphaRuntime"]
     AlphaRuntime --> InsightManager["InsightManager"]
-    InsightManager --> Portfolio["PortfolioConstructionEngine<br/>EqualWeightPortfolioConstructionModel"]
+    InsightManager --> Portfolio["PortfolioConstructionEngine<br/>EqualWeight / RL PPO model"]
     Portfolio --> TargetBatch["PortfolioTargetBatch<br/>target percent / desired value"]
     TargetBatch --> Sizing["OrderSizingEngine"]
     Sizing --> TargetPlan["OrderSizingBatch<br/>quantity / rounding loss"]
@@ -84,10 +92,10 @@ flowchart LR
 
 Implemented now:
 
-- Universe: coarse file, fine cache refresh, active selection, and forced inclusion for held/open-order/exit-watch/manual symbols.
-- Indicators: sleeve-namespaced in-memory state, warmup, 30+ indicator catalog, live snapshot updates, and immutable `IndicatorSnapshot`.
-- Alpha: Python Alpha Model loader, `AlphaRuntime`, `Insight`, `InsightBatch`, and example alpha modules.
-- Framework: `InsightManager`, `PortfolioConstructionEngine`, equal-weight portfolio model, `PortfolioAllocationTarget`, `OrderSizingEngine`, basic risk gates, immediate execution, and order-intent output.
+- Universe: coarse file, fine cache refresh, active selection, composite selection union, and forced inclusion for held/open-order/exit-watch/manual symbols.
+- Indicators: sleeve-namespaced in-memory state, warmup, 30+ indicator catalog, resolution-gated updates, live snapshot updates, and immutable `IndicatorSnapshot`.
+- Alpha: Python Alpha Model loader, `AlphaRuntime`, per-alpha cadence, alpha-specific selected symbol inputs, `Insight`, `InsightBatch`, and example alpha modules.
+- Framework: `InsightManager`, `PortfolioConstructionEngine`, target persistence through rebalance cadence, equal-weight portfolio model, `PortfolioAllocationTarget`, `OrderSizingEngine`, basic risk gates, immediate execution, and order-intent output.
 - Orders: global order coordination, `OrderTicket`, `OrderEvent`, append-only order runtime state, open-ticket polling, execution-history reconciliation, simulated fills, multi-sleeve order orchestration, paper broker gateway, and a StockProgram-style broker-engine gateway.
 - Operations: `runtime-run-once --order-batch-output` persists strategy output as a submit-ready order-intent artifact. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from that artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation and returns a final status report. Order runtime commands can route through sleeve-level broker account profiles.
 - Runtime: config validation, broker account profiles, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
@@ -112,11 +120,11 @@ Not complete yet:
 - `MarketDataSnapshot` / `IndicatorSnapshot`: stable read models for live/replay consumers.
 - `WarmupPolicy`: startup/restart indicator preparation from cached history.
 - `BackgroundSnapshotWorker`: bounded/background snapshot update loop.
-- `AlphaRuntime`: Python Alpha Model runner that emits insights from snapshots.
+- `AlphaRuntime`: Python Alpha Model runner that emits insights from snapshots and can skip daily alpha models until their cadence is due.
 - `InsightManager`: LEAN-style active/expired/cancelled insight state.
 - `PortfolioConstructionEngine`: turns active insights plus the sleeve virtual account portfolio into auditable allocation targets with target percent and desired value.
-- `OrderSizingEngine`: turns allocation targets into quantity-based `PortfolioTarget` records, applying rebalance noise filters and recording rounding loss.
-- `FrameworkRunner`: deterministic `Alpha -> Portfolio -> OrderSizing -> Risk -> Execution` v0 pipeline.
+- `OrderSizingEngine`: turns allocation targets into quantity-based `PortfolioTarget` records from current portfolio state, applying rebalance noise filters and recording rounding loss.
+- `FrameworkRunner`: deterministic `Alpha -> Portfolio -> OrderSizing -> Risk -> Execution` v0 pipeline with persisted portfolio targets when rebalance cadence is not due.
 - `OrderCoordinator`: converts sleeve order-intent batches into global `OrderTicket` records and collision reports.
 - `MultiSleeveOrderOrchestrator`: collects all sleeve order batches, registers ticket ownership, submits through a broker gateway, polls events, and applies fills to the virtual sleeve account ledger.
 - `FileOrderRuntimeStateStore`: records tickets and order events as append-only JSONL and reconstructs open tickets after restart.
@@ -127,7 +135,7 @@ Not complete yet:
 - `OpenTicketPollWorker`: reloads open tickets, polls the broker gateway, appends observed events, and applies fill events to virtual sleeve accounts.
 - `ExecutionHistoryReconcileWorker`: imports recent broker execution-history fills without stopping on bad rows, skips already-applied order-event fills, and records unknown fills for sleeve allocation.
 - `BrokerExecutionGateway`: submits or simulates tickets through paper or local broker-engine adapters and emits normalized `OrderEvent` records.
-- `UniverseSelectionModel`: sleeve-level active universe selection with forced watchlist inclusion.
+- `UniverseSelectionModel` / `CompositeUniverseSelectionRuntime`: sleeve-level active universe selection with forced watchlist inclusion and per-selection provenance.
 - `RuntimeConfig` / `BrokerAccountRuntimeConfig` / `RuntimeControlCommand`: option snapshots, sleeve-to-account routing, and command-based reload for future UI/control-plane flows.
 
 ## Smoke Test
@@ -139,7 +147,7 @@ py -3 -m pytest -q
 Current expected result:
 
 ```text
-205 passed
+270 passed
 ```
 
 ## Run Sample
@@ -192,6 +200,8 @@ The first sample lives at `configs/runtime/live_us_smoke.json`. It references th
 
 `runtime-run-once` returns both worker and framework sections: worker covers market snapshot collection and indicator publication; framework covers `Alpha -> InsightManager -> Portfolio -> OrderSizing -> Risk -> Execution -> OrderIntent`.
 
+When `indicators.warmup_enabled=true`, runtime bootstrap warms indicators before active selection and passes the warmed snapshot into selection models. If warmup is incomplete, the runtime marks the cycle with `warmup_not_ready` and blocks new entries instead of making cold-start momentum decisions.
+
 `broker_accounts` can define separate domestic and overseas virtual-account/order-runtime stores. A sleeve can set `broker_account_id` so order runtime commands resolve the correct account route without reusing the old `portfolio.account_store_path` fallback. `order-runtime-status` returns `broker_account_id` and `market_scope`; overseas `broker-engine` submit/poll/reconcile is currently blocked intentionally.
 
 Dry-run or commit an order-intent batch file into the order runtime:
@@ -215,6 +225,27 @@ Run one bounded order maintenance pass:
 ```powershell
 $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json --summary-only
+```
+
+## Notifications
+
+Notifications follow the StockProgram local-first pattern: write an auditable
+local record first, then try Telegram only when credentials are configured.
+
+Environment:
+
+```text
+LEAPS_TELEGRAM_BOT_TOKEN
+LEAPS_TELEGRAM_CHAT_ID
+```
+
+The StockProgram variable names are also accepted as fallback for migration.
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli notification-status
+py -3 -m leaps_quant_engine.cli notify-user-message --category order --title "Order queued" --message "LEaps KRX:005930 buy 1" --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --commit --broker paper --notify --summary-only
 ```
 
 ## KIS Adapter
@@ -279,6 +310,44 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli framework-backtest-daily configs/universes/swing_kor_core.json examples/alpha/price_above_sma_alpha.py --sleeve-id swing-kor --summary-only
 ```
 
+Runtime-config sleeve backtests use the sleeve's configured selection, alpha,
+portfolio, risk, and execution models:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --start 2023-05-10 --end 2026-05-08 --cash 2000000 --source finance-datareader --summary-only
+```
+
+This path runs configured `universe.active.selection_models` on each backtest
+cycle and passes `alpha.input_selections` into `AlphaRuntime`, so research can
+exercise the same selection-to-alpha wiring used by runtime.
+`leaps_workspace_smoke` now wires LEaps to the USD-only
+`configs/universes/leaps_us_research_core.json` universe and the
+`portfolios/rl_ppo_constructor.py` model. Train the local PPO policy ensemble
+with:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli train-rl-portfolio-constructor configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --start 2021-05-10 --end 2026-05-08 --source finance-datareader --timesteps 20000 --ensemble-seed 7 --ensemble-seed 17 --ensemble-seed 29 --seed 7 --output-dir data/rl --summary-only
+```
+
+The RL model chooses allocation percentages only; order sizing, risk, execution,
+and fills stay in the normal deterministic framework pipeline. The training
+reward is shape-aware: downside return, volatility, drawdown increase,
+underwater state, turnover, and missed upside are penalized so CAGR does not
+dominate model selection.
+The current policy uses an attention feature extractor: selector/alpha top-k
+candidates become asset tokens, and a small Transformer encoder reads those
+tokens before PPO chooses gross exposure.
+The current selected runtime profile keeps equal allocation inside the selected
+top-k basket after PPO chooses gross exposure; risk-softmax weighting remains an
+experimental option.
+
+The LEaps workspace alpha modules now use risk-adjusted scoring before
+portfolio construction: momentum confirms fast/slow trend and penalizes
+normalized volatility, while ETF rotation uses trend-filtered momentum and
+normalized volatility rather than raw price standard deviation.
+
 ## Indicators
 
 Indicators follow a LEAN-like incremental interface:
@@ -314,7 +383,7 @@ py -3 -m leaps_quant_engine.cli indicators-kis-once sample_swing_kor_pipeline.js
 py -3 -m leaps_quant_engine.cli indicators-backtest-once sample_swing_kor_pipeline.json --sleeve-id swing-kor
 ```
 
-`indicators-kis-once` pulls latest bars through broker-engine/KIS. `indicators-backtest-once` verifies the configured sleeve universe can be loaded without touching KIS; deterministic backtest updates are covered through `VirtualMarketDataProvider`.
+`indicators-kis-once` pulls latest bars through the engine-owned KIS adapter boundary. `indicators-backtest-once` verifies the configured sleeve universe can be loaded without touching KIS; deterministic backtest updates are covered through `VirtualMarketDataProvider`.
 
 Daily indicator warmup:
 
@@ -323,7 +392,7 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli warmup-indicators-daily configs/universes/swing_kor_core.json --sleeve-id swing-kor --summary-only
 ```
 
-Warmup loads cache-first daily history through the local market-data bridge, calculates the required trailing bar count from each configured indicator's `warmup_period`, updates in-memory indicator state, and emits a readiness report. This is the startup/restart step before a future live snapshot worker begins publishing indicator snapshots.
+Warmup loads cache-first daily history through `KISDirectClient` and the local file cache, calculates the required trailing bar count from each configured indicator's `warmup_period`, updates in-memory indicator state, and emits a readiness report. This is the startup/restart step before a future live snapshot worker begins publishing indicator snapshots.
 
 Daily indicator cycle benchmark:
 
@@ -333,7 +402,7 @@ py -3 -m leaps_quant_engine.cli benchmark-indicators-daily configs/universes/ben
 ```
 
 The benchmark replays cached KIS daily history for the configured universe and measures only `IndicatorEngine.on_data(DataSlice)` latency. History loading and replay-feed build time are reported separately.
-It expects the local StockProgram `market-data-engine` cache bridge at `MARKET_DATA_ENGINE_BASE_URL` (default `http://127.0.0.1:8765`).
+It no longer requires the local StockProgram `market-data-engine` HTTP server; the default KIS cache path is `data/kis-cache`.
 
 Live snapshot indicator check:
 
@@ -358,7 +427,9 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli alpha-run-snapshot configs/universes/swing_kor_core.json examples/alpha/price_above_sma_alpha.py --sleeve-id swing-kor --min-success 2 --rate-limit-per-second 20 --summary-only
 ```
 
-Alpha Models are normal Python files. A module can expose `create_alpha_model()`, `ALPHA_MODEL`, or a module-level `generate(context)` function. Alpha reads `SnapshotContext`, emits `Insight` records, and never creates orders directly.
+Alpha Models are normal Python files. A module can expose `create_alpha_model()`, `ALPHA_MODEL`, or a module-level `generate(context)` function. Alpha reads `SnapshotContext`, emits `Insight` records, and never creates orders directly. Daily/swing modules may declare `EVALUATION_CADENCE = "once_per_day"` and `INPUT_RESOLUTION = "daily"` so minute-level framework cycles do not regenerate the same thesis every minute.
+
+For the full model contract, including selection-to-alpha input wiring, see [docs/model-authoring-guide.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/model-authoring-guide.md).
 
 Example alpha modules:
 
@@ -384,7 +455,7 @@ IndicatorSnapshot
   -> OrderIntent
 ```
 
-This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights and the sleeve's virtual account portfolio, creates auditable `PortfolioTargetBatch` records, and emits allocation plans that explain target percent and desired value. `OrderSizingEngine` then converts those allocation plans into integer quantity targets, records rounding loss, and applies `RebalancePolicy` support for cash reserve, minimum quantity delta, and minimum order notional filters. Portfolio construction can flatten held symbols when their active insight becomes inactive. Risk runs every cycle, even when alpha emits no new insight. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
+This path is implemented by `FrameworkRunner`. Portfolio construction reads active insights and the sleeve's virtual account portfolio, creates auditable `PortfolioTargetBatch` records, and emits allocation targets that explain target percent and desired value. `OrderSizingEngine` then converts those allocation targets into integer quantity targets from the current portfolio, current price, current cash/equity, and `RebalancePolicy`, records rounding loss, and applies cash reserve, minimum quantity delta, and minimum order notional filters. If portfolio cadence is not due, the runner reuses the last allocation targets, but sizing, risk, and execution still run every cycle. Portfolio construction can flatten held symbols when their active insight becomes inactive on a due rebalance. Urgent exits should live in always-on risk or quote-resolution exit models. The configured runtime bootstrap now runs this framework path immediately after the active indicator snapshot is published.
 
 Portfolio Construction Models can be injected as Python model modules, similar to Alpha Models:
 
@@ -399,7 +470,8 @@ Portfolio Construction Models can be injected as Python model modules, similar t
     "rebalance": {
       "cash_reserve_pct": 0.0,
       "min_order_notional": 0.0,
-      "min_quantity_delta": 1
+      "min_quantity_delta": 1,
+      "cadence": "once_per_day"
     }
   }
 }
@@ -555,7 +627,7 @@ For mixed overseas exchanges, universe symbols may include metadata:
 }
 ```
 
-`live-indicators-once` collects quote bars through the local `market-data-engine`, closes a `MarketDataSnapshot`, updates `IndicatorEngine`, and publishes an `IndicatorSnapshot`. Symbol failures are reported instead of killing the entire snapshot when `--min-success` is satisfied. The default live quote pace comes from `MARKET_DATA_ENGINE_RATE_LIMIT_PER_SECOND` and can be overridden per run with `--rate-limit-per-second`; the KIS-backed adapter clamps this to 20/s.
+`live-indicators-once` collects quote bars through the in-process KIS adapter boundary, closes a `MarketDataSnapshot`, updates `IndicatorEngine`, and publishes an `IndicatorSnapshot`. Symbol failures are reported instead of killing the entire snapshot when `--min-success` is satisfied. The default live quote pace comes from `MARKET_DATA_ENGINE_RATE_LIMIT_PER_SECOND` and can be overridden per run with `--rate-limit-per-second`; the KIS-backed adapter clamps this to 20/s.
 Useful log events include `market_data_snapshot.collect.start`, `market_data_snapshot.collect.symbol_failed`, `market_data_snapshot.collect.complete`, `indicator_snapshot.publish`, and `live_indicator_snapshot.complete`.
 Worker runs also emit `background_snapshot_worker.warmup.complete` and `background_snapshot_worker.cycle.complete`.
 Alpha runs emit `alpha_runtime.model.complete` and `alpha_runtime.batch.publish`.

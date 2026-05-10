@@ -130,6 +130,7 @@ class ActiveUniverseRuntimeConfig:
     selection_model: ModuleReference = field(
         default_factory=lambda: ModuleReference("leaps_quant_engine.universe.selection:StaticUniverseSelectionModel")
     )
+    selection_models: tuple[ModuleReference, ...] = ()
 
     def __post_init__(self) -> None:
         if self.max_symbols < 0:
@@ -139,6 +140,7 @@ class ActiveUniverseRuntimeConfig:
         return {
             "max_symbols": self.max_symbols,
             "selection_model": self.selection_model.to_dict(),
+            "selection_models": [model.to_dict() for model in self.selection_models],
         }
 
 
@@ -181,9 +183,23 @@ class IndicatorRuntimeConfig:
 @dataclass(frozen=True, slots=True)
 class AlphaRuntimeConfig:
     modules: tuple[ModuleReference, ...] = ()
+    input_selections: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        selections: dict[str, str] = {}
+        for alpha_id, selection_id in dict(self.input_selections).items():
+            alpha_key = str(alpha_id).strip()
+            selection_key = str(selection_id).strip()
+            if not alpha_key or not selection_key:
+                raise ConfigurationValidationError("alpha.input_selections keys and values cannot be empty.")
+            selections[alpha_key] = selection_key
+        object.__setattr__(self, "input_selections", MappingProxyType(selections))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"modules": [module.to_dict() for module in self.modules]}
+        return {
+            "modules": [module.to_dict() for module in self.modules],
+            "input_selections": dict(self.input_selections),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +208,7 @@ class RebalancePolicyRuntimeConfig:
     min_order_notional: float = 0.0
     min_quantity_delta: int = 1
     allow_exit_below_min_notional: bool = True
+    cadence: str = "every_cycle"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.cash_reserve_pct < 1.0:
@@ -199,6 +216,8 @@ class RebalancePolicyRuntimeConfig:
         _validate_non_negative("portfolio.rebalance.min_order_notional", self.min_order_notional)
         if self.min_quantity_delta < 0:
             raise ConfigurationValidationError("portfolio.rebalance.min_quantity_delta must be non-negative.")
+        if not self.cadence.strip():
+            raise ConfigurationValidationError("portfolio.rebalance.cadence cannot be empty.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -206,6 +225,7 @@ class RebalancePolicyRuntimeConfig:
             "min_order_notional": self.min_order_notional,
             "min_quantity_delta": self.min_quantity_delta,
             "allow_exit_below_min_notional": self.allow_exit_below_min_notional,
+            "cadence": self.cadence,
         }
 
 
@@ -535,6 +555,10 @@ def _parse_active_universe_runtime_config(payload: Mapping[str, Any]) -> ActiveU
         selection_model=_parse_module_reference(
             payload.get("selection_model", "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel")
         ),
+        selection_models=tuple(
+            _parse_module_reference(item)
+            for item in _list(payload.get("selection_models"), default=[])
+        ),
     )
 
 
@@ -553,8 +577,22 @@ def _parse_alpha_runtime_config(payload: Mapping[str, Any]) -> AlphaRuntimeConfi
             module
             for module in (_parse_optional_module_reference(item) for item in _list(payload.get("modules"), default=[]))
             if module is not None
-        )
+        ),
+        input_selections=_parse_alpha_input_selections(
+            payload.get("input_selections", payload.get("selection_by_alpha"))
+        ),
     )
+
+
+def _parse_alpha_input_selections(payload: Any) -> dict[str, str]:
+    if payload is None:
+        return {}
+    if not isinstance(payload, Mapping):
+        raise ConfigurationValidationError("alpha.input_selections must be an object.")
+    return {
+        str(alpha_id).strip(): str(selection_id).strip()
+        for alpha_id, selection_id in payload.items()
+    }
 
 
 def _parse_portfolio_runtime_config(payload: Mapping[str, Any]) -> PortfolioRuntimeConfig:
@@ -589,6 +627,7 @@ def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> Rebala
         min_order_notional=float(payload.get("min_order_notional", 0.0)),
         min_quantity_delta=int(payload.get("min_quantity_delta", 1)),
         allow_exit_below_min_notional=bool(payload.get("allow_exit_below_min_notional", True)),
+        cadence=str(payload.get("cadence", "every_cycle")).strip(),
     )
 
 

@@ -5,8 +5,9 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Protocol
 
-from leaps_quant_engine.models import OrderSide
+from leaps_quant_engine.models import OrderSide, OrderType, TimeInForce
 from leaps_quant_engine.orders import OrderEvent, OrderEventType, OrderTicket, OrderTicketStatus
+from leaps_quant_engine.market_rules import round_krx_price_to_tick
 
 
 class BrokerExecutionError(RuntimeError):
@@ -352,8 +353,8 @@ def _domestic_order_arguments(
         "side": ticket.side.value,
         "symbol": ticket.symbol.ticker,
         "quantity": ticket.remaining_quantity,
-        "price": int(round(ticket.reference_price)),
-        "order_division": order_division,
+        "price": _domestic_order_price(ticket),
+        "order_division": _domestic_order_division(ticket, fallback=order_division),
         "exchange_scope": exchange_scope,
         "use_hashkey": use_hashkey,
     }
@@ -372,14 +373,38 @@ def _domestic_cancel_arguments(
     return {
         "original_branch_no": branch_no,
         "original_order_no": order_no,
-        "order_division": order_division,
+        "order_division": _domestic_order_division(ticket, fallback=order_division),
         "rvse_cncl_dvsn_cd": "02",
         "quantity": ticket.remaining_quantity,
-        "price": int(round(ticket.reference_price)),
+        "price": _domestic_order_price(ticket),
         "qty_all_ord_yn": "Y",
         "exchange_scope": exchange_scope,
         "use_hashkey": use_hashkey,
     }
+
+
+_DOMESTIC_ORDER_DIVISION_BY_STYLE = {
+    (OrderType.LIMIT, TimeInForce.DAY): "00",
+    (OrderType.MARKET, TimeInForce.DAY): "01",
+    (OrderType.LIMIT, TimeInForce.IOC): "11",
+    (OrderType.LIMIT, TimeInForce.FOK): "12",
+    (OrderType.MARKET, TimeInForce.IOC): "13",
+    (OrderType.MARKET, TimeInForce.FOK): "14",
+}
+
+
+def _domestic_order_division(ticket: OrderTicket, *, fallback: str) -> str:
+    explicit = str(ticket.metadata.get("order_division") or "").strip()
+    if explicit:
+        return explicit
+    return _DOMESTIC_ORDER_DIVISION_BY_STYLE.get((ticket.order_type, ticket.time_in_force), fallback)
+
+
+def _domestic_order_price(ticket: OrderTicket) -> int:
+    if ticket.order_type is OrderType.MARKET:
+        return 0
+    price = ticket.limit_price if ticket.limit_price is not None else ticket.reference_price
+    return round_krx_price_to_tick(price, side=ticket.side)
 
 
 def _split_broker_order_id(broker_order_id: str) -> tuple[str, str]:

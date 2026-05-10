@@ -1,0 +1,45 @@
+{
+  "id": "leaps-kr-research-core",
+  "market": "KRX",
+  "tags": [
+    "research",
+    "krw",
+    "leaps",
+    "kospi-growth"
+  ],
+  "symbols": [
+    {"ticker": "005930", "market": "KRX", "asset_type": "stock", "sector": "technology", "country": "KR"},
+    {"ticker": "000660", "market": "KRX", "asset_type": "stock", "sector": "technology", "country": "KR"},
+    {"ticker": "005380", "market": "KRX", "asset_type": "stock", "sector": "consumer_discretionary", "country": "KR"},
+    {"ticker": "000270", "market": "KRX", "asset_type": "stock", "sector": "consumer_discretionary", "country": "KR"},
+    {"ticker": "035420", "market": "KRX", "asset_type": "stock", "sector": "communication_services", "country": "KR"},
+    {"ticker": "035720", "market": "KRX", "asset_type": "stock", "sector": "communication_services", "country": "KR"},
+    {"ticker": "068270", "market": "KRX", "asset_type": "stock", "sector": "health_care", "country": "KR"},
+    {"ticker": "207940", "market": "KRX", "asset_type": "stock", "sector": "health_care", "country": "KR"},
+    {"ticker": "051910", "market": "KRX", "asset_type": "stock", "sector": "materials", "country": "KR"},
+    {"ticker": "006400", "market": "KRX", "asset_type": "stock", "sector": "technology", "country": "KR"},
+    {"ticker": "105560", "market": "KRX", "asset_type": "stock", "sector": "financials", "country": "KR"},
+    {"ticker": "055550", "market": "KRX", "asset_type": "stock", "sector": "financials", "country": "KR"},
+    {"ticker": "086790", "market": "KRX", "asset_type": "stock", "sector": "financials", "country": "KR"},
+    {"ticker": "028260", "market": "KRX", "asset_type": "stock", "sector": "industrials", "country": "KR"},
+    {"ticker": "034020", "market": "KRX", "asset_type": "stock", "sector": "industrials", "country": "KR"},
+    {"ticker": "012450", "market": "KRX", "asset_type": "stock", "sector": "industrials", "country": "KR"}
+  ],
+  "indicators": [
+    {"name": "close", "type": "close", "period": 1, "field": "close", "resolution": "daily"},
+    {"name": "identity_close", "type": "identity", "period": 1, "field": "close", "resolution": "daily"},
+    {"name": "sma_5_close", "type": "sma", "period": 5, "field": "close", "resolution": "daily"},
+    {"name": "sma_20_close", "type": "sma", "period": 20, "field": "close", "resolution": "daily"},
+    {"name": "ema_8_close", "type": "ema", "period": 8, "field": "close", "resolution": "daily"},
+    {"name": "momentum_5_close", "type": "momentum", "period": 5, "field": "close", "resolution": "daily"},
+    {"name": "roc_20_close", "type": "roc", "period": 20, "field": "close", "resolution": "daily"},
+    {"name": "rolling_max_20_close", "type": "rolling_max", "period": 20, "field": "close", "resolution": "daily"},
+    {"name": "rolling_min_20_close", "type": "rolling_min", "period": 20, "field": "close", "resolution": "daily"},
+    {"name": "stddev_20_close", "type": "stddev", "period": 20, "field": "close", "resolution": "daily"},
+    {"name": "atr_14", "type": "atr", "period": 14, "resolution": "daily"},
+    {"name": "volume", "type": "volume", "period": 1, "resolution": "daily"},
+    {"name": "rolling_volume_20", "type": "rolling_volume", "period": 20, "resolution": "daily"},
+    {"name": "rolling_dollar_volume_20", "type": "rolling_dollar_volume", "period": 20, "resolution": "daily"},
+    {"name": "vwap_20", "type": "vwap", "period": 20, "resolution": "daily"}
+  ]
+}

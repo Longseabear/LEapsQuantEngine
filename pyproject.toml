@@ -18,6 +18,11 @@ leapsq = "leaps_quant_engine.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+rl = [
+  "gymnasium>=0.29",
+  "stable-baselines3>=2.5",
+]
+market-data = ["yfinance>=0.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

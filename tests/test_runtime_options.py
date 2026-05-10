@@ -93,7 +93,9 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.universe.active.selection_model == ModuleReference(
         "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"
     )
+    assert sleeve.universe.active.selection_models == ()
     assert sleeve.alpha.modules == (ModuleReference("examples/alpha/price_above_sma_alpha.py"),)
+    assert dict(sleeve.alpha.input_selections) == {}
     assert sleeve.portfolio.model == ModuleReference("examples/portfolio_models/equal_weight.py")
     assert dict(sleeve.portfolio.parameters) == {"max_portfolio_pct": 0.8}
     assert sleeve.portfolio.account_store_path == Path("data/virtual-accounts/live-us-main.json")
@@ -102,6 +104,31 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.portfolio.rebalance.min_quantity_delta == 2
     assert sleeve.worker.cycle_interval_seconds == 60
     assert sleeve.indicators.min_ready_ratio == 0.9
+
+
+def test_runtime_config_can_wire_selection_results_to_alpha_inputs():
+    payload = _runtime_payload()
+    payload["sleeves"][0]["universe"]["active"]["selection_models"] = [
+        "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+        "leaps_quant_engine.universe.selection:MomentumUniverseSelectionModel",
+    ]
+    payload["sleeves"][0]["alpha"]["input_selections"] = {
+        "momentum-alpha": "static-top-n",
+        "etf-rotation": "momentum-active-selection",
+    }
+
+    config = parse_runtime_config(payload)
+    sleeve = config.sleeve("us-live")
+
+    assert sleeve.universe.active.selection_models == (
+        ModuleReference("leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"),
+        ModuleReference("leaps_quant_engine.universe.selection:MomentumUniverseSelectionModel"),
+    )
+    assert dict(sleeve.alpha.input_selections) == {
+        "momentum-alpha": "static-top-n",
+        "etf-rotation": "momentum-active-selection",
+    }
+    assert config.to_dict()["sleeves"][0]["alpha"]["input_selections"]["momentum-alpha"] == "static-top-n"
 
 
 def test_runtime_config_routes_sleeves_to_broker_account_profiles():
@@ -211,6 +238,30 @@ def test_runtime_config_snapshot_hashes_loaded_file(tmp_path):
     assert snapshot.version.startswith("sha256:")
     assert snapshot.config.sleeve("us-live").worker.min_success == 2
     assert snapshot.to_dict()["config"]["runtime_id"] == "live-us-main"
+
+
+def test_us_etf_rotation_sample_config_is_usd_etf_only():
+    root = Path(__file__).resolve().parents[1]
+    snapshot = load_runtime_config_snapshot(root / "configs" / "runtime" / "us_etf_rotation_sleeve.json")
+    sleeve = snapshot.config.sleeve("us_etf_rotation")
+    universe_payload = json.loads((root / sleeve.universe.coarse_path).read_text(encoding="utf-8"))
+
+    assert snapshot.config.runtime_id == "us_etf_rotation"
+    assert sleeve.workspace_path == Path("sleeves/us_etf_rotation")
+    assert sleeve.broker_account_id == "kis-overseas"
+    assert dict(sleeve.cash_by_currency) == {"USD": 3434.25}
+    assert sleeve.universe.coarse_path == Path("configs/universes/us_etf_rotation_core.json")
+    assert [module.ref for module in sleeve.alpha.modules] == [
+        "alphas/etf_rotation.py",
+        "alphas/volatility_trailing_stop.py",
+    ]
+    assert sleeve.portfolio.model == ModuleReference("portfolios/rl_ppo_constructor.py")
+    assert dict(sleeve.portfolio.parameters)["allocation_mode"] == "rl_weights"
+    assert dict(sleeve.portfolio.parameters)["policy_path"] is None
+    assert dict(sleeve.portfolio.parameters)["top_k"] == 8
+    assert dict(sleeve.alpha.input_selections)["us_etf_rotation"] == "us_etf_rotation"
+    assert universe_payload["id"] == "us-etf-rotation-core"
+    assert all(symbol["asset_type"] == "etf" and symbol["is_etf"] is True for symbol in universe_payload["symbols"])
 
 
 def test_control_queue_drains_commands_in_order():

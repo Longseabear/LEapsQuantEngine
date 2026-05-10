@@ -51,5 +51,6 @@ def _parse_indicator_definition(payload: dict[str, Any]) -> IndicatorDefinition:
         type=str(payload["type"]).strip(),
         period=int(payload["period"]),
         field=str(payload.get("field", "close")).strip() or "close",
+        resolution=str(payload.get("resolution", "any")).strip().lower() or "any",
         parameters=dict(payload.get("parameters") or {}),
     )

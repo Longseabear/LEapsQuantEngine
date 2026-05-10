@@ -3,11 +3,12 @@ from datetime import datetime
 from leaps_quant_engine.models import Symbol
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
 from leaps_quant_engine.universe.loader import parse_universe_definition
-from leaps_quant_engine.universe.runtime import UniverseSelectionRuntime
+from leaps_quant_engine.universe.runtime import CompositeUniverseSelectionRuntime, UniverseSelectionRuntime
 from leaps_quant_engine.universe.selection import (
     MomentumUniverseSelectionModel,
     StaticUniverseSelectionModel,
     UniverseSelectionContext,
+    build_universe_selection_result,
 )
 
 
@@ -152,3 +153,61 @@ def test_universe_selection_runtime_returns_active_universe_definition_with_forc
         Symbol("000002", "KRX"),
         Symbol("000004", "KRX"),
     )
+
+
+class FixedSelectionModel:
+    def __init__(self, selection_id, symbols):
+        self.selection_id = selection_id
+        self.symbols = symbols
+
+    def select(self, context):
+        return build_universe_selection_result(
+            context,
+            tuple(self.symbols),
+            selection_id=self.selection_id,
+            candidates={},
+            rejected={},
+        )
+
+
+def test_composite_universe_selection_runtime_unions_models_and_preserves_inputs():
+    universe = _universe()
+    runtime = CompositeUniverseSelectionRuntime(
+        coarse_universe=universe,
+        selection_models=(
+            FixedSelectionModel("stock-momentum-top-2", (Symbol("000001", "KRX"), Symbol("000002", "KRX"))),
+            FixedSelectionModel("etf-rotation-top-2", (Symbol("000002", "KRX"), Symbol("000003", "KRX"))),
+        ),
+    )
+
+    result = runtime.select_active(
+        sleeve_id="swing-kor",
+        previous_live_symbols=(Symbol("000001", "KRX"), Symbol("999999", "KRX")),
+        held_symbols=(Symbol("000004", "KRX"),),
+        active_universe_id="live-union",
+    )
+
+    assert result.active_universe.id == "live-union"
+    assert result.selection.selected_symbols == (
+        Symbol("000001", "KRX"),
+        Symbol("000002", "KRX"),
+        Symbol("000003", "KRX"),
+    )
+    assert result.selection.live_symbols == (
+        Symbol("000001", "KRX"),
+        Symbol("000002", "KRX"),
+        Symbol("000003", "KRX"),
+        Symbol("000004", "KRX"),
+    )
+    assert result.selection.symbols_for_selection("stock-momentum-top-2") == (
+        Symbol("000001", "KRX"),
+        Symbol("000002", "KRX"),
+    )
+    assert result.selection.symbols_for_selection("etf-rotation-top-2") == (
+        Symbol("000002", "KRX"),
+        Symbol("000003", "KRX"),
+    )
+    assert result.selection.removed_symbols == (Symbol("999999", "KRX"),)
+    report = result.selection.to_dict(include_candidates=False)
+    assert report["selection_ids"] == ["stock-momentum-top-2", "etf-rotation-top-2"]
+    assert report["selections"]["stock-momentum-top-2"]["selected_symbols"] == ["KRX:000001", "KRX:000002"]

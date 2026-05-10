@@ -21,7 +21,7 @@ The engine should stay LEAN-like at the strategy boundary, but sleeve-aware at e
 
 - `models.py`: common immutable-ish domain records such as `Symbol`, `Bar`, `DataSlice`, `PortfolioTarget`, and `OrderIntent`.
 - `market_data.py`: provider protocol for normalized bars.
-- `adapters/`: provider adapters, including KIS/broker-engine and FinanceDataReader history.
+- `adapters/`: provider adapters, including in-process KIS, compatibility broker/market-data clients, and FinanceDataReader history.
 - `universe/`: coarse/fine/active universe selection and forced live-universe invariants.
 - `indicators/`: LEAN-like indicator objects and sleeve-namespaced indicator runtime.
 - `snapshots/`: immutable `IndicatorSnapshot` records and snapshot quality/freshness policy.
@@ -38,11 +38,11 @@ The engine should stay LEAN-like at the strategy boundary, but sleeve-aware at e
 - `order_submit.py`: guarded conversion from submit-ready `OrderIntentBatch` artifacts into order tickets and broker submit events.
 - `order_supervisor.py`: bounded poll/reconcile/status operation for order runtime maintenance.
 - `order_worker.py`: open-ticket polling and execution-history reconciliation workers.
-- `brokerage.py`: broker gateway boundary for paper execution and local broker-engine command submission.
+- `brokerage.py`: broker gateway boundary for paper execution and KIS/broker command submission.
 - `portfolio.py`: sleeve portfolio state and fill-event application.
 - `portfolio_state.py`: agent-readable portfolio engine state snapshots.
 - `virtual_account.py`: file-backed virtual sleeve account source of truth for live/paper ownership.
-- `account_sync.py`: read-only KIS/broker-engine account sync into the virtual account ledger.
+- `account_sync.py`: read-only KIS account sync into the virtual account ledger.
 - `runtime_config.py`: validated config snapshot schema, including broker account profiles and sleeve-to-account routing.
 - `runtime_bootstrap.py`: converts config snapshots into executable sleeve runtimes.
 - `control.py`: explicit runtime reload/control commands.

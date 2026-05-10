@@ -13,6 +13,7 @@ class IndicatorDefinition:
     period: int
     field: str = "close"
     parameters: dict[str, Any] | None = None
+    resolution: str = "any"
 
 
 @dataclass(frozen=True, slots=True)

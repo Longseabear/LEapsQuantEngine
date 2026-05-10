@@ -7,9 +7,11 @@ import inspect
 import json
 import logging
 from pathlib import Path
+import sys
 from types import ModuleType
 from typing import Any, Callable
 
+from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
 from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketDataEngineLiveQuoteProvider
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader
 from leaps_quant_engine.execution import ExecutionEngine
@@ -22,20 +24,21 @@ from leaps_quant_engine.framework import (
     PythonRiskManagementModelLoader,
     RebalancePolicy,
 )
+from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
 from leaps_quant_engine.portfolio_state import PortfolioEngineState
-from leaps_quant_engine.runtime_config import ModuleReference, RuntimeConfigSnapshot, SleeveRuntimeConfig
+from leaps_quant_engine.runtime_config import ActiveUniverseRuntimeConfig, ModuleReference, RuntimeConfigSnapshot, SleeveRuntimeConfig
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker, SnapshotWorkerRunReport
-from leaps_quant_engine.snapshots import IndicatorSnapshot
+from leaps_quant_engine.snapshots import IndicatorSnapshot, SnapshotQualityReport, SnapshotQualityStatus
 from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.universe.fine import FineUniverseRefreshReport, FineUniverseRuntime
 from leaps_quant_engine.universe.loader import load_universe_definition
-from leaps_quant_engine.universe.runtime import ActiveUniverseResult, UniverseSelectionRuntime
+from leaps_quant_engine.universe.runtime import ActiveUniverseResult, CompositeUniverseSelectionRuntime, UniverseSelectionRuntime
 from leaps_quant_engine.universe.selection import UniverseSelectionModel
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
-from leaps_quant_engine.warmup import WarmupPolicy
+from leaps_quant_engine.warmup import WarmupPolicy, WarmupReport, run_daily_indicator_warmup
 
 
 class RuntimeBootstrapError(RuntimeError):
@@ -73,6 +76,7 @@ class RuntimeSleeveRuntime:
     sleeve_config: SleeveRuntimeConfig
     coarse_universe: UniverseDefinition
     selection_model: UniverseSelectionModel
+    selection_models: tuple[UniverseSelectionModel, ...]
     live_provider: MarketDataProvider
     history_provider: MarketDataProvider
     alpha_runtime: AlphaRuntime
@@ -81,6 +85,8 @@ class RuntimeSleeveRuntime:
     portfolio: Portfolio
     worker: BackgroundSnapshotWorker
     active_result: ActiveUniverseResult
+    selection_warmup_report: WarmupReport | None = None
+    selection_indicator_snapshot: IndicatorSnapshot | None = None
     fine_runtime: FineUniverseRuntime | None = None
     fine_refresh_report: FineUniverseRefreshReport | None = None
     _pending_reload: RuntimeSleeveRuntime | None = field(default=None, init=False, repr=False)
@@ -113,6 +119,7 @@ class RuntimeSleeveRuntime:
             active_universe_id=self.active_result.active_universe.id,
             fine_refresh_report=self.fine_refresh_report,
             active_result=self.active_result,
+            selection_warmup_report=self.selection_warmup_report,
             worker=run_report,
             framework=framework_result,
             portfolio_state=portfolio_state,
@@ -168,6 +175,7 @@ class RuntimeSleeveRuntime:
         self.sleeve_config = pending.sleeve_config
         self.coarse_universe = pending.coarse_universe
         self.selection_model = pending.selection_model
+        self.selection_models = pending.selection_models
         self.live_provider = pending.live_provider
         self.history_provider = pending.history_provider
         self.alpha_runtime = pending.alpha_runtime
@@ -176,6 +184,8 @@ class RuntimeSleeveRuntime:
         self.portfolio = pending.portfolio
         self.worker = pending.worker
         self.active_result = pending.active_result
+        self.selection_warmup_report = pending.selection_warmup_report
+        self.selection_indicator_snapshot = pending.selection_indicator_snapshot
         self.fine_runtime = pending.fine_runtime
         self.fine_refresh_report = pending.fine_refresh_report
         self._pending_reload = None
@@ -197,6 +207,7 @@ class RuntimeSleeveRuntime:
             indicator_snapshot=active_snapshot,
             data=_data_slice_from_indicator_snapshot(active_snapshot),
             portfolio=self.portfolio_provider.current_portfolio(self.sleeve_id),
+            alpha_symbols_by_model=pending._alpha_symbols_by_model(),
         )
 
     def _run_framework_once(self) -> FrameworkCycleResult | None:
@@ -210,7 +221,16 @@ class RuntimeSleeveRuntime:
             indicator_snapshot=active_snapshot,
             data=data,
             portfolio=self.portfolio,
+            alpha_symbols_by_model=self._alpha_symbols_by_model(),
         )
+
+    def _alpha_symbols_by_model(self) -> dict[str, tuple[Symbol, ...]] | None:
+        if not self.sleeve_config.alpha.input_selections:
+            return None
+        return {
+            alpha_id: _selection_symbols_for(self.active_result, selection_id)
+            for alpha_id, selection_id in self.sleeve_config.alpha.input_selections.items()
+        }
 
     def _portfolio_engine_state(self, framework: FrameworkCycleResult | None) -> PortfolioEngineState | None:
         if framework is None:
@@ -234,7 +254,18 @@ class RuntimeSleeveRuntime:
             active_snapshot_store = self.worker.stores_by_sleeve.get(self.sleeve_id)
             active_snapshot = active_snapshot_store.active() if active_snapshot_store is not None else None
             data = _data_slice_from_indicator_snapshot(active_snapshot) if active_snapshot is not None else None
-        portfolio_equity = self.portfolio.equity(data) if data is not None else self.portfolio.cash
+        if data is not None:
+            portfolio_equity_by_currency = self.portfolio.equity_by_currency(
+                data,
+                self.portfolio.currencies(data),
+            )
+        else:
+            portfolio_equity_by_currency = dict(self.portfolio.cash_by_currency)
+        portfolio_equity = (
+            next(iter(portfolio_equity_by_currency.values()))
+            if len(portfolio_equity_by_currency) == 1
+            else 0.0
+        )
         return {
             "event": "engine_status",
             "runtime_id": self.runtime_id,
@@ -253,7 +284,9 @@ class RuntimeSleeveRuntime:
             },
             "portfolio": {
                 "cash": self.portfolio.cash,
+                "cash_by_currency": dict(self.portfolio.cash_by_currency),
                 "equity": portfolio_equity,
+                "equity_by_currency": portfolio_equity_by_currency,
                 "held_symbol_count": len(self.portfolio.held_symbols),
                 "held_symbols": [symbol.key for symbol in self.portfolio.held_symbols],
             },
@@ -287,6 +320,7 @@ class RuntimeRunOnceReport:
     active_universe_id: str
     fine_refresh_report: FineUniverseRefreshReport | None
     active_result: ActiveUniverseResult
+    selection_warmup_report: WarmupReport | None
     worker: SnapshotWorkerRunReport
     framework: FrameworkCycleResult | None = None
     portfolio_state: PortfolioEngineState | None = None
@@ -306,6 +340,9 @@ class RuntimeRunOnceReport:
             "coarse_universe_id": self.coarse_universe_id,
             "fine_refresh": self.fine_refresh_report.to_dict(include_failures=include_failures)
             if self.fine_refresh_report is not None
+            else None,
+            "selection_warmup": self.selection_warmup_report.to_dict(include_symbols=include_warmup_symbols)
+            if self.selection_warmup_report is not None
             else None,
             "active_universe_id": self.active_universe_id,
             "selection": self.active_result.selection.to_dict(include_candidates=include_candidates),
@@ -355,6 +392,7 @@ def bootstrap_sleeve_runtime(
     open_order_symbols: tuple[Symbol, ...] = (),
     exit_watch_symbols: tuple[Symbol, ...] = (),
     manual_symbols: tuple[Symbol, ...] = (),
+    preselect_warmup: bool | None = None,
 ) -> RuntimeSleeveRuntime:
     deps = dependencies or RuntimeBootstrapDependencies()
     sleeve_config = _resolve_sleeve_config(snapshot, sleeve_id)
@@ -368,11 +406,20 @@ def bootstrap_sleeve_runtime(
     portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
     risk_model = _build_risk_model(snapshot, sleeve_config, deps.risk_model_loader)
     execution_engine = _build_execution_engine(snapshot, sleeve_config, deps.execution_model_loader)
-    selection_model = _build_selection_model(sleeve_config.universe.active.selection_model, sleeve_config, snapshot)
+    selection_models = _build_selection_models(sleeve_config.universe.active, sleeve_config, snapshot)
+    selection_model = selection_models[0]
 
     selection_base_universe = coarse_universe
     fine_runtime = None
     fine_refresh_report = None
+    warmup_policy = WarmupPolicy(
+        extra_bars=sleeve_config.indicators.extra_bars,
+        min_ready_ratio=sleeve_config.indicators.min_ready_ratio,
+    )
+    should_preselect_warmup = sleeve_config.indicators.warmup_enabled if preselect_warmup is None else preselect_warmup
+    indicator_engine = IndicatorEngine()
+    selection_warmup_report = None
+    selection_indicator_snapshot = None
     portfolio_provider = deps.portfolio_provider or _build_portfolio_provider(snapshot, sleeve_config)
     portfolio = portfolio_provider.current_portfolio(sleeve_config.sleeve_id)
     framework_runner = FrameworkRunner(
@@ -398,12 +445,38 @@ def bootstrap_sleeve_runtime(
                 universe_id=f"{coarse_universe.id}-fine",
             )
 
-    selection_runtime = UniverseSelectionRuntime(
-        coarse_universe=selection_base_universe,
-        selection_model=selection_model,
-    )
+    if should_preselect_warmup:
+        warmup_result = run_daily_indicator_warmup(
+            selection_base_universe,
+            history_provider,
+            sleeve_id=sleeve_config.sleeve_id,
+            refresh_history=sleeve_config.indicators.refresh_history,
+            source=snapshot.config.market_data.history_source,
+            policy=warmup_policy,
+            indicator_engine=indicator_engine,
+        )
+        selection_warmup_report = warmup_result.report
+        selection_indicator_snapshot = warmup_result.indicator_engine.snapshot(
+            sleeve_config.sleeve_id,
+            universe_id=selection_base_universe.id,
+            source_snapshot_id=f"warmup:{selection_base_universe.id}",
+            quality_report=_snapshot_quality_from_warmup(selection_warmup_report),
+        )
+
+    if len(selection_models) == 1:
+        selection_runtime = UniverseSelectionRuntime(
+            coarse_universe=selection_base_universe,
+            selection_model=selection_model,
+        )
+    else:
+        selection_runtime = CompositeUniverseSelectionRuntime(
+            coarse_universe=selection_base_universe,
+            selection_models=selection_models,
+        )
     active_result = selection_runtime.select_active(
         sleeve_id=sleeve_config.sleeve_id,
+        indicator_snapshot=selection_indicator_snapshot,
+        as_of=selection_indicator_snapshot.as_of if selection_indicator_snapshot is not None else None,
         previous_live_symbols=previous_live_symbols,
         held_symbols=held_symbols,
         open_order_symbols=open_order_symbols,
@@ -411,6 +484,8 @@ def bootstrap_sleeve_runtime(
         manual_symbols=manual_symbols,
         active_universe_id=f"{selection_base_universe.id}-active",
     )
+    if should_preselect_warmup:
+        indicator_engine.set_active_universe(sleeve_config.sleeve_id, active_result.active_universe)
     worker = BackgroundSnapshotWorker(
         universe=active_result.active_universe,
         sleeve_id=sleeve_config.sleeve_id,
@@ -420,16 +495,16 @@ def bootstrap_sleeve_runtime(
         history_source=snapshot.config.market_data.history_source,
         min_success=sleeve_config.worker.min_success,
         interval_seconds=sleeve_config.worker.cycle_interval_seconds,
-        warmup_policy=WarmupPolicy(
-            extra_bars=sleeve_config.indicators.extra_bars,
-            min_ready_ratio=sleeve_config.indicators.min_ready_ratio,
-        ),
+        indicator_engine=indicator_engine,
+        warmup_policy=warmup_policy,
+        entry_block_reasons=_warmup_entry_block_reasons(selection_warmup_report),
     )
     return RuntimeSleeveRuntime(
         snapshot=snapshot,
         sleeve_config=sleeve_config,
         coarse_universe=coarse_universe,
         selection_model=selection_model,
+        selection_models=selection_models,
         live_provider=live_provider,
         history_provider=history_provider,
         alpha_runtime=alpha_runtime,
@@ -439,6 +514,8 @@ def bootstrap_sleeve_runtime(
         fine_runtime=fine_runtime,
         fine_refresh_report=fine_refresh_report,
         active_result=active_result,
+        selection_warmup_report=selection_warmup_report,
+        selection_indicator_snapshot=selection_indicator_snapshot,
         worker=worker,
     )
 
@@ -478,6 +555,7 @@ def _build_portfolio_engine(
             min_order_notional=rebalance_config.min_order_notional,
             min_quantity_delta=rebalance_config.min_quantity_delta,
             allow_exit_below_min_notional=rebalance_config.allow_exit_below_min_notional,
+            cadence=rebalance_config.cadence,
         ),
     )
 
@@ -503,6 +581,25 @@ def _build_execution_engine(
     return ExecutionEngine(model=model)
 
 
+def _warmup_entry_block_reasons(report: WarmupReport | None) -> tuple[str, ...]:
+    if report is None or report.is_ready:
+        return ()
+    return ("warmup_not_ready",)
+
+
+def _snapshot_quality_from_warmup(report: WarmupReport) -> SnapshotQualityReport:
+    return SnapshotQualityReport(
+        status=SnapshotQualityStatus.FRESH if report.is_ready else SnapshotQualityStatus.DEGRADED,
+        complete_ratio=report.ready_ratio,
+        age_seconds=0.0,
+        collection_seconds=max(report.total_elapsed_ms / 1000.0, 0.0),
+        requested_symbol_count=report.requested_symbol_count,
+        collected_symbol_count=report.ready_symbol_count,
+        failed_symbol_count=report.failed_symbol_count,
+        reasons=() if report.is_ready else ("warmup_not_ready",),
+    )
+
+
 def _build_portfolio_provider(
     snapshot: RuntimeConfigSnapshot,
     sleeve_config: SleeveRuntimeConfig,
@@ -523,9 +620,17 @@ def _build_portfolio_provider(
         sleeve.sleeve_id: float(dict(getattr(sleeve, "cash_by_currency", {}) or {}).get(default_currency, sleeve.cash))
         for sleeve in snapshot.config.sleeves
     }
+    default_cash_by_currency_by_sleeve = {
+        sleeve.sleeve_id: {
+            str(currency).strip().upper(): float(amount)
+            for currency, amount in dict(getattr(sleeve, "cash_by_currency", {}) or {}).items()
+        }
+        for sleeve in snapshot.config.sleeves
+    }
     return VirtualSleeveAccountStore(
         resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
         default_cash_by_sleeve=default_cash_by_sleeve,
+        default_cash_by_currency_by_sleeve=default_cash_by_currency_by_sleeve,
         default_currency=default_currency,
     )
 
@@ -552,6 +657,15 @@ def _build_selection_model(
     return _validate_selection_model(loaded(**kwargs))
 
 
+def _build_selection_models(
+    active_config: ActiveUniverseRuntimeConfig,
+    sleeve_config: SleeveRuntimeConfig,
+    snapshot: RuntimeConfigSnapshot | None = None,
+) -> tuple[UniverseSelectionModel, ...]:
+    references = active_config.selection_models or (active_config.selection_model,)
+    return tuple(_build_selection_model(reference, sleeve_config, snapshot) for reference in references)
+
+
 def _validate_selection_model(model: Any) -> UniverseSelectionModel:
     if not callable(getattr(model, "select", None)):
         raise RuntimeBootstrapError("Selection model must provide select(context).")
@@ -560,11 +674,22 @@ def _validate_selection_model(model: Any) -> UniverseSelectionModel:
     return model
 
 
+def _selection_symbols_for(active_result: ActiveUniverseResult, selection_id: str) -> tuple[Symbol, ...]:
+    selection = active_result.selection
+    if hasattr(selection, "selections") and hasattr(selection, "symbols_for_selection"):
+        if selection_id not in selection.selections:
+            raise RuntimeBootstrapError(f"Unknown alpha input selection_id: {selection_id}")
+        return selection.symbols_for_selection(selection_id)
+    if getattr(selection, "selection_id", None) == selection_id:
+        return selection.selected_symbols
+    raise RuntimeBootstrapError(f"Unknown alpha input selection_id: {selection_id}")
+
+
 def _load_reference(reference: ModuleReference) -> Any:
     text = reference.ref
     if ":" not in text:
         raise RuntimeBootstrapError(f"Module reference must use module:object format: {text}")
-    module_name, object_name = text.split(":", 1)
+    module_name, object_name = text.rsplit(":", 1)
     module = _load_module(module_name)
     value = module
     for part in object_name.split("."):
@@ -580,6 +705,7 @@ def _load_module(module_name_or_path: str) -> ModuleType:
         if spec is None or spec.loader is None:
             raise RuntimeBootstrapError(f"Cannot load module from {resolved}")
         module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
     return import_module(module_name_or_path)
@@ -590,6 +716,11 @@ def _resolve_model_reference(snapshot: RuntimeConfigSnapshot, sleeve_config: Sle
 
 
 def _resolve_module_reference(snapshot: RuntimeConfigSnapshot, sleeve_config: SleeveRuntimeConfig, ref: str) -> str:
+    if ":" in ref:
+        module_ref, object_ref = ref.rsplit(":", 1)
+        module_path = Path(module_ref)
+        if module_path.suffix == ".py" or module_path.exists():
+            return f"{_resolve_sleeve_path(snapshot, sleeve_config, module_path)}:{object_ref}"
     path = Path(ref)
     if path.suffix == ".py" or path.exists():
         return str(_resolve_sleeve_path(snapshot, sleeve_config, path))
@@ -661,7 +792,37 @@ def _default_live_provider_factory(
 
 
 def _default_history_provider_factory() -> MarketDataProvider:
-    return KISCachedMarketDataProvider.from_env()
+    return _FallbackHistoryProvider(
+        primary=KISCachedMarketDataProvider.from_env(),
+        fallback=FinanceDataReaderMarketDataProvider(),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _FallbackHistoryProvider(MarketDataProvider):
+    primary: MarketDataProvider
+    fallback: MarketDataProvider
+
+    def get_latest_bar(self, symbol: Symbol) -> Bar:
+        try:
+            return self.primary.get_latest_bar(symbol)
+        except Exception:  # noqa: BLE001 - runtime warmup should degrade to deterministic public history.
+            return self.fallback.get_latest_bar(symbol)
+
+    def get_history(
+        self,
+        symbol: Symbol,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[Bar]:
+        try:
+            bars = self.primary.get_history(symbol, start=start, end=end)
+        except Exception:  # noqa: BLE001 - provider failures are surfaced by warmup if fallback also fails.
+            bars = []
+        if bars:
+            return bars
+        return self.fallback.get_history(symbol, start=start, end=end)
 
 
 def _exchange_map_from_universe(universe: UniverseDefinition) -> dict[str, str]:

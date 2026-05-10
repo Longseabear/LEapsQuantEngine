@@ -25,7 +25,29 @@ class IndicatorEngine:
             active_symbols.add(symbol.key)
             self.sleeves_by_symbol.setdefault(symbol.key, set()).add(sleeve_id)
             for definition in universe.indicators:
-                registry.add(symbol, create_indicator(definition))
+                indicator = create_indicator(definition)
+                if indicator.name not in registry.indicators_for(symbol):
+                    registry.add(symbol, indicator, resolution=definition.resolution)
+
+    def set_active_universe(self, sleeve_id: str, universe: UniverseDefinition) -> None:
+        registry = self.registries_by_sleeve.setdefault(sleeve_id, IndicatorRegistry())
+        previous_keys = set(self.active_symbols_by_sleeve.get(sleeve_id, set()))
+        next_keys = {symbol.key for symbol in universe.symbols}
+        for symbol in universe.symbols:
+            for definition in universe.indicators:
+                indicator = create_indicator(definition)
+                if indicator.name not in registry.indicators_for(symbol):
+                    registry.add(symbol, indicator, resolution=definition.resolution)
+        for symbol_key in previous_keys - next_keys:
+            sleeves = self.sleeves_by_symbol.get(symbol_key)
+            if sleeves is None:
+                continue
+            sleeves.discard(sleeve_id)
+            if not sleeves:
+                del self.sleeves_by_symbol[symbol_key]
+        for symbol_key in next_keys:
+            self.sleeves_by_symbol.setdefault(symbol_key, set()).add(sleeve_id)
+        self.active_symbols_by_sleeve[sleeve_id] = next_keys
 
     def warm_up(self, sleeve_id: str, bars: list[Bar]) -> None:
         registry = self._registry(sleeve_id)
@@ -122,6 +144,7 @@ class IndicatorEngine:
                     is_ready=indicator.is_ready,
                     samples=indicator.samples,
                     time=indicator.current.time if indicator.current is not None else None,
+                    resolution=registry.resolution_for(symbol, name),
                 )
         return IndicatorSnapshot(
             snapshot_id=f"indicator-{uuid4()}",

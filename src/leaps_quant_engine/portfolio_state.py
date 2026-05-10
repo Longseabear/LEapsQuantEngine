@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, Symbol
-from leaps_quant_engine.portfolio import Holding, Portfolio
+from leaps_quant_engine.portfolio import Holding, Portfolio, currency_for_symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +58,8 @@ class PortfolioSnapshot:
     equity: float
     gross_exposure: float
     net_exposure: float
+    cash_by_currency: dict[str, float] = field(default_factory=dict)
+    equity_by_currency: dict[str, float] = field(default_factory=dict)
     holdings: tuple[PortfolioHoldingSnapshot, ...] = ()
 
     @classmethod
@@ -75,13 +77,22 @@ class PortfolioSnapshot:
         )
         gross_exposure = sum(abs(holding.market_value) for holding in holdings)
         net_exposure = sum(holding.market_value for holding in holdings)
+        cash_by_currency = dict(portfolio.cash_by_currency)
+        if not cash_by_currency and portfolio.cash:
+            currencies = {currency_for_symbol(holding.symbol) for holding in holdings}
+            if len(currencies) == 1:
+                cash_by_currency[next(iter(currencies))] = portfolio.cash
+        equity_by_currency = portfolio.equity_by_currency(data, portfolio.currencies(data))
+        scalar_equity = next(iter(equity_by_currency.values())) if len(equity_by_currency) == 1 else 0.0
         return cls(
             sleeve_id=sleeve_id,
             as_of=data.time,
             cash=portfolio.cash,
-            equity=portfolio.cash + net_exposure,
+            equity=scalar_equity,
             gross_exposure=gross_exposure,
             net_exposure=net_exposure,
+            cash_by_currency=cash_by_currency,
+            equity_by_currency=equity_by_currency,
             holdings=holdings,
         )
 
@@ -106,7 +117,9 @@ class PortfolioSnapshot:
             "sleeve_id": self.sleeve_id,
             "as_of": self.as_of.isoformat(),
             "cash": self.cash,
+            "cash_by_currency": self.cash_by_currency,
             "equity": self.equity,
+            "equity_by_currency": self.equity_by_currency,
             "gross_exposure": self.gross_exposure,
             "net_exposure": self.net_exposure,
             "gross_exposure_pct": self.gross_exposure_pct,

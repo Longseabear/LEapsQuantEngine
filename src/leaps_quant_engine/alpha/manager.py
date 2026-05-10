@@ -129,7 +129,14 @@ class InsightManager:
             record.insight
             for record in sorted(
                 (self._records_by_id[insight_id] for insight_id in self._active_ids),
-                key=lambda item: (item.insight.generated_at, item.insight.insight_id),
+                key=lambda item: (
+                    item.insight.generated_at,
+                    item.insight.sleeve_id,
+                    item.insight.symbol_key,
+                    item.insight.alpha_id,
+                    item.insight.insight_type.value,
+                    item.insight.insight_id,
+                ),
             )
             if sleeve_id is None or record.insight.sleeve_id == sleeve_id
         )

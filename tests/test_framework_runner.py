@@ -5,6 +5,8 @@ from leaps_quant_engine.framework import (
     EqualWeightPortfolioConstructionModel,
     FrameworkRunner,
     PassThroughRiskManagementModel,
+    PortfolioConstructionEngine,
+    RebalancePolicy,
 )
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Portfolio
@@ -20,6 +22,27 @@ class OneShotAlpha:
 
     def generate(self, context):
         return [self.insight] if self.insight is not None else []
+
+
+class SelectedSymbolsAlpha:
+    alpha_id = "selected-symbols"
+    version = "1.0"
+
+    def generate(self, context):
+        return [
+            Insight(
+                sleeve_id=context.sleeve_id,
+                symbol=context.symbol(symbol_key),
+                direction=InsightDirection.UP,
+                generated_at=context.as_of,
+                source_snapshot_id=context.source_snapshot_id,
+                alpha_id=self.alpha_id,
+                alpha_version=self.version,
+                weight=0.5,
+                reason="selected_symbol",
+            )
+            for symbol_key in context.symbol_keys
+        ]
 
 
 def _snapshot(as_of: datetime, symbol: Symbol) -> IndicatorSnapshot:
@@ -43,6 +66,34 @@ def _slice(as_of: datetime, symbol: Symbol, close: float = 100.0) -> DataSlice:
     return DataSlice(
         time=as_of,
         bars={symbol.key: Bar(symbol, as_of, close, close, close, close, 1000)},
+    )
+
+
+def _multi_snapshot(as_of: datetime, symbols: tuple[Symbol, ...]) -> IndicatorSnapshot:
+    return IndicatorSnapshot(
+        snapshot_id=f"indicator-{as_of:%H%M}",
+        sleeve_id="us-live",
+        universe_id="us-active",
+        as_of=as_of,
+        created_at=as_of,
+        symbols=tuple(symbol.key for symbol in symbols),
+        source_snapshot_id=f"market-{as_of:%H%M}",
+        values={
+            symbol.key: {
+                "close": IndicatorValue("close", 100.0, True, 1, as_of),
+            }
+            for symbol in symbols
+        },
+    )
+
+
+def _multi_slice(as_of: datetime, symbols: tuple[Symbol, ...], close: float = 100.0) -> DataSlice:
+    return DataSlice(
+        time=as_of,
+        bars={
+            symbol.key: Bar(symbol, as_of, close, close, close, close, 1000)
+            for symbol in symbols
+        },
     )
 
 
@@ -92,6 +143,29 @@ def test_framework_runner_turns_active_insight_into_order_intent():
     assert summary["active_insights"] == []
 
 
+def test_framework_runner_scopes_alpha_with_selection_symbols():
+    symbols = (Symbol("NVDA", "US"), Symbol("MSFT", "US"))
+    selected = (symbols[1],)
+    as_of = datetime(2026, 5, 9, 9, 30)
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(SelectedSymbolsAlpha(),)),
+        portfolio_model=EqualWeightPortfolioConstructionModel(),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+
+    result = runner.run_once(
+        indicator_snapshot=_multi_snapshot(as_of, symbols),
+        data=_multi_slice(as_of, symbols, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+        alpha_symbols_by_model={"selected-symbols": selected},
+    )
+
+    assert [insight.symbol for insight in result.new_insight_batch.insights] == [symbols[1]]
+    assert result.portfolio_target_batch.target_count == 1
+    assert result.order_intents[0].symbol == symbols[1]
+
+
 def test_framework_runner_expires_insight_and_flattens_managed_symbol():
     symbol = Symbol("NVDA", "US")
     first_time = datetime(2026, 5, 9, 9, 30)
@@ -135,3 +209,52 @@ def test_framework_runner_expires_insight_and_flattens_managed_symbol():
     assert second.portfolio_targets[0].quantity == 0
     assert second.order_intents[0].side is OrderSide.SELL
     assert second.order_intents[0].quantity == 10
+
+
+def test_framework_runner_reuses_portfolio_targets_until_rebalance_cadence_due():
+    symbol = Symbol("NVDA", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 9, 31)
+    insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=first_time,
+        expires_at=datetime(2026, 5, 10, 9, 30),
+        source_snapshot_id="market-0930",
+        alpha_id="daily-alpha",
+        alpha_version="1.0",
+    )
+    alpha = OneShotAlpha(insight)
+    alpha.alpha_id = "daily-alpha"
+    alpha.evaluation_cadence = "once_per_day"
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(alpha,)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="once_per_day"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    portfolio = Portfolio(cash=1_000)
+
+    first = runner.run_once(
+        indicator_snapshot=_snapshot(first_time, symbol),
+        data=_slice(first_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    for order in first.order_intents:
+        portfolio.apply_fill(order)
+
+    second = runner.run_once(
+        indicator_snapshot=_snapshot(second_time, symbol),
+        data=_slice(second_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert second.new_insight_batch.insight_count == 0
+    assert second.active_insight_count == 1
+    assert second.portfolio_target_batch.metadata["reused"] is True
+    assert second.stage_decisions["portfolio"]["ran"] is False
+    assert second.order_intents == ()

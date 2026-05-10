@@ -74,22 +74,25 @@ Indicators are shared computation primitives for universe, alpha, and risk. Keep
 
 ## KIS Integration Direction
 
-Do not rebuild the old `apps/market-data-engine` or `apps/broker-engine` inside the new core.
+Do not extend the old `apps/market-data-engine` or `apps/broker-engine` for new engine work.
+When KIS functionality is needed, implement it behind the new engine adapter boundary.
 
 Use this layering:
 
 ```text
 KIS
-  -> local broker-engine
-  -> market-data adapter / cached replay
+  -> leaps_quant_engine.adapters.kis_direct.KISDirectClient
+  -> market-data adapter / local cached replay / broker gateway
   -> MarketDataProvider adapter
   -> normalized Bar / DataSlice
   -> universe / alpha / portfolio / risk / execution
 ```
 
-KIS access must go through broker-engine because request throughput is shared at the AppKey/lane level. The legacy broker-engine is the reference for rate limiting, token reuse, websocket approval, order command idempotency, and broker operation boundaries.
+KIS access must go through an explicit adapter boundary because request throughput is shared at the AppKey/lane level. The current default boundary is the in-process `KISDirectClient`; the legacy broker-engine is reference material for rate limiting, token reuse, websocket approval, order command idempotency, and broker operation boundaries.
 
-Historical KIS data has separate operation paths such as `get_daily_ohlcv`, `get_or_cache_daily_ohlcv`, `build_position_replay_feed`, and `get_or_cache_domestic_minute_bars`. New engine history workflows should be cache-first and should normalize payloads before they reach universe or alpha code.
+Strategies, alpha models, portfolio models, risk models, execution models, indicators, and universe selection models still must not call KIS directly.
+
+Historical KIS data has separate operation paths such as `get_daily_ohlcv`, `get_or_cache_daily_ohlcv`, and `get_or_cache_domestic_minute_bars`. New engine history workflows should be cache-first and should normalize payloads before they reach universe or alpha code.
 
 See `docs/kis-market-data-architecture.md` before changing KIS, history, cache, or market-data adapter behavior.
 
