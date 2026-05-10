@@ -87,10 +87,10 @@
         "parameters": {
           "policy_path": null,
           "policy_paths": [
-            "data/rl/kr_only_20260511/kr_top8_cash5m_short_s801/leaps_ppo_portfolio_allocator_seed801.zip",
-            "data/rl/kr_only_20260511/kr_top8_cash5m_short_s801/leaps_ppo_portfolio_allocator_seed809.zip"
+            "data/rl/kr_only_20260510/kr_top8_volfilter_exec_s401/leaps_ppo_portfolio_allocator_seed403.zip",
+            "data/rl/kr_only_20260510/kr_top8_volfilter_exec_s401/leaps_ppo_portfolio_allocator_seed407.zip"
           ],
-          "metadata_path": "data/rl/kr_only_20260511/kr_top8_cash5m_short_s801/leaps_ppo_portfolio_allocator.json",
+          "metadata_path": "data/rl/kr_only_20260510/kr_top8_volfilter_exec_s401/leaps_ppo_portfolio_allocator.json",
           "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
           "fallback_action": 3,
           "top_k": 8,
