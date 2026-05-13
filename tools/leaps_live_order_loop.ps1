@@ -10,7 +10,8 @@ param(
     [int]$ReconcileEveryCycles = 5,
     [string]$FrameworkStatePath = "",
     [string]$SubmitStatePath = "",
-    [string]$SubmitOncePerDay = "true"
+    [string]$SubmitOncePerDay = "true",
+    [string]$RequireSupportedSubmitSession = "true"
 )
 
 $ErrorActionPreference = "Continue"
@@ -62,7 +63,27 @@ function Get-OrderBatchHash {
     if ($null -eq $OrderBatch -or $null -eq $OrderBatch.batches) {
         return ""
     }
-    $ordersJson = ($OrderBatch.batches | ConvertTo-Json -Depth 32 -Compress)
+    $signatures = @()
+    foreach ($batch in @($OrderBatch.batches)) {
+        foreach ($order in @($batch.orders)) {
+            $metadata = $order.metadata
+            $signatures += [ordered]@{
+                sleeve_id = [string]$order.sleeve_id
+                symbol = [string]$order.symbol
+                side = [string]$order.side
+                quantity = [string]$order.quantity
+                reference_price = [string]$order.reference_price
+                limit_price = [string]$order.limit_price
+                order_type = [string]$order.order_type
+                time_in_force = [string]$order.time_in_force
+                tag = [string]$order.tag
+                current_quantity = [string]$metadata.current_quantity
+                target_quantity = [string]$metadata.target_quantity
+            }
+        }
+    }
+    $stableOrders = $signatures | Sort-Object sleeve_id, symbol, side, quantity, reference_price, limit_price, order_type, time_in_force, tag, current_quantity, target_quantity
+    $ordersJson = ($stableOrders | ConvertTo-Json -Depth 16 -Compress)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($ordersJson)
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -73,7 +94,7 @@ function Get-OrderBatchHash {
 }
 
 function Test-SubmitGuardBlocked {
-    param([string]$BatchHash)
+    param([string]$Today, [string]$BatchHash)
     if (-not $submitStateFullPath -or -not (Test-Path $submitStateFullPath)) {
         return $false
     }
@@ -83,11 +104,85 @@ function Test-SubmitGuardBlocked {
         Write-LoopLog "submit state read failed, continuing without block: $($_.Exception.Message)"
         return $false
     }
-    if ($state.batch_hash -eq $BatchHash) {
+    if ($state.trade_date -eq $Today -and $state.batch_hash -eq $BatchHash) {
         Write-LoopLog "submit guard blocked: identical order batch already submitted state=$submitStateFullPath trade_date=$($state.trade_date)"
         return $true
     }
     return $false
+}
+
+function Test-FlagEnabled {
+    param([string]$Value)
+    return $Value -notmatch '^(false|0|no)$'
+}
+
+function Get-OrderSymbolMarketScope {
+    param([string]$Symbol)
+    $upper = $Symbol.ToUpperInvariant()
+    if (
+        $upper.StartsWith("KRX:") -or
+        $upper.StartsWith("KR:") -or
+        $upper.StartsWith("KOSPI:") -or
+        $upper.StartsWith("KOSDAQ:") -or
+        $upper.StartsWith("KONEX:")
+    ) {
+        return "domestic"
+    }
+    return "overseas"
+}
+
+function Test-IsWeekday {
+    param([datetime]$When)
+    return ($When.DayOfWeek -ne [System.DayOfWeek]::Saturday -and $When.DayOfWeek -ne [System.DayOfWeek]::Sunday)
+}
+
+function Test-IsDomesticSupportedSubmitSession {
+    $now = Get-Date
+    if (-not (Test-IsWeekday -When $now)) {
+        return $false
+    }
+    $time = $now.TimeOfDay
+    $regularAndPreOpen = ($time -ge ([TimeSpan]::new(8, 30, 0)) -and $time -lt ([TimeSpan]::new(15, 30, 0)))
+    $afterHoursClose = ($time -ge ([TimeSpan]::new(15, 40, 0)) -and $time -lt ([TimeSpan]::new(16, 0, 0)))
+    return ($regularAndPreOpen -or $afterHoursClose)
+}
+
+function Test-IsOverseasSupportedSubmitSession {
+    try {
+        $easternZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+        $easternNow = [System.TimeZoneInfo]::ConvertTime([DateTimeOffset]::Now, $easternZone)
+    } catch {
+        Write-LoopLog "US session check failed, blocking submit conservatively: $($_.Exception.Message)"
+        return $false
+    }
+    if ($easternNow.DayOfWeek -eq [System.DayOfWeek]::Saturday -or $easternNow.DayOfWeek -eq [System.DayOfWeek]::Sunday) {
+        return $false
+    }
+    $time = $easternNow.TimeOfDay
+    return ($time -ge ([TimeSpan]::new(4, 0, 0)) -and $time -lt ([TimeSpan]::new(20, 0, 0)))
+}
+
+function Get-SubmitSessionBlockReason {
+    param([object]$OrderBatch)
+    $hasDomestic = $false
+    $hasOverseas = $false
+    foreach ($batch in @($OrderBatch.batches)) {
+        foreach ($order in @($batch.orders)) {
+            $scope = Get-OrderSymbolMarketScope -Symbol ([string]$order.symbol)
+            if ($scope -eq "domestic") {
+                $hasDomestic = $true
+            } elseif ($scope -eq "overseas") {
+                $hasOverseas = $true
+            }
+        }
+    }
+    if ($hasDomestic -and -not (Test-IsDomesticSupportedSubmitSession)) {
+        return "domestic_live_submit_supported_only_0830_1530_and_1540_1600_kst current_kst=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+    }
+    if ($hasOverseas -and -not (Test-IsOverseasSupportedSubmitSession)) {
+        return "overseas_live_submit_supported_only_0400_2000_us_eastern current_utc=$([DateTimeOffset]::Now.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+    }
+    return ""
 }
 
 function Save-SubmitState {
@@ -151,10 +246,11 @@ function Invoke-OrderRuntimeSupervise {
     Write-LoopLog "$Phase order-runtime-supervise exit=$LASTEXITCODE"
 }
 
-Write-LoopLog "live order loop started config=$Config sleeve=$SleeveId interval=${IntervalSeconds}s max_notional=$MaxSubmitNotional submit_state=$SubmitStatePath framework_state=$frameworkStateRelativePath submit_once_per_day=$SubmitOncePerDay guard_mode=engine_target_lineage reconcile_every_cycles=$ReconcileEveryCycles"
+Write-LoopLog "live order loop started config=$Config sleeve=$SleeveId interval=${IntervalSeconds}s max_notional=$MaxSubmitNotional submit_state=$SubmitStatePath framework_state=$frameworkStateRelativePath submit_once_per_day=$SubmitOncePerDay guard_mode=engine_target_lineage reconcile_every_cycles=$ReconcileEveryCycles require_supported_submit_session=$RequireSupportedSubmitSession"
 Write-LoopLog "submit guard note: date-level buy block is disabled; order-runtime-submit uses target_quantity/open_ticket/fill state guards"
 Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath"
-$skipReconcileEnabled = $SkipReconcile -notmatch '^(false|0|no)$'
+$skipReconcileEnabled = Test-FlagEnabled -Value $SkipReconcile
+$submitSessionGuardEnabled = Test-FlagEnabled -Value $RequireSupportedSubmitSession
 $cycleIndex = 0
 
 while ($true) {
@@ -189,11 +285,17 @@ while ($true) {
             }
 
             $today = Get-Date -Format "yyyy-MM-dd"
+            $sessionBlockReason = ""
+            if ($submitSessionGuardEnabled -and $orderBatchReadOk -and $orderCount -gt 0) {
+                $sessionBlockReason = Get-SubmitSessionBlockReason -OrderBatch $orderBatch
+            }
             if (-not $orderBatchReadOk) {
                 Write-LoopLog "order-runtime-submit skipped: unreadable order batch artifact path=$orderBatchFullPath"
             } elseif ($orderCount -le 0) {
                 Write-LoopLog "order-runtime-submit skipped: no candidate orders"
-            } elseif (Test-SubmitGuardBlocked -BatchHash $batchHash) {
+            } elseif ($sessionBlockReason) {
+                Write-LoopLog "order-runtime-submit skipped: unsupported submit session reason=$sessionBlockReason order_count=$orderCount batch_hash=$batchHash"
+            } elseif (Test-SubmitGuardBlocked -Today $today -BatchHash $batchHash) {
                 Write-LoopLog "order-runtime-submit skipped by submit guard order_count=$orderCount batch_hash=$batchHash"
             } else {
                 $submitArgs = @(

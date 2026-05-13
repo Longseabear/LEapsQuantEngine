@@ -7,7 +7,11 @@ from typing import Any, Iterable, Mapping, Protocol
 
 from leaps_quant_engine.models import OrderSide, OrderType, TimeInForce
 from leaps_quant_engine.orders import OrderEvent, OrderEventType, OrderTicket, OrderTicketStatus
-from leaps_quant_engine.market_rules import round_krx_price_to_tick, round_overseas_price_to_tick
+from leaps_quant_engine.market_rules import (
+    DOMESTIC_ORDER_SESSION_TO_DIVISION,
+    round_krx_price_to_tick,
+    round_overseas_price_to_tick,
+)
 
 
 class BrokerExecutionError(RuntimeError):
@@ -355,6 +359,12 @@ class BrokerEngineExecutionGateway:
         )
 
     def _command_metadata(self, ticket: OrderTicket, *, desired_action: str) -> dict[str, Any]:
+        order_session = _ticket_order_session(ticket)
+        order_division = (
+            _overseas_order_division(ticket, fallback=self.order_division)
+            if _is_overseas_ticket(ticket)
+            else _domestic_order_division(ticket, fallback=self.order_division)
+        )
         return {
             "consumer_id": self.consumer_id,
             "desired_action": desired_action,
@@ -365,6 +375,9 @@ class BrokerEngineExecutionGateway:
             "ticket_id": ticket.ticket_id,
             "sleeve_id": ticket.sleeve_id,
             "symbol": ticket.symbol.key,
+            "order_session": order_session,
+            "market_session_phase": str(ticket.metadata.get("market_session_phase") or order_session),
+            "order_division": order_division,
             **dict(self.metadata),
         }
 
@@ -494,6 +507,9 @@ def _domestic_order_division(ticket: OrderTicket, *, fallback: str) -> str:
     explicit = str(ticket.metadata.get("order_division") or "").strip()
     if explicit:
         return explicit
+    session_division = DOMESTIC_ORDER_SESSION_TO_DIVISION.get(_ticket_order_session(ticket))
+    if session_division and session_division != "00":
+        return session_division
     return _DOMESTIC_ORDER_DIVISION_BY_STYLE.get((ticket.order_type, ticket.time_in_force), fallback)
 
 
@@ -502,6 +518,10 @@ def _overseas_order_division(ticket: OrderTicket, *, fallback: str) -> str:
     if explicit:
         return explicit
     return _OVERSEAS_ORDER_DIVISION_BY_STYLE.get((ticket.order_type, ticket.time_in_force), fallback)
+
+
+def _ticket_order_session(ticket: OrderTicket) -> str:
+    return str(ticket.metadata.get("order_session") or ticket.metadata.get("market_session_phase") or "").strip()
 
 
 def _overseas_order_price(ticket: OrderTicket, *, allow_zero: bool = False, exchange: str | None = None) -> float:

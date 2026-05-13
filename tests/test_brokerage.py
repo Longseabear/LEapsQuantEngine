@@ -143,6 +143,70 @@ def test_broker_engine_gateway_maps_market_ioc_ticket_to_domestic_order_division
     assert client.enqueued[0]["arguments"]["price"] == 0
 
 
+def test_broker_engine_gateway_maps_domestic_after_hours_close_to_order_division():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 15, 41),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.SELL,
+                2,
+                70_000,
+                order_type=OrderType.LIMIT,
+                limit_price=70_000,
+                time_in_force=TimeInForce.DAY,
+                metadata={"order_session": "after_hours_close"},
+            ),
+        ),
+        batch_id="batch-after-hours-close",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 13, 15, 42)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 13, 15, 42))
+
+    command = client.enqueued[0]
+    assert command["arguments"]["order_division"] == "06"
+    assert command["metadata"]["order_session"] == "after_hours_close"
+    assert command["metadata"]["order_division"] == "06"
+
+
+def test_broker_engine_gateway_maps_domestic_after_hours_single_price_to_order_division():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 16, 1),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.BUY,
+                2,
+                70_000,
+                order_type=OrderType.LIMIT,
+                limit_price=70_000,
+                time_in_force=TimeInForce.DAY,
+                metadata={"market_session_phase": "after_hours_single_price"},
+            ),
+        ),
+        batch_id="batch-after-hours-single-price",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 13, 16, 2)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 13, 16, 2))
+
+    command = client.enqueued[0]
+    assert command["arguments"]["order_division"] == "07"
+    assert command["metadata"]["order_session"] == "after_hours_single_price"
+    assert command["metadata"]["order_division"] == "07"
+
+
 def test_broker_engine_gateway_uses_limit_price_for_domestic_limit_order():
     symbol = Symbol("005930", "KRX")
     batch = OrderIntentBatch(

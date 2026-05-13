@@ -4,9 +4,10 @@ from datetime import datetime
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.order_submit import OrderRuntimeSubmitter, load_order_intent_batches, write_order_intent_batches
 from leaps_quant_engine.execution import OrderIntentBatch
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol, TimeInForce
 from leaps_quant_engine.orders import OrderCoordinator
-from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
+from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
 
 def test_load_order_intent_batches_accepts_framework_execution_json(tmp_path):
@@ -170,3 +171,68 @@ def test_order_runtime_submitter_blocks_duplicate_commit_from_same_artifact(tmp_
     assert report.status == "blocked"
     assert report.errors == ("duplicate_order_intent_already_recorded",)
     assert len(report.final_status.order_snapshot.tickets) == 1
+
+
+def test_order_runtime_submitter_stamps_order_session_on_tickets(tmp_path):
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 15, 41),
+        order_intents=(
+            OrderIntent(
+                sleeve_id="LEaps",
+                symbol=Symbol("005930", "KRX"),
+                side=OrderSide.SELL,
+                quantity=1,
+                reference_price=70_000,
+                order_type=OrderType.LIMIT,
+                limit_price=70_000,
+                time_in_force=TimeInForce.DAY,
+            ),
+        ),
+        batch_id="batch-after-hours",
+    )
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 0},
+    )
+    account_store.apply_fill(
+        VirtualFillEvent(
+            fill_id="seed",
+            order_id="seed",
+            symbol=Symbol("005930", "KRX"),
+            side=OrderSide.BUY,
+            quantity=1,
+            fill_price=69_000,
+            filled_at=datetime(2026, 5, 13, 9, 0),
+            sleeve_id="LEaps",
+        )
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+
+    report = OrderRuntimeSubmitter(
+        runtime_id="test-runtime",
+        order_state_store=order_store,
+        account_store=account_store,
+        broker_account_id="kis-domestic",
+        market_scope="domestic",
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_close",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        require_orderable_session=True,
+    ).submit_batches(
+        (batch,),
+        allowed_sleeve_ids=("LEaps",),
+        broker="broker-engine",
+        commit=False,
+        confirm_live_submit=True,
+        generated_at=datetime(2026, 5, 13, 15, 42),
+    )
+
+    ticket = report.coordination.tickets[0]
+    assert ticket.metadata["order_session"] == "after_hours_close"
+    assert ticket.metadata["market_session_phase"] == "after_hours_close"
+    assert ticket.metadata["market_session_scope"] == "domestic"

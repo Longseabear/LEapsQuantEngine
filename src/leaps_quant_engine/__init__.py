@@ -303,6 +303,18 @@ from leaps_quant_engine.runtime_recovery import (
     build_recovery_account_report,
     build_recovery_report,
 )
+from leaps_quant_engine.runtime_state import (
+    MODEL_STATE_EVENT_SCHEMA_VERSION,
+    MODEL_STATE_SCHEMA_VERSION,
+    InMemoryRuntimeStateStore,
+    ModelStateEvent,
+    ModelStateKey,
+    ModelStateRecord,
+    RuntimeStateStore,
+    SQLiteRuntimeStateStore,
+    StatePatch,
+    StatePatchOperation,
+)
 from leaps_quant_engine.sleeve import Sleeve, SleevePolicy
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker, SnapshotWorkerCycleReport, SnapshotWorkerRunReport
 from leaps_quant_engine.snapshots import SnapshotFreshnessPolicy, SnapshotQualityReport, SnapshotQualityStatus
@@ -430,6 +442,7 @@ __all__ = [
     "IndicatorSnapshotStore",
     "IndicatorValue",
     "ImmediateExecutionModel",
+    "InMemoryRuntimeStateStore",
     "LimitExecutionModel",
     "Insight",
     "InsightBatch",
@@ -451,6 +464,11 @@ __all__ = [
     "MarketReplaySession",
     "MarketReplayStore",
     "MarketDataRuntimeConfig",
+    "MODEL_STATE_EVENT_SCHEMA_VERSION",
+    "MODEL_STATE_SCHEMA_VERSION",
+    "ModelStateEvent",
+    "ModelStateKey",
+    "ModelStateRecord",
     "Momentum",
     "MomentumUniverseSelectionModel",
     "normalize_agent_text",
@@ -549,6 +567,8 @@ __all__ = [
     "RuntimeRunOnceReport",
     "RuntimeSleeveReloadReport",
     "RuntimeSleeveRuntime",
+    "RuntimeStateStore",
+    "SQLiteRuntimeStateStore",
     "Sleeve",
     "SleeveOrderRuntimeStatus",
     "SleeveRuntimeConfig",
@@ -569,6 +589,8 @@ __all__ = [
     "SnapshotContext",
     "SnapshotWorkerCycleReport",
     "SnapshotWorkerRunReport",
+    "StatePatch",
+    "StatePatchOperation",
     "StaticUniverseSelectionModel",
     "VirtualMarketDataProvider",
     "VirtualAccountReconciliationReport",

@@ -64,6 +64,72 @@ def test_rl_portfolio_constructor_keeps_managed_holding_without_active_insight()
     assert targets == ()
 
 
+def test_rl_portfolio_constructor_can_zero_held_symbol_missing_from_complete_target_set():
+    selected = Symbol("005930", "KRX")
+    held_missing = Symbol("034020", "KRX")
+    now = datetime(2026, 1, 2)
+    portfolio = Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000})
+    portfolio.holdings[held_missing.key] = type(
+        "HoldingLike",
+        (),
+        {"symbol": held_missing, "quantity": 6, "average_price": 133_100},
+    )()
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_path="missing.zip",
+        allocation_mode="rl_weights",
+        fallback_gross_exposure=0.8,
+        max_position_pct=0.9,
+        emit_zero_for_missing_held_targets=True,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                selected.key: Bar(selected, now, 280_000, 280_000, 280_000, 280_000, 1000),
+                held_missing.key: Bar(held_missing, now, 119_300, 119_300, 119_300, 119_300, 1000),
+            },
+        ),
+        portfolio=portfolio,
+        active_insights=(_up_insight(selected, now, momentum=0.2),),
+        managed_symbols=(held_missing,),
+    )
+
+    targets = model.create_targets(context)
+
+    by_symbol = {target.symbol.key: target for target in targets}
+    assert by_symbol[selected.key].target_percent == pytest.approx(0.8)
+    assert by_symbol[held_missing.key].target_percent == 0.0
+    assert by_symbol[held_missing.key].tag == "rl:ppo:no_longer_in_target_portfolio"
+
+
+def test_rl_portfolio_constructor_complete_target_mode_does_not_flatten_without_actionable_insights():
+    held = Symbol("034020", "KRX")
+    now = datetime(2026, 1, 2)
+    portfolio = Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000})
+    portfolio.holdings[held.key] = type(
+        "HoldingLike",
+        (),
+        {"symbol": held, "quantity": 6, "average_price": 133_100},
+    )()
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_path="missing.zip",
+        allocation_mode="rl_weights",
+        emit_zero_for_missing_held_targets=True,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(time=now, bars={held.key: Bar(held, now, 119_300, 119_300, 119_300, 119_300, 1000)}),
+        portfolio=portfolio,
+        active_insights=(),
+        managed_symbols=(held,),
+    )
+
+    targets = model.create_targets(context)
+
+    assert targets == ()
+
+
 def test_rl_portfolio_constructor_emits_exit_for_explicit_flat_insight():
     symbol = Symbol("AAPL", "US")
     now = datetime(2026, 1, 2)

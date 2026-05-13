@@ -10,6 +10,8 @@ from leaps_quant_engine.framework import (
     PortfolioConstructionContext,
     PortfolioConstructionEngine,
     PortfolioAllocationTarget,
+    PortfolioTargetBatch,
+    PortfolioTargetPlan,
     RebalancePolicy,
 )
 from leaps_quant_engine.models import Bar, DataSlice, PortfolioTarget, Symbol
@@ -200,6 +202,164 @@ def test_order_sizing_lot_optimizer_ignores_tiny_fractional_targets():
 
     assert sized.targets == ()
     assert sized.metadata["lot_optimizer_adjustment_count"] == 0
+
+
+def test_order_sizing_can_suppress_reused_batch_adjacent_lot_sell_churn():
+    symbol = Symbol("005380", "KRX")
+    target = PortfolioAllocationTarget(
+        symbol=symbol,
+        target_percent=0.138,
+        tag="rl:attention_ppo:leaps-kospi-conviction:weight=0.138",
+    )
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 13, 26),
+        targets=(target,),
+        plans=(
+            PortfolioTargetPlan(
+                target=target,
+                current_quantity=3,
+                current_price=698_000,
+                current_value=2_094_000,
+                target_percent=0.138,
+                desired_value=1_750_000,
+                reason="target",
+            ),
+        ),
+        metadata={"reused": True, "source_batch_id": "portfolio-targets-1"},
+    )
+    portfolio = Portfolio(
+        cash=10_581_159.420289854,
+        holdings={symbol.key: Holding(symbol, quantity=3, average_price=671_778)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            reused_target_churn_guard=True,
+            reused_target_churn_lot_fraction=0.5,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 700_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["reused_target_churn_guard_enabled"] is True
+    assert sized.metadata["reused_target_churn_suppressed_count"] == 1
+    assert sized.metadata["reused_target_churn_suppressed_symbols"] == ["KRX:005380"]
+
+
+def test_order_sizing_can_suppress_reused_batch_adjacent_lot_buy_back_churn():
+    symbol = Symbol("005380", "KRX")
+    stabilizer = Symbol("005930", "KRX")
+    target = PortfolioAllocationTarget(
+        symbol=symbol,
+        target_percent=0.138,
+        tag="rl:attention_ppo:leaps-kospi-conviction:weight=0.138",
+    )
+    stabilizer_target = PortfolioAllocationTarget(symbol=stabilizer, target_percent=0.08)
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 13, 28),
+        targets=(target, stabilizer_target),
+        plans=(
+            PortfolioTargetPlan(
+                target=target,
+                current_quantity=3,
+                current_price=698_000,
+                current_value=2_094_000,
+                target_percent=0.138,
+                desired_value=1_750_000,
+                reason="target",
+            ),
+            PortfolioTargetPlan(
+                target=stabilizer_target,
+                current_quantity=1,
+                current_price=660_000,
+                current_value=660_000,
+                target_percent=0.08,
+                desired_value=1_013_913.04,
+                reason="target",
+            ),
+        ),
+        metadata={"reused": True, "source_batch_id": "portfolio-targets-1"},
+    )
+    portfolio = Portfolio(
+        cash=10_613_913.04347826,
+        holdings={
+            symbol.key: Holding(symbol, quantity=2, average_price=671_778),
+            stabilizer.key: Holding(stabilizer, quantity=1, average_price=660_000),
+        },
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            reused_target_churn_guard=True,
+            reused_target_churn_lot_fraction=0.5,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 700_000), _bar(stabilizer, 660_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["lot_optimizer_adjustment_count"] == 1
+    assert sized.metadata["reused_target_churn_suppressed_count"] == 1
+
+
+def test_order_sizing_reused_batch_churn_guard_keeps_fresh_and_exit_targets():
+    symbol = Symbol("005380", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.138)
+    fresh_batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 13, 30),
+        targets=(target,),
+    )
+    portfolio = Portfolio(
+        cash=10_581_159.420289854,
+        holdings={symbol.key: Holding(symbol, quantity=3, average_price=671_778)},
+    )
+    engine = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            reused_target_churn_guard=True,
+            reused_target_churn_lot_fraction=0.5,
+        )
+    )
+
+    fresh_sized = engine.size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 700_000)),
+            portfolio=portfolio,
+            portfolio_targets=fresh_batch,
+        )
+    )
+    assert fresh_sized.targets == (PortfolioTarget(symbol=symbol, quantity=2),)
+
+    exit_target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.0, tag="framework:stop:flat")
+    reused_exit = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 13, 31),
+        targets=(exit_target,),
+        metadata={"reused": True},
+    )
+    exit_sized = engine.size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 700_000)),
+            portfolio=portfolio,
+            portfolio_targets=reused_exit,
+        )
+    )
+    assert exit_sized.targets == (PortfolioTarget(symbol=symbol, quantity=0, tag="framework:stop:flat"),)
 
 
 def test_rebalance_policy_filters_small_target_delta():

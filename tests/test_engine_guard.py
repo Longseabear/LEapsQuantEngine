@@ -3,7 +3,7 @@ from datetime import datetime
 from leaps_quant_engine.engine_guard import EngineGuard
 from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.market_rules import MarketSession
-from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol
+from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol, TimeInForce
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderCoordinator, OrderEventType
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
@@ -472,3 +472,260 @@ def test_engine_guard_allows_orderable_session_and_warns_invalid_krx_tick(tmp_pa
 
     assert report.blocked is False
     assert "limit_price_not_on_krx_tick" in report.warnings
+
+
+def test_engine_guard_allows_domestic_after_hours_limit_day_when_gateway_supports_it(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+
+    report = EngineGuard().evaluate(
+        batches=(
+            _batch(
+                OrderIntent(
+                    "LEaps",
+                    Symbol("005930", "KRX"),
+                    OrderSide.BUY,
+                    1,
+                    70_000,
+                    order_type=OrderType.LIMIT,
+                    limit_price=70_000,
+                    time_in_force=TimeInForce.DAY,
+                )
+            ),
+        ),
+        account_store=account_store,
+        account_id="kis-domestic",
+        market_scope="domestic",
+        broker="broker-engine",
+        commit=True,
+        require_orderable_session=True,
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_close",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        generated_at=datetime(2026, 5, 13, 15, 41),
+    )
+
+    assert report.blocked is False
+    assert "unsupported_live_session_phase_for_route" not in report.errors
+
+
+def test_engine_guard_rejects_domestic_after_hours_market_order(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+
+    report = EngineGuard().evaluate(
+        batches=(
+            _batch(
+                OrderIntent(
+                    "LEaps",
+                    Symbol("005930", "KRX"),
+                    OrderSide.BUY,
+                    1,
+                    70_000,
+                    order_type=OrderType.MARKET,
+                    time_in_force=TimeInForce.DAY,
+                )
+            ),
+        ),
+        account_store=account_store,
+        account_id="kis-domestic",
+        market_scope="domestic",
+        broker="broker-engine",
+        commit=True,
+        require_orderable_session=True,
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_single_price",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        generated_at=datetime(2026, 5, 13, 16, 1),
+    )
+
+    assert report.blocked is True
+    assert "unsupported_extended_session_order_style" in report.errors
+
+
+def test_engine_guard_rejects_domestic_single_price_without_symbol_venue_support(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+
+    report = EngineGuard().evaluate(
+        batches=(
+            _batch(
+                OrderIntent(
+                    "LEaps",
+                    Symbol("005930", "KRX"),
+                    OrderSide.BUY,
+                    1,
+                    70_000,
+                    order_type=OrderType.LIMIT,
+                    limit_price=70_000,
+                    time_in_force=TimeInForce.DAY,
+                )
+            ),
+        ),
+        account_store=account_store,
+        account_id="kis-domestic",
+        market_scope="domestic",
+        broker="broker-engine",
+        commit=True,
+        require_orderable_session=True,
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_single_price",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        generated_at=datetime(2026, 5, 13, 16, 1),
+    )
+
+    assert report.blocked is True
+    assert "domestic_after_hours_single_price_requires_explicit_symbol_support" in report.errors
+
+
+def test_engine_guard_allows_domestic_single_price_when_symbol_venue_support_is_explicit(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+
+    report = EngineGuard().evaluate(
+        batches=(
+            _batch(
+                OrderIntent(
+                    "LEaps",
+                    Symbol("005930", "KRX"),
+                    OrderSide.BUY,
+                    1,
+                    70_000,
+                    order_type=OrderType.LIMIT,
+                    limit_price=70_000,
+                    time_in_force=TimeInForce.DAY,
+                    metadata={"allow_after_hours_single_price": True},
+                )
+            ),
+        ),
+        account_store=account_store,
+        account_id="kis-domestic",
+        market_scope="domestic",
+        broker="broker-engine",
+        commit=True,
+        require_orderable_session=True,
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_single_price",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        generated_at=datetime(2026, 5, 13, 16, 1),
+    )
+
+    assert report.blocked is False
+
+
+def test_engine_guard_allows_us_pre_market_limit_day(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"us_etf_rotation": 0},
+        default_cash_by_currency_by_sleeve={"us_etf_rotation": {"USD": 10_000}},
+        default_currency="USD",
+    )
+
+    report = EngineGuard().evaluate(
+        batches=(
+            OrderIntentBatch(
+                sleeve_id="us_etf_rotation",
+                generated_at=datetime(2026, 5, 13, 17, 0),
+                order_intents=(
+                    OrderIntent(
+                        "us_etf_rotation",
+                        Symbol("SMH", "US"),
+                        OrderSide.BUY,
+                        1,
+                        570.0,
+                        order_type=OrderType.LIMIT,
+                        limit_price=570.0,
+                        time_in_force=TimeInForce.DAY,
+                    ),
+                ),
+                batch_id="batch-us",
+            ),
+        ),
+        account_store=account_store,
+        account_id="kis-overseas",
+        market_scope="overseas",
+        broker="broker-engine",
+        commit=True,
+        require_orderable_session=True,
+        market_session=MarketSession(
+            market_scope="overseas",
+            session_phase="pre_market",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        generated_at=datetime(2026, 5, 13, 17, 0),
+    )
+
+    assert report.blocked is False
+
+
+def test_engine_guard_rejects_us_after_market_market_order(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"us_etf_rotation": 0},
+        default_cash_by_currency_by_sleeve={"us_etf_rotation": {"USD": 10_000}},
+        default_currency="USD",
+    )
+
+    report = EngineGuard().evaluate(
+        batches=(
+            OrderIntentBatch(
+                sleeve_id="us_etf_rotation",
+                generated_at=datetime(2026, 5, 14, 6, 0),
+                order_intents=(
+                    OrderIntent(
+                        "us_etf_rotation",
+                        Symbol("SMH", "US"),
+                        OrderSide.BUY,
+                        1,
+                        570.0,
+                        order_type=OrderType.MARKET,
+                        time_in_force=TimeInForce.DAY,
+                    ),
+                ),
+                batch_id="batch-us",
+            ),
+        ),
+        account_store=account_store,
+        account_id="kis-overseas",
+        market_scope="overseas",
+        broker="broker-engine",
+        commit=True,
+        require_orderable_session=True,
+        market_session=MarketSession(
+            market_scope="overseas",
+            session_phase="after_market",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+        generated_at=datetime(2026, 5, 14, 6, 0),
+    )
+
+    assert report.blocked is True
+    assert "unsupported_extended_session_order_style" in report.errors

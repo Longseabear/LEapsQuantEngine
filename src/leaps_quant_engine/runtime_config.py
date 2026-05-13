@@ -209,6 +209,10 @@ class RebalancePolicyRuntimeConfig:
     min_quantity_delta: int = 1
     allow_exit_below_min_notional: bool = True
     cadence: str = "every_cycle"
+    reused_target_churn_guard: bool = False
+    reused_target_churn_max_quantity_delta: int = 1
+    reused_target_churn_lot_fraction: float = 0.5
+    reused_target_churn_equity_bps: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.cash_reserve_pct < 1.0:
@@ -218,6 +222,10 @@ class RebalancePolicyRuntimeConfig:
             raise ConfigurationValidationError("portfolio.rebalance.min_quantity_delta must be non-negative.")
         if not self.cadence.strip():
             raise ConfigurationValidationError("portfolio.rebalance.cadence cannot be empty.")
+        if self.reused_target_churn_max_quantity_delta < 0:
+            raise ConfigurationValidationError("portfolio.rebalance.reused_target_churn_max_quantity_delta must be non-negative.")
+        _validate_non_negative("portfolio.rebalance.reused_target_churn_lot_fraction", self.reused_target_churn_lot_fraction)
+        _validate_non_negative("portfolio.rebalance.reused_target_churn_equity_bps", self.reused_target_churn_equity_bps)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -226,6 +234,10 @@ class RebalancePolicyRuntimeConfig:
             "min_quantity_delta": self.min_quantity_delta,
             "allow_exit_below_min_notional": self.allow_exit_below_min_notional,
             "cadence": self.cadence,
+            "reused_target_churn_guard": self.reused_target_churn_guard,
+            "reused_target_churn_max_quantity_delta": self.reused_target_churn_max_quantity_delta,
+            "reused_target_churn_lot_fraction": self.reused_target_churn_lot_fraction,
+            "reused_target_churn_equity_bps": self.reused_target_churn_equity_bps,
         }
 
 
@@ -628,6 +640,10 @@ def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> Rebala
         min_quantity_delta=int(payload.get("min_quantity_delta", 1)),
         allow_exit_below_min_notional=bool(payload.get("allow_exit_below_min_notional", True)),
         cadence=str(payload.get("cadence", "every_cycle")).strip(),
+        reused_target_churn_guard=bool(payload.get("reused_target_churn_guard", False)),
+        reused_target_churn_max_quantity_delta=int(payload.get("reused_target_churn_max_quantity_delta", 1)),
+        reused_target_churn_lot_fraction=float(payload.get("reused_target_churn_lot_fraction", 0.5)),
+        reused_target_churn_equity_bps=float(payload.get("reused_target_churn_equity_bps", 0.0)),
     )
 
 

@@ -24,4 +24,5 @@ def create_portfolio_model(params: Mapping[str, Any] | None = None) -> Reinforce
         min_signal_action=int(values.get("min_signal_action", 1)),
         allocation_mode=str(values.get("allocation_mode", "rl_weights")),
         fallback_gross_exposure=float(values.get("fallback_gross_exposure", 0.70)),
+        emit_zero_for_missing_held_targets=bool(values.get("emit_zero_for_missing_held_targets", False)),
     )

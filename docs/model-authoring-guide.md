@@ -281,6 +281,25 @@ Alpha must not:
 - fetch external data
 - mutate portfolio state
 
+## Optional Model State
+
+Models are stateless by default. A model that needs restart-safe state, such as
+a trailing stop high watermark or a target-smoothing anchor, should request
+state changes with `StatePatch` records instead of writing files or mutating
+portfolio state directly.
+
+State ownership rule:
+
+```text
+model decides what state means
+runtime stores and replays the state
+engine guard validates order/account safety separately
+```
+
+Use `ModelStateKey` to namespace state by sleeve, model, namespace, symbol, and
+optionally position. See `docs/runtime-state.md` for the current offline
+`RuntimeStateStore` foundation. It is not enabled in the live loop by default.
+
 ## Portfolio Construction Models
 
 Portfolio construction consumes active insights and produces desired allocation
@@ -338,10 +357,31 @@ Notes:
   allocations. If cadence is not due, `FrameworkRunner` reuses the last
   allocation targets; `OrderSizingEngine`, risk, and execution still run every
   cycle.
+- Tiny churn from reused allocation batches is an opt-in rebalance policy, not
+  a portfolio model rule. Set `portfolio.rebalance.reused_target_churn_guard`
+  only when a sleeve wants `OrderSizingEngine` to suppress adjacent-lot
+  non-exit deltas from a reused `PortfolioTargetBatch`. Fresh target batches
+  and explicit exit/flat targets still pass through.
 - Active FLAT/DOWN insights should be allowed to override same-symbol UP
   insights in portfolio construction. In LEaps, the RL constructor treats a
   same-or-newer non-UP insight as a reason to avoid a long target and to emit an
   exit target for held quantities.
+
+Example:
+
+```json
+{
+  "portfolio": {
+    "rebalance": {
+      "cadence": "every_5_minutes",
+      "reused_target_churn_guard": true,
+      "reused_target_churn_max_quantity_delta": 1,
+      "reused_target_churn_lot_fraction": 0.5,
+      "reused_target_churn_equity_bps": 5
+    }
+  }
+}
+```
 
 ### Reinforcement Learning Constructors
 
@@ -380,6 +420,14 @@ as momentum, volatility, short returns, drawdown, rank score, and current
 exposure. This follows the portfolio-RL literature pattern of using attention to
 model cross-asset relationships while keeping the engine boundary unchanged:
 the RL model still emits only allocation percentages.
+
+When an RL constructor is used as a complete target portfolio allocator, set
+`emit_zero_for_missing_held_targets=true`. In that mode, if the model has an
+actionable target set for a currency bucket and a currently held symbol in that
+same bucket is missing from the target set, the model emits a zero allocation
+tagged `no_longer_in_target_portfolio`. If there are no actionable insights for
+that currency, it does not mass-flatten holdings; exits still require explicit
+FLAT/DOWN insights or another active target set in the same bucket.
 
 The runtime supports both the older gross-exposure controller modes and the
 newer direct allocator mode. In `allocation_mode=rl_weights`, PPO emits a
@@ -501,7 +549,7 @@ from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType
 
 
 class MyExecutionModel:
-    def create_orders(self, sleeve_id, portfolio, data, targets):
+    def create_orders(self, sleeve_id, portfolio, data, targets, execution_context=None):
         orders = []
         for target in targets:
             current = portfolio.quantity(target.symbol)
@@ -524,6 +572,22 @@ class MyExecutionModel:
                 )
             )
         return orders
+```
+
+Existing execution models may keep the shorter four-argument signature. New
+session-aware execution models can optionally accept `execution_context` or
+`market_session`. The context exposes `market_session`, `market_sessions`, and
+`session_for_symbol(symbol)`, so a mixed-market sleeve can decide KRX and US
+order policy independently.
+
+```python
+class SessionAwareExecutionModel:
+    def create_orders(self, sleeve_id, portfolio, data, targets, execution_context=None):
+        for target in targets:
+            session = execution_context.session_for_symbol(target.symbol) if execution_context else None
+            if session and session.session_phase == "after_hours_single_price":
+                # Only emit an order here when this symbol/venue has been verified.
+                ...
 ```
 
 Notes:
@@ -556,6 +620,19 @@ Notes:
   Confirmed live broker-engine submit can require a normalized
   `MarketSession`; non-orderable phases should block order submission before
   KIS is touched.
+- Strategy models should not hard-code KIS after-hours order divisions. The
+  runtime submitter stamps the current `order_session`, and the broker gateway
+  maps KRX after-hours sessions to KIS divisions: `05` for pre-open after-hours,
+  `06` for after-hours close, and `07` for after-hours single-price. US
+  pre-market and after-market are also treated as orderable sessions.
+- Extended-session live submit is intentionally restricted to `limit/day`
+  orders. Market/IOC/FOK behavior belongs in regular-session execution unless
+  a broker-specific extension is explicitly implemented and tested.
+- Do not set `allow_after_hours_single_price` from a model unless symbol/venue
+  support has been verified. In live operation KIS may reject NXT-traded Korean
+  symbols during `after_hours_single_price`, so the engine guard blocks that
+  phase by default and still keeps the `07` mapping available for verified
+  exceptions.
 - Stale open tickets and stale partial fills are maintained by the order
   supervisor. Strategy models should not cancel or replace broker orders
   directly.

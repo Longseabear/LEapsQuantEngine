@@ -24,6 +24,7 @@ from leaps_quant_engine.framework.risk import (
     RiskManagementContext,
     RiskManagementModel,
 )
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import DataSlice, OrderIntent, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.fundamentals import FundamentalSnapshot
@@ -239,6 +240,8 @@ class FrameworkRunner:
         data: DataSlice,
         portfolio: Portfolio,
         alpha_symbols_by_model: Mapping[str, Iterable[Symbol | str]] | None = None,
+        market_session: MarketSession | None = None,
+        market_sessions: Mapping[str, MarketSession] | None = None,
     ) -> FrameworkCycleResult:
         context = SnapshotContext.from_indicator_snapshot(
             indicator_snapshot,
@@ -322,10 +325,19 @@ class FrameworkRunner:
                 portfolio=portfolio,
                 data=data,
                 approved_targets=risk_decisions.approved_targets,
+                market_session=market_session,
+                market_sessions=dict(market_sessions or {}),
             )
         )
         orders = execution_batch.order_intents
         execution_ms = _elapsed_ms(started)
+        stage_decisions["execution"] = {
+            "market_session": market_session.to_dict() if market_session is not None else None,
+            "market_sessions": {
+                scope: session.to_dict()
+                for scope, session in sorted(dict(market_sessions or {}).items())
+            },
+        }
 
         return FrameworkCycleResult(
             sleeve_id=self.sleeve_id,

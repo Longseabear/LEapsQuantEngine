@@ -1191,7 +1191,7 @@ _OVERSEAS_REVISE_CANCEL_TR_IDS = {
     "VNSE": "TTTS0312U",
 }
 _MARKET_PRICE_ORDER_DIVISIONS = {"01", "13", "14"}
-_LIMIT_PRICE_ORDER_DIVISIONS = {"00", "11", "12"}
+_LIMIT_PRICE_ORDER_DIVISIONS = {"00", "05", "06", "07", "11", "12"}
 
 
 def _required_text(payload: Mapping[str, Any], key: str) -> str:

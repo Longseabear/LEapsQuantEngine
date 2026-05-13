@@ -39,6 +39,33 @@ def test_kospi_conviction_alpha_emits_krw_growth_only():
     assert insights[0].reason == "kospi_conviction_breadth_trend_momentum"
 
 
+def test_leaps_live_alphas_run_every_cycle():
+    alpha_paths = (
+        "sleeves/LEaps/alphas/kospi_conviction.py",
+        "sleeves/LEaps/alphas/kospi_pullback_reversion.py",
+        "sleeves/LEaps/alphas/volatility_trailing_stop.py",
+    )
+
+    cadences = {
+        relative_path: getattr(_load(relative_path), "EVALUATION_CADENCE", None)
+        for relative_path in alpha_paths
+    }
+
+    assert cadences == {
+        "sleeves/LEaps/alphas/kospi_conviction.py": "every_cycle",
+        "sleeves/LEaps/alphas/kospi_pullback_reversion.py": "every_cycle",
+        "sleeves/LEaps/alphas/volatility_trailing_stop.py": "every_cycle",
+    }
+
+
+def test_leaps_rl_constructor_can_be_configured_as_complete_target_portfolio():
+    module = _load("sleeves/LEaps/portfolios/rl_ppo_constructor.py")
+
+    model = module.create_portfolio_model({"emit_zero_for_missing_held_targets": True})
+
+    assert model.emit_zero_for_missing_held_targets is True
+
+
 def test_kospi_conviction_alpha_filters_uncompensated_high_volatility():
     module = _load("sleeves/LEaps/alphas/kospi_conviction.py")
     now = datetime(2026, 5, 8)

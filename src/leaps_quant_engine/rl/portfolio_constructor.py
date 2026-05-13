@@ -128,6 +128,7 @@ class ReinforcementLearningPortfolioConstructionModel:
     min_signal_action: int = 0
     allocation_mode: str = "equal"
     fallback_gross_exposure: float = 0.75
+    emit_zero_for_missing_held_targets: bool = False
 
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
         actionable_by_currency: dict[str, list] = {}
@@ -188,7 +189,35 @@ class ReinforcementLearningPortfolioConstructionModel:
                 target_percent=0.0,
                 tag=f"rl:{insight.alpha_id}:{insight.direction.value}",
             )
+        if self.emit_zero_for_missing_held_targets:
+            self._add_missing_held_zero_targets(
+                context,
+                targets,
+                actionable_currencies=set(actionable_by_currency),
+            )
         return tuple(targets.values())
+
+    def _add_missing_held_zero_targets(
+        self,
+        context: PortfolioConstructionContext,
+        targets: dict[str, PortfolioAllocationTarget],
+        *,
+        actionable_currencies: set[str],
+    ) -> None:
+        if not actionable_currencies:
+            return
+        for symbol in context.portfolio.held_symbols:
+            if symbol.key in targets:
+                continue
+            if currency_for_symbol(symbol) not in actionable_currencies:
+                continue
+            if context.portfolio.quantity(symbol) == 0:
+                continue
+            targets[symbol.key] = PortfolioAllocationTarget(
+                symbol=symbol,
+                target_percent=0.0,
+                tag=f"rl:{self.model_name}:no_longer_in_target_portfolio",
+            )
 
     def _weights_for_observation(
         self,

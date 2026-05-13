@@ -13,6 +13,18 @@ from leaps_quant_engine.models import OrderSide, OrderType, Symbol, TimeInForce
 REGULAR_ORDERABLE_PHASES = frozenset({"regular_open_auction", "regular_continuous", "regular_close_auction"})
 AFTER_HOURS_ORDERABLE_PHASES = frozenset({"pre_open_after_hours", "after_hours_close", "after_hours_single_price"})
 ORDERABLE_PHASES = REGULAR_ORDERABLE_PHASES | AFTER_HOURS_ORDERABLE_PHASES
+DOMESTIC_ORDER_SESSION_TO_DIVISION = {
+    "regular": "00",
+    "regular_open_auction": "00",
+    "regular_continuous": "00",
+    "regular_close_auction": "00",
+    "pre_open_after_hours": "05",
+    "after_hours_close": "06",
+    "after_hours_single_price": "07",
+}
+US_EXTENDED_ORDERABLE_PHASES = frozenset({"pre_market", "regular_continuous", "after_market"})
+DOMESTIC_BROKER_ENGINE_SUPPORTED_PHASES = tuple(sorted(ORDERABLE_PHASES))
+OVERSEAS_BROKER_ENGINE_SUPPORTED_PHASES = tuple(sorted(US_EXTENDED_ORDERABLE_PHASES))
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,14 +35,24 @@ class MarketSession:
     is_regular_market_open: bool = False
     source: str = ""
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "market_scope": self.market_scope,
+            "session_phase": self.session_phase,
+            "is_orderable": self.is_orderable,
+            "is_regular_market_open": self.is_regular_market_open,
+            "source": self.source,
+        }
+
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "MarketSession":
         phase = str(payload.get("session_phase") or payload.get("phase") or "").strip()
+        scope = str(payload.get("market_scope") or payload.get("market") or "").strip().lower()
         orderable = payload.get("is_orderable_session", payload.get("is_orderable"))
         if orderable is None:
-            orderable = phase in ORDERABLE_PHASES
+            orderable = _is_orderable_phase(scope, phase)
         return cls(
-            market_scope=str(payload.get("market_scope") or payload.get("market") or "").strip().lower(),
+            market_scope=scope,
             session_phase=phase,
             is_orderable=bool(orderable),
             is_regular_market_open=bool(payload.get("is_regular_market_open", payload.get("is_market_open", False))),
@@ -47,6 +69,7 @@ class BrokerRouteCapability:
     supports_limit_order: bool = True
     supported_time_in_force: tuple[TimeInForce, ...] = (TimeInForce.DAY, TimeInForce.IOC, TimeInForce.FOK)
     enforce_tick_size: bool = True
+    supported_live_session_phases: tuple[str, ...] = DOMESTIC_BROKER_ENGINE_SUPPORTED_PHASES
 
     def supports(self, *, order_type: OrderType, time_in_force: TimeInForce) -> bool:
         if order_type is OrderType.MARKET and not self.supports_market_order:
@@ -59,7 +82,11 @@ class BrokerRouteCapability:
 def default_capability_for_market_scope(market_scope: str | None) -> BrokerRouteCapability:
     scope = str(market_scope or "domestic").strip().lower()
     if scope == "overseas":
-        return BrokerRouteCapability(market_scope="overseas", fractional_quantity=False)
+        return BrokerRouteCapability(
+            market_scope="overseas",
+            fractional_quantity=False,
+            supported_live_session_phases=OVERSEAS_BROKER_ENGINE_SUPPORTED_PHASES,
+        )
     return BrokerRouteCapability(market_scope="domestic", fractional_quantity=False)
 
 
@@ -147,7 +174,7 @@ def synthetic_us_market_session(now: datetime) -> MarketSession:
     return MarketSession(
         market_scope="overseas",
         session_phase=phase,
-        is_orderable=phase == "regular_continuous",
+        is_orderable=phase in US_EXTENDED_ORDERABLE_PHASES,
         is_regular_market_open=phase == "regular_continuous",
         source="synthetic_us_eastern_clock",
     )
@@ -171,6 +198,12 @@ def _domestic_session_phase(current: time) -> str:
 
 def is_domestic_symbol(symbol: Symbol) -> bool:
     return symbol.market.upper() in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _is_orderable_phase(market_scope: str, phase: str) -> bool:
+    if market_scope == "overseas":
+        return phase in US_EXTENDED_ORDERABLE_PHASES
+    return phase in ORDERABLE_PHASES
 
 
 def _decimal_price(price: float) -> Decimal:

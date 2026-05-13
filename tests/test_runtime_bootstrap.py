@@ -215,6 +215,8 @@ def _write_runtime_config(
     workspace_path=None,
     cash=100_000,
     min_order_notional=1000,
+    reused_target_churn_guard=False,
+    reused_target_churn_equity_bps=0.0,
     worker_min_success=2,
     account_store_path=None,
 ):
@@ -261,6 +263,8 @@ def _write_runtime_config(
                             "rebalance": {
                                 "cash_reserve_pct": 0.1,
                                 "min_order_notional": min_order_notional,
+                                "reused_target_churn_guard": reused_target_churn_guard,
+                                "reused_target_churn_equity_bps": reused_target_churn_equity_bps,
                             },
                         },
                         "risk": {
@@ -291,7 +295,12 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
     universe_path = tmp_path / "universe.json"
     config_path = tmp_path / "runtime.json"
     _write_universe(universe_path)
-    _write_runtime_config(config_path, universe_path)
+    _write_runtime_config(
+        config_path,
+        universe_path,
+        reused_target_churn_guard=True,
+        reused_target_churn_equity_bps=5.0,
+    )
     snapshot = load_runtime_config_snapshot(config_path)
     symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
     live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
@@ -329,6 +338,8 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
     assert execution_model_loader.calls == [(str(tmp_path / "execution.py"), {})]
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.cash_reserve_pct == 0.1
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.min_order_notional == 1000
+    assert runtime.framework_runner.portfolio_engine.rebalance_policy.reused_target_churn_guard is True
+    assert runtime.framework_runner.portfolio_engine.rebalance_policy.reused_target_churn_equity_bps == 5.0
     assert runtime.framework_runner.risk_model.limits.max_position_pct == 0.4
     assert runtime.fine_refresh_report is not None
     assert runtime.fine_refresh_report.updated_symbol_count == 2
@@ -425,6 +436,91 @@ def test_runtime_wires_active_selection_symbols_into_alpha_context(tmp_path):
     assert runtime.active_result.selection.live_symbols == (Symbol("NVDA", "US"), Symbol("IBM", "US"))
     assert report.framework is not None
     assert [insight.symbol.key for insight in report.framework.new_insight_batch.insights] == ["US:NVDA"]
+
+
+def test_runtime_forces_portfolio_holdings_into_operational_alpha_input(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    selector_path = tmp_path / "operational_selector.py"
+    _write_universe(universe_path)
+    _write_runtime_config(
+        config_path,
+        universe_path,
+        sleeve_id="LEaps",
+        worker_min_success=1,
+        min_order_notional=0,
+    )
+    selector_path.write_text(
+        "\n".join(
+            [
+                "from dataclasses import dataclass",
+                "from leaps_quant_engine.universe.selection import UniverseSelectionCandidate, build_universe_selection_result",
+                "",
+                "@dataclass(frozen=True, slots=True)",
+                "class OperationalSymbolsSelectionModel:",
+                "    selection_id = 'leaps-operational-symbols'",
+                "",
+                "    def select(self, context):",
+                "        selected = context.forced_symbols",
+                "        candidates = {",
+                "            symbol.key: UniverseSelectionCandidate(",
+                "                symbol=symbol,",
+                "                score=None,",
+                "                selected=True,",
+                "                forced=True,",
+                "                reasons=('operational_symbol',),",
+                "            )",
+                "            for symbol in selected",
+                "        }",
+                "        return build_universe_selection_result(",
+                "            context, selected, selection_id=self.selection_id, candidates=candidates, rejected={}",
+                "        )",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["sleeves"][0]["universe"]["active"]["selection_models"] = [
+        "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+        f"{selector_path}:OperationalSymbolsSelectionModel",
+    ]
+    payload["sleeves"][0]["alpha"]["input_selections"] = {
+        "all-symbols": "leaps-operational-symbols",
+    }
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    held = Symbol("IBM", "US")
+    provider = StaticPortfolioProvider(
+        portfolios={
+            "LEaps": Portfolio(
+                cash=500,
+                holdings={held.key: Holding(held, quantity=3, average_price=90.0)},
+            )
+        }
+    )
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), held]
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
+
+    runtime = bootstrap_sleeve_runtime(
+        snapshot,
+        "LEaps",
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
+            history_provider_factory=lambda: FakeHistoryProvider(),
+            alpha_loader=AllSymbolsAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+            portfolio_provider=provider,
+        ),
+    )
+    report = runtime.run_once()
+
+    assert runtime.active_result.selection.forced_symbols == (held,)
+    operational = runtime.active_result.selection.selections["leaps-operational-symbols"]
+    assert operational.selected_symbols == (held,)
+    assert report.framework is not None
+    assert [insight.symbol for insight in report.framework.new_insight_batch.insights] == [held]
 
 
 def test_bootstrap_warms_indicators_before_indicator_based_active_selection(tmp_path):

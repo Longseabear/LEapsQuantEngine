@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -106,7 +106,7 @@ class OrderRuntimeSubmitter:
         initial_errors: tuple[str, ...] = (),
     ) -> OrderRuntimeSubmitReport:
         generated_at = generated_at or datetime.now()
-        batches_tuple = tuple(batches)
+        batches_tuple = _enrich_batches_with_market_session(tuple(batches), self.market_session)
         coordination = self.coordinator.coordinate(batches_tuple, generated_at=generated_at)
         errors, warnings = _validate_submit_request(
             batches_tuple,
@@ -178,6 +178,35 @@ class OrderRuntimeSubmitter:
             errors=errors,
             warnings=warnings,
         )
+
+
+def _enrich_batches_with_market_session(
+    batches: tuple[OrderIntentBatch, ...],
+    market_session: MarketSession | None,
+) -> tuple[OrderIntentBatch, ...]:
+    if market_session is None:
+        return batches
+    enriched_batches: list[OrderIntentBatch] = []
+    for batch in batches:
+        enriched_orders = tuple(
+            replace(order, metadata=_metadata_with_market_session(order.metadata, market_session))
+            for order in batch.order_intents
+        )
+        enriched_batches.append(replace(batch, order_intents=enriched_orders))
+    return tuple(enriched_batches)
+
+
+def _metadata_with_market_session(
+    metadata: Mapping[str, Any],
+    market_session: MarketSession,
+) -> dict[str, Any]:
+    enriched = dict(metadata)
+    enriched.setdefault("order_session", market_session.session_phase)
+    enriched.setdefault("market_session_phase", market_session.session_phase)
+    enriched.setdefault("market_session_scope", market_session.market_scope)
+    enriched.setdefault("market_session_source", market_session.source)
+    enriched.setdefault("is_regular_market_open", market_session.is_regular_market_open)
+    return enriched
 
 
 def load_order_intent_batches(path: Path) -> tuple[OrderIntentBatch, ...]:

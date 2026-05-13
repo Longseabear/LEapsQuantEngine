@@ -1,6 +1,6 @@
 # Current Status
 
-Last updated: 2026-05-11
+Last updated: 2026-05-13
 
 This document records what is currently implemented and what should come next. It is intentionally operational: keep it close to the code and update it whenever a public runtime contract changes.
 
@@ -17,6 +17,13 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
 - `ExecutionModel` that creates order intents instead of broker orders,
   including order type, limit price, time-in-force, and optional slice lineage.
 - Runtime config loaders and a sample swing pipeline.
+- `RuntimeStateStore` is now available as an offline foundation for
+  model-owned state. `ModelStateKey`, `StatePatch`, `ModelStateRecord`, and
+  `ModelStateEvent` define the LEAN-style contract: models may request state
+  changes, but the runtime commits them at a boundary. `InMemoryRuntimeStateStore`
+  and `SQLiteRuntimeStateStore` are implemented for tests and future
+  backtest/live wiring; they are not connected to the live order loop by
+  default. See `docs/runtime-state.md`.
 
 ### Backtesting
 
@@ -309,6 +316,13 @@ The current LEaps RL constructor also treats same-symbol FLAT/DOWN insights as
 an override over same-or-older UP insights. This lets
 `leaps-volatility-trailing-stop` force an exit target for held symbols without
 alpha models creating orders directly.
+LEaps config now enables `emit_zero_for_missing_held_targets` on the RL
+constructor. This means the RL target set is interpreted as the complete target
+portfolio for any currency bucket with actionable UP insights: held symbols that
+drop out of that bucket's target set get explicit 0% targets tagged
+`no_longer_in_target_portfolio`. The model does not mass-flatten when a currency
+bucket has no actionable insights, so degraded/no-signal cycles do not become
+implicit all-sell cycles.
 LEaps alpha v0.2 upgrades the momentum and ETF rotation modules with
 risk-adjusted scoring. Momentum now uses fast/slow trend confirmation,
 20-session momentum, short acceleration, normalized volatility, and liquidity,
@@ -947,7 +961,7 @@ Current v0 behavior:
 - `order-runtime-status` provides an explicit operator/agent read model for order operations. It combines the append-only order ticket/event store with the virtual sleeve account store and reports broker account route, market scope, open tickets, ticket/event counts, sleeve cash/holdings, pending buy notional, pending sell quantities, and unallocated broker fills. It does not submit, poll, or reconcile broker orders.
 - `order-runtime-supervise` is the first bounded order maintenance command. It can poll stored open tickets through paper or broker-engine gateways, import recent execution history through broker-engine account operations, run holdings reconciliation, and then attach the final `order-runtime-status` view. Setup, poll, and reconcile failures are returned as warnings so an agent loop can continue. Overseas broker-engine poll/reconcile is blocked explicitly until an overseas broker-engine adapter exists.
 - `EqualWeightPortfolioConstructionModel` remains the first model implementation. It emits equal target percentages for active insights instead of quantity targets.
-- `RebalancePolicy` can reserve cash, filter tiny quantity deltas, and suppress tiny non-exit order notionals through `OrderSizingEngine`.
+- `RebalancePolicy` can reserve cash, filter tiny quantity deltas, and suppress tiny non-exit order notionals through `OrderSizingEngine`. It can also opt into `reused_target_churn_guard`, which suppresses adjacent-lot non-exit churn when a previous `PortfolioTargetBatch` is being reused. This is off by default because same-day opposite-side cooldown is a strategy/execution policy, not a universal engine invariant.
 - Portfolio Construction Models can be loaded from Python model modules through `PythonPortfolioConstructionModelLoader`.
 - When previously managed or currently held symbols lose active insight support, portfolio construction can emit flatten targets.
 - Risk runs every framework cycle. The default `FrameworkRunner` risk model is now `BasicRiskManagementModel`, which enforces v0 long-only behavior, per-symbol max position percentage, portfolio-level gross exposure percentage, available-cash clamps, and snapshot-quality entry gates before execution sees targets.
@@ -957,12 +971,33 @@ Current v0 behavior:
 - Execution now has a small `ExecutionEngine` that wraps a sleeve execution model and returns an auditable `OrderIntentBatch`.
 - Sleeves can inject execution models through `execution.model` and `execution.parameters`. File-based execution model references resolve relative to `workspace_path`, matching alpha, portfolio, and risk loading.
 - Execution models convert approved targets into `OrderIntent` records only. `ImmediateExecutionModel` remains the default one-ticket limit model, while `StandardExecutionModel`, `LimitExecutionModel`, `MarketExecutionModel`, and `SlicedExecutionModel` can express market/limit style, time-in-force, limit offsets, and quantity/notional slicing. They do not submit broker orders.
+- Execution model interfaces are now session-aware without breaking older
+  models. A custom model may keep the legacy four-argument `create_orders`
+  signature, or opt into `execution_context` / `market_session`. The context
+  exposes `session_for_symbol(symbol)` plus a market-scope session map, which
+  lets mixed KRX/US sleeves choose execution policy per route before the guard
+  and broker gateway run.
 - `OrderIntent` and `OrderTicket` now preserve execution instructions: `order_type`, `limit_price`, `time_in_force`, and metadata. Simulated fills can enforce explicit limit prices with `SimulatedFillModel(enforce_limit_price=True)`, while the default research fill path remains immediate-fill for compatibility.
 - `market_rules.py` centralizes KIS/KRX-style order constraints. Domestic KRX
   limit prices use the KRX tick table, whole-share quantity is required, and
   `MarketSession` separates regular-open from orderable after-hours phases.
   Confirmed live broker-engine submit can require an orderable session before
   commands are sent to KIS.
+- Current live KIS submit support includes regular KRX auction/continuous
+  phases and KRX after-hours phases. The runtime stamps `order_session` at
+  submit time, and the broker gateway maps domestic after-hours sessions to KIS
+  order divisions: `pre_open_after_hours -> 05`, `after_hours_close -> 06`,
+  and `after_hours_single_price -> 07`. Extended sessions are restricted to
+  `limit/day` orders by the engine guard.
+- KRX after-hours single-price (`16:00-18:00`) has an additional live guard:
+  KIS can reject NXT-traded symbols in that phase, so automatic live submit is
+  disabled unless symbol/venue support is explicitly marked on the order
+  metadata. The standard live order loop therefore submits domestic orders only
+  during `08:30-15:30` and `15:40-16:00` by default.
+- Overseas US routes are orderable for `pre_market`, `regular_continuous`, and
+  `after_market` sessions. v0 extended-session live submit is also guarded to
+  `limit/day`; account, exchange, or KIS-side rejections still flow back as
+  normal order lifecycle events.
 - `BrokerEngineExecutionGateway` rounds domestic limit prices to the side-safe
   KRX tick grid before submission: buys round up, sells round down. Market
   orders submit with price `0`.
@@ -976,7 +1011,7 @@ Current v0 behavior:
 - `BrokerExecutionGateway` is now the live/paper side-effect boundary after `OrderTicket`. The gateway returns `OrderEvent` records only; it does not mutate portfolio holdings.
 - `PaperBrokerExecutionGateway` can submit tickets and emit deterministic paper fills through the same broker-event surface.
 - 2026-05-10 update: the default live KIS boundary has moved in-process. `KISDirectClient` now owns KIS REST calls, token reuse, local daily/minute cache files, domestic account reads, execution-history reads, and domestic order submit/cancel. The legacy broker-engine path remains a compatibility/reference concept.
-- `BrokerEngineExecutionGateway` is the first StockProgram-inspired live broker adapter. It can submit domestic KRX tickets through the local broker-engine `place_domestic_cash_order` operation, prefers the broker-engine command queue when available, includes StockProgram-style dedupe metadata (`consumer_id`, `plan_id`, `chain_id`, `strategy_leg_id`, `intent_id`), and can poll broker-engine `command_status` snapshots to turn queued commands into accepted or rejected order events. It is domestic-only today; overseas sleeve routes are accepted for paper/status but blocked for broker-engine side effects.
+- `BrokerEngineExecutionGateway` is the first StockProgram-inspired live broker adapter. It can submit domestic KRX tickets through `place_domestic_cash_order` and overseas tickets through `place_overseas_stock_order`, prefers the broker-engine command queue when available, includes StockProgram-style dedupe metadata (`consumer_id`, `plan_id`, `chain_id`, `strategy_leg_id`, `intent_id`, `order_session`, `order_division`), and can poll broker-engine `command_status` snapshots to turn queued commands into accepted or rejected order events.
 - `VirtualSleeveAccountStore` can register `OrderTicket` ownership, bind later broker order aliases, and apply `OrderEvent` fills into the sleeve portfolio. This keeps the coupling one-way: broker/order events feed the virtual account ledger, while strategy and portfolio construction continue to read only `PortfolioProvider.current_portfolio(sleeve_id)`.
 - Broker fills are still synchronized from KIS execution history or broker-engine events after submission. The broker gateway does not treat submit acceptance as a holding change.
 - `MultiSleeveOrderOrchestrator` is now the account-level bridge after sleeve execution models run. It collects one or more sleeve `OrderIntentBatch` records, runs `OrderCoordinator`, registers ticket ownership in `VirtualSleeveAccountStore`, submits tickets through a `BrokerExecutionService`, optionally polls immediately, applies broker/order events back to the virtual account ledger, and returns an agent-readable orchestration report.
@@ -1580,7 +1615,7 @@ INPUT_RESOLUTION = "daily"
 
 `AlphaRuntime` tracks the last run per `alpha_id`. If a same-day cycle is skipped, it publishes an empty `InsightBatch` with `metadata.ran_alpha_ids` and `metadata.skipped_alpha_ids`, while `InsightManager` keeps existing active insights alive until their normal expiry.
 
-Portfolio construction now uses `portfolio.rebalance.cadence`. When cadence is not due, `FrameworkRunner` reuses the last allocation targets instead of rebuilding a new target set from a minute-level context. `OrderSizingEngine` still recomputes desired value, target quantity, and delta quantity from the current virtual portfolio, current price, and current cash/equity every cycle. Risk and execution then run against those freshly sized targets. Urgent exits should be modeled as always-on risk or explicitly quote-resolution exit models; daily portfolio cadence should not be the only safety path.
+Portfolio construction now uses `portfolio.rebalance.cadence`. When cadence is not due, `FrameworkRunner` reuses the last allocation targets instead of rebuilding a new target set from a minute-level context. `OrderSizingEngine` still recomputes desired value, target quantity, and delta quantity from the current virtual portfolio, current price, and current cash/equity every cycle. If `portfolio.rebalance.reused_target_churn_guard` is enabled, reused batches can suppress tiny adjacent-lot non-exit flips caused by discretization, while fresh allocation batches and explicit exit/flat targets remain tradeable. Risk and execution then run against the resulting sized targets. Urgent exits should be modeled as always-on risk or explicitly quote-resolution exit models; daily portfolio cadence should not be the only safety path.
 
 ## Next Work
 

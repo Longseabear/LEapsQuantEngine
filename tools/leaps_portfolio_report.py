@@ -560,7 +560,10 @@ def _pct(value: Any) -> str:
     if value is None:
         return "-"
     try:
-        return f"{float(value) * 100:.1f}%"
+        percent = float(value) * 100
+        if percent != 0 and abs(percent) < 0.1:
+            return f"{percent:.2f}%"
+        return f"{percent:.1f}%"
     except (TypeError, ValueError):
         return str(value)
 

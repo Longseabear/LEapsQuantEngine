@@ -141,7 +141,11 @@ class OrderSizingEngine:
             for target in context.portfolio_targets.targets
         )
         sized_plans, lot_optimizer_metadata = self._optimize_lots(raw_plans, target_value_by_currency)
-        plans = self._filter_rebalance_noise(sized_plans)
+        plans, noise_metadata = self._filter_rebalance_noise(
+            sized_plans,
+            context,
+            target_value_by_currency=target_value_by_currency,
+        )
         targets = tuple(plan.target for plan in plans)
         return OrderSizingBatch(
             sleeve_id=context.sleeve_id,
@@ -165,11 +169,19 @@ class OrderSizingEngine:
                 "target_portfolio_value_by_currency": target_value_by_currency,
                 "recomputed_from_current_state": True,
                 **lot_optimizer_metadata,
+                **noise_metadata,
             },
         )
 
-    def _filter_rebalance_noise(self, plans: tuple[OrderSizingPlan, ...]) -> tuple[OrderSizingPlan, ...]:
+    def _filter_rebalance_noise(
+        self,
+        plans: tuple[OrderSizingPlan, ...],
+        context: OrderSizingContext,
+        *,
+        target_value_by_currency: Mapping[str, float],
+    ) -> tuple[tuple[OrderSizingPlan, ...], dict[str, Any]]:
         filtered: list[OrderSizingPlan] = []
+        suppressed_churn: list[OrderSizingPlan] = []
         for plan in plans:
             if plan.delta_quantity == 0:
                 continue
@@ -177,8 +189,21 @@ class OrderSizingEngine:
                 continue
             if self._below_min_notional(plan):
                 continue
+            if self._reused_target_churn_noise(
+                plan,
+                context,
+                target_value_by_currency=target_value_by_currency,
+            ):
+                suppressed_churn.append(plan)
+                continue
             filtered.append(plan)
-        return tuple(filtered)
+        return tuple(filtered), {
+            "reused_target_churn_guard_enabled": self.rebalance_policy.reused_target_churn_guard,
+            "reused_target_churn_suppressed_count": len(suppressed_churn),
+            "reused_target_churn_suppressed_symbols": [
+                plan.allocation.symbol.key for plan in suppressed_churn
+            ],
+        }
 
     def _below_min_notional(self, plan: OrderSizingPlan) -> bool:
         min_notional = self.rebalance_policy.min_order_notional
@@ -193,6 +218,36 @@ class OrderSizingEngine:
         if plan.current_price is None:
             return True
         return abs(plan.delta_quantity) * plan.current_price < min_notional
+
+    def _reused_target_churn_noise(
+        self,
+        plan: OrderSizingPlan,
+        context: OrderSizingContext,
+        *,
+        target_value_by_currency: Mapping[str, float],
+    ) -> bool:
+        policy = self.rebalance_policy
+        if not policy.reused_target_churn_guard:
+            return False
+        if not bool(context.portfolio_targets.metadata.get("reused")):
+            return False
+        if plan.current_quantity == 0 or plan.target_quantity == 0:
+            return False
+        if abs(plan.delta_quantity) > policy.reused_target_churn_max_quantity_delta:
+            return False
+        if plan.target_percent == 0 or str(plan.reason or "").strip().lower() == "exit":
+            return False
+        if plan.current_price is None or plan.current_price <= 0:
+            return False
+
+        currency = currency_for_symbol(plan.allocation.symbol)
+        threshold = max(
+            policy.min_order_notional,
+            plan.current_price * policy.reused_target_churn_lot_fraction,
+            target_value_by_currency.get(currency, 0.0) * policy.reused_target_churn_equity_bps / 10_000.0,
+        )
+        drift_notional = abs(plan.desired_value - plan.current_value)
+        return drift_notional <= threshold + 1e-9
 
     def _optimize_lots(
         self,

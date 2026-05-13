@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+import inspect
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, TimeInForce
 from leaps_quant_engine.portfolio import Portfolio
 
@@ -17,6 +19,17 @@ class ExecutionContext:
     portfolio: Portfolio
     data: DataSlice
     approved_targets: tuple[PortfolioTarget, ...]
+    market_session: MarketSession | None = None
+    market_sessions: Mapping[str, MarketSession] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        sessions = dict(self.market_sessions)
+        if self.market_session is not None:
+            sessions.setdefault(self.market_session.market_scope, self.market_session)
+        object.__setattr__(self, "market_sessions", MappingProxyType(sessions))
+
+    def session_for_symbol(self, symbol: str | Any) -> MarketSession | None:
+        return self.market_sessions.get(_market_scope_for_symbol(symbol)) or self.market_session
 
 
 class ExecutionModel(Protocol):
@@ -26,6 +39,8 @@ class ExecutionModel(Protocol):
         portfolio: Portfolio,
         data: DataSlice,
         targets: list[PortfolioTarget],
+        execution_context: ExecutionContext | None = None,
+        market_session: MarketSession | None = None,
     ) -> list[OrderIntent]:
         """Convert approved portfolio targets into order intents."""
 
@@ -104,6 +119,8 @@ class StandardExecutionModel:
         portfolio: Portfolio,
         data: DataSlice,
         targets: list[PortfolioTarget],
+        execution_context: ExecutionContext | None = None,
+        market_session: MarketSession | None = None,
     ) -> list[OrderIntent]:
         orders: list[OrderIntent] = []
         for target in targets:
@@ -255,12 +272,8 @@ class ExecutionEngine:
 
     def execute(self, context: ExecutionContext) -> OrderIntentBatch:
         orders = tuple(
-            self.model.create_orders(
-                context.sleeve_id,
-                context.portfolio,
-                context.data,
-                list(context.approved_targets),
-            )
+            _with_execution_context_metadata(order, context)
+            for order in _create_orders(self.model, context)
         )
         return OrderIntentBatch(
             sleeve_id=context.sleeve_id,
@@ -271,5 +284,48 @@ class ExecutionEngine:
             metadata={
                 "approved_target_count": len(context.approved_targets),
                 "created_order_count": len(orders),
+                "market_sessions": {
+                    market_scope: session.to_dict()
+                    for market_scope, session in sorted(context.market_sessions.items())
+                },
             },
         )
+
+
+def _create_orders(model: ExecutionModel, context: ExecutionContext) -> list[OrderIntent]:
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(model.create_orders).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    supports_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if supports_kwargs or "execution_context" in parameters:
+        kwargs["execution_context"] = context
+    if supports_kwargs or "market_session" in parameters:
+        kwargs["market_session"] = context.market_session
+    return model.create_orders(
+        context.sleeve_id,
+        context.portfolio,
+        context.data,
+        list(context.approved_targets),
+        **kwargs,
+    )
+
+
+def _with_execution_context_metadata(order: OrderIntent, context: ExecutionContext) -> OrderIntent:
+    session = context.session_for_symbol(order.symbol)
+    if session is None:
+        return order
+    metadata = dict(order.metadata)
+    metadata.setdefault("order_session", session.session_phase)
+    metadata.setdefault("market_session_phase", session.session_phase)
+    metadata.setdefault("market_session_scope", session.market_scope)
+    metadata.setdefault("market_session_source", session.source)
+    metadata.setdefault("is_regular_market_open", session.is_regular_market_open)
+    return replace(order, metadata=metadata)
+
+
+def _market_scope_for_symbol(symbol: str | Any) -> str:
+    key = symbol.key if hasattr(symbol, "key") else str(symbol)
+    market = key.split(":", 1)[0].strip().upper() if ":" in key else str(getattr(symbol, "market", "")).strip().upper()
+    return "domestic" if market in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"} else "overseas"

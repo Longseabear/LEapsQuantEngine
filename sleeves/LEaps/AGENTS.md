@@ -52,6 +52,13 @@ construction must respect active FLAT/DOWN insights for a symbol over UP
 insights from another alpha at the same or later timestamp. Do not work around
 exit signals by emitting broker orders from alpha code.
 
+The active RL portfolio constructor is configured as a complete target
+portfolio allocator for KRW buckets. When active KRW UP insights produce a new
+target set, any currently held KRW symbol missing from that set should receive
+a 0% target tagged `no_longer_in_target_portfolio`. If no actionable KRW
+insights exist, do not interpret that as an implicit all-sell signal; rely on
+explicit FLAT/DOWN insights or the next valid target set.
+
 Known current strategy risk: the active RL allocator plus daily rebalance can
 produce high turnover. If tuning this, adjust portfolio/risk policy such as
 rebalance cadence, minimum drift, cooldown, or turnover guard. Do not add hidden
@@ -67,12 +74,21 @@ Use `order_type`, `limit_price`, `time_in_force`, and execution metadata on
 portfolio, or risk modules. `executions/leaps_immediate.py` wraps the engine's
 `StandardExecutionModel`, so it can be configured as limit, market, or sliced
 execution through `execution.parameters` without changing portfolio logic.
+New execution models can accept `execution_context` or `market_session` in
+`create_orders`. Use `execution_context.session_for_symbol(symbol)` when the
+policy must differ between KRX regular, KRX after-hours, US pre-market, and US
+after-market.
 
 KIS-style execution constraints are now engine-owned. Domestic KRX orders are
 whole-share only, limit prices must fit the KRX tick grid, and the broker
 gateway rounds domestic limit prices to the nearest side-safe tick before
 submission. Confirmed live submit can require an orderable market session. Do
-not bypass these checks from sleeve code.
+not bypass these checks from sleeve code. KRX after-hours submit is supported
+through runtime-stamped `order_session` metadata and gateway-owned KIS order
+division mapping, so sleeve execution models should keep choosing only
+`order_type`, `limit_price`, and `time_in_force`. Do not opt into
+`allow_after_hours_single_price` unless the symbol/venue combination has been
+verified; KIS rejects some NXT-traded symbols in that phase.
 
 Backtests can simulate KIS-like transaction costs with `--fee-model kis`.
 Treat this as a configurable preset, not a promise that a specific account's

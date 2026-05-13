@@ -156,6 +156,10 @@ class RebalancePolicy:
     min_quantity_delta: int = 1
     allow_exit_below_min_notional: bool = True
     cadence: str = "every_cycle"
+    reused_target_churn_guard: bool = False
+    reused_target_churn_max_quantity_delta: int = 1
+    reused_target_churn_lot_fraction: float = 0.5
+    reused_target_churn_equity_bps: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.cash_reserve_pct < 1.0:
@@ -166,6 +170,12 @@ class RebalancePolicy:
             raise ValueError("min_quantity_delta cannot be negative.")
         if not str(self.cadence).strip():
             raise ValueError("cadence cannot be empty.")
+        if self.reused_target_churn_max_quantity_delta < 0:
+            raise ValueError("reused_target_churn_max_quantity_delta cannot be negative.")
+        if self.reused_target_churn_lot_fraction < 0:
+            raise ValueError("reused_target_churn_lot_fraction cannot be negative.")
+        if self.reused_target_churn_equity_bps < 0:
+            raise ValueError("reused_target_churn_equity_bps cannot be negative.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +226,10 @@ class PortfolioConstructionEngine:
                 "min_order_notional": self.rebalance_policy.min_order_notional,
                 "min_quantity_delta": self.rebalance_policy.min_quantity_delta,
                 "cadence": self.rebalance_policy.cadence,
+                "reused_target_churn_guard": self.rebalance_policy.reused_target_churn_guard,
+                "reused_target_churn_max_quantity_delta": self.rebalance_policy.reused_target_churn_max_quantity_delta,
+                "reused_target_churn_lot_fraction": self.rebalance_policy.reused_target_churn_lot_fraction,
+                "reused_target_churn_equity_bps": self.rebalance_policy.reused_target_churn_equity_bps,
             },
         )
 

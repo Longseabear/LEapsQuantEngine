@@ -7,10 +7,11 @@ from typing import Any, Iterable, Mapping
 
 from leaps_quant_engine.broker_routing import currency_for_market_scope, market_scope_for_symbol
 from leaps_quant_engine.execution import OrderIntentBatch
-from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType
+from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, TimeInForce
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderTicketStatus
 from leaps_quant_engine.market_rules import (
+    AFTER_HOURS_ORDERABLE_PHASES,
     MarketSession,
     default_capability_for_market_scope,
     is_domestic_symbol,
@@ -115,6 +116,26 @@ class EngineGuard:
                     },
                 )
             )
+        if (
+            require_orderable_session
+            and broker == "broker-engine"
+            and session is not None
+            and session.is_orderable
+            and session.session_phase not in capability.supported_live_session_phases
+        ):
+            decisions.append(
+                _decision(
+                    "rejected",
+                    "unsupported_live_session_phase_for_route",
+                    "",
+                    metadata={
+                        "market_scope": session.market_scope,
+                        "session_phase": session.session_phase,
+                        "supported_live_session_phases": list(capability.supported_live_session_phases),
+                        "source": session.source,
+                    },
+                )
+            )
         decisions.extend(_duplicate_submit_decisions(batches_tuple, order_state_store, commit=commit))
         open_buy_notional, open_buy_quantities, open_sell_quantities = _open_ticket_reservations(order_state_store)
         unapplied_fill_deltas = _unapplied_fill_quantity_deltas(order_state_store, account_store)
@@ -162,6 +183,50 @@ class EngineGuard:
                             "order_type": order.order_type.value,
                             "time_in_force": order.time_in_force.value,
                             "market_scope": market_scope,
+                        },
+                    )
+                )
+            if (
+                require_orderable_session
+                and broker == "broker-engine"
+                and session is not None
+                and session.market_scope == "domestic"
+                and session.session_phase == "after_hours_single_price"
+                and not _metadata_bool(order.metadata.get("allow_after_hours_single_price"))
+            ):
+                decisions.append(
+                    _decision(
+                        "rejected",
+                        "domestic_after_hours_single_price_requires_explicit_symbol_support",
+                        order.sleeve_id,
+                        order=order,
+                        metadata={
+                            "market_scope": session.market_scope,
+                            "session_phase": session.session_phase,
+                            "hint": "KIS can reject NXT-traded symbols in KRX after-hours single-price. Set allow_after_hours_single_price only after symbol/venue support is verified.",
+                        },
+                    )
+                )
+            if (
+                require_orderable_session
+                and broker == "broker-engine"
+                and session is not None
+                and _is_extended_order_session(session)
+                and not _is_limit_day_order(order)
+            ):
+                decisions.append(
+                    _decision(
+                        "rejected",
+                        "unsupported_extended_session_order_style",
+                        order.sleeve_id,
+                        order=order,
+                        metadata={
+                            "market_scope": session.market_scope,
+                            "session_phase": session.session_phase,
+                            "order_type": order.order_type.value,
+                            "time_in_force": order.time_in_force.value,
+                            "supported_order_type": OrderType.LIMIT.value,
+                            "supported_time_in_force": TimeInForce.DAY.value,
                         },
                     )
                 )
@@ -485,6 +550,24 @@ def _metadata_int(value: Any) -> int | None:
         return int(float(text))
     except ValueError:
         return None
+
+
+def _metadata_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _is_extended_order_session(session: MarketSession) -> bool:
+    if session.market_scope == "domestic":
+        return session.session_phase in AFTER_HOURS_ORDERABLE_PHASES
+    if session.market_scope == "overseas":
+        return session.session_phase in {"pre_market", "after_market"}
+    return False
+
+
+def _is_limit_day_order(order: OrderIntent) -> bool:
+    return order.order_type is OrderType.LIMIT and order.time_in_force is TimeInForce.DAY
 
 
 def _coerce_market_session(value: MarketSession | Mapping[str, Any] | None) -> MarketSession | None:

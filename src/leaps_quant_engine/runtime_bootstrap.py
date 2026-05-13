@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
 import importlib.util
 import inspect
@@ -9,11 +10,12 @@ import logging
 from pathlib import Path
 import sys
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 
 from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
 from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketDataEngineLiveQuoteProvider
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader
+from leaps_quant_engine.broker_routing import market_scope_for_symbol, market_scope_from_market
 from leaps_quant_engine.execution import ExecutionEngine
 from leaps_quant_engine.execution_model_loader import PythonExecutionModelLoader
 from leaps_quant_engine.framework import (
@@ -25,6 +27,7 @@ from leaps_quant_engine.framework import (
     RebalancePolicy,
 )
 from leaps_quant_engine.indicators import IndicatorEngine
+from leaps_quant_engine.market_rules import MarketSession, synthetic_domestic_market_session, synthetic_us_market_session
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
@@ -204,11 +207,14 @@ class RuntimeSleeveRuntime:
         active_snapshot = active_snapshot_store.active() if active_snapshot_store is not None else None
         if active_snapshot is None:
             return None
+        market_sessions = pending._market_sessions()
         return pending.framework_runner.run_once(
             indicator_snapshot=active_snapshot,
             data=self._latest_data_slice(active_snapshot),
             portfolio=self.portfolio_provider.current_portfolio(self.sleeve_id),
             alpha_symbols_by_model=pending._alpha_symbols_by_model(),
+            market_session=pending._primary_market_session(market_sessions),
+            market_sessions=market_sessions,
         )
 
     def _run_framework_once(self) -> FrameworkCycleResult | None:
@@ -218,11 +224,14 @@ class RuntimeSleeveRuntime:
             return None
         data = self._latest_data_slice(active_snapshot)
         self.portfolio = self.portfolio_provider.current_portfolio(self.sleeve_id)
+        market_sessions = self._market_sessions()
         return self.framework_runner.run_once(
             indicator_snapshot=active_snapshot,
             data=data,
             portfolio=self.portfolio,
             alpha_symbols_by_model=self._alpha_symbols_by_model(),
+            market_session=self._primary_market_session(market_sessions),
+            market_sessions=market_sessions,
         )
 
     def _alpha_symbols_by_model(self) -> dict[str, tuple[Symbol, ...]] | None:
@@ -251,6 +260,20 @@ class RuntimeSleeveRuntime:
         if market_snapshot is not None and market_snapshot.bars:
             return market_snapshot.as_data_slice()
         return _data_slice_from_indicator_snapshot(indicator_snapshot)
+
+    def _primary_market_session(self, market_sessions: Mapping[str, MarketSession]) -> MarketSession | None:
+        return market_sessions.get(market_scope_from_market(self.coarse_universe.market))
+
+    def _market_sessions(self) -> dict[str, MarketSession]:
+        scopes = {market_scope_from_market(self.coarse_universe.market)}
+        scopes.update(str(scope).strip().lower() for scope in self.sleeve_config.broker_account_routes.keys())
+        scopes.update(market_scope_for_symbol(symbol) for symbol in self.active_result.active_universe.symbols)
+        scopes.update(market_scope_for_symbol(symbol) for symbol in self.portfolio.held_symbols)
+        return {
+            scope: _synthetic_market_session_for_scope(scope)
+            for scope in sorted(scopes)
+            if scope in {"domestic", "overseas"}
+        }
 
     def _agent_status(self, report: "RuntimeRunOnceReport") -> dict[str, Any]:
         cycle = report.worker.cycles[-1] if report.worker.cycles else None
@@ -431,6 +454,7 @@ def bootstrap_sleeve_runtime(
     selection_indicator_snapshot = None
     portfolio_provider = deps.portfolio_provider or _build_portfolio_provider(snapshot, sleeve_config)
     portfolio = portfolio_provider.current_portfolio(sleeve_config.sleeve_id)
+    held_symbols = _merge_symbols(portfolio.held_symbols, held_symbols)
     framework_runner = FrameworkRunner(
         sleeve_id=sleeve_config.sleeve_id,
         alpha_runtime=alpha_runtime,
@@ -565,6 +589,10 @@ def _build_portfolio_engine(
             min_quantity_delta=rebalance_config.min_quantity_delta,
             allow_exit_below_min_notional=rebalance_config.allow_exit_below_min_notional,
             cadence=rebalance_config.cadence,
+            reused_target_churn_guard=rebalance_config.reused_target_churn_guard,
+            reused_target_churn_max_quantity_delta=rebalance_config.reused_target_churn_max_quantity_delta,
+            reused_target_churn_lot_fraction=rebalance_config.reused_target_churn_lot_fraction,
+            reused_target_churn_equity_bps=rebalance_config.reused_target_churn_equity_bps,
         ),
     )
 
@@ -694,6 +722,18 @@ def _selection_symbols_for(active_result: ActiveUniverseResult, selection_id: st
     raise RuntimeBootstrapError(f"Unknown alpha input selection_id: {selection_id}")
 
 
+def _merge_symbols(*groups: Iterable[Symbol]) -> tuple[Symbol, ...]:
+    merged: list[Symbol] = []
+    seen: set[str] = set()
+    for group in groups:
+        for symbol in group:
+            if symbol.key in seen:
+                continue
+            seen.add(symbol.key)
+            merged.append(symbol)
+    return tuple(merged)
+
+
 def _load_reference(reference: ModuleReference) -> Any:
     text = reference.ref
     if ":" not in text:
@@ -781,6 +821,12 @@ def _snapshot_price(snapshot: IndicatorSnapshot, symbol_key: str) -> float | Non
 def _symbol_from_key(symbol_key: str) -> Symbol:
     market, ticker = symbol_key.split(":", 1)
     return Symbol(ticker=ticker, market=market)
+
+
+def _synthetic_market_session_for_scope(market_scope: str) -> MarketSession:
+    if market_scope == "overseas":
+        return synthetic_us_market_session(datetime.now(timezone.utc))
+    return synthetic_domestic_market_session(datetime.now(timezone(timedelta(hours=9))))
 
 
 def resolve_runtime_path(snapshot: RuntimeConfigSnapshot, path: str | Path) -> Path:

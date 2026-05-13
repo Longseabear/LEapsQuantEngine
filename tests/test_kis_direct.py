@@ -260,6 +260,49 @@ def test_direct_kis_limit_order_rejects_zero_price(tmp_path):
         raise AssertionError("limit order with zero price should fail")
 
 
+def test_direct_kis_domestic_after_hours_close_order_sends_order_division_06(tmp_path):
+    _TOKEN_CACHE.clear()
+    session = _FakeSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    client.call_operation(
+        "place_domestic_cash_order",
+        {
+            "side": "sell",
+            "symbol": "005930",
+            "quantity": 4,
+            "price": 70000,
+            "order_division": "06",
+            "exchange_scope": "KRX",
+        },
+    )
+
+    order_call = session.post_calls[-1]
+    assert order_call["json"]["ORD_DVSN"] == "06"
+    assert order_call["json"]["ORD_UNPR"] == "70000"
+
+
+def test_direct_kis_domestic_after_hours_limit_order_rejects_zero_price(tmp_path):
+    _TOKEN_CACHE.clear()
+    client = KISDirectClient(settings=_settings(), session=_FakeSession(), cache_dir=tmp_path)
+
+    try:
+        client.call_operation(
+            "place_domestic_cash_order",
+            {
+                "side": "sell",
+                "symbol": "005930",
+                "quantity": 1,
+                "price": 0,
+                "order_division": "07",
+            },
+        )
+    except KISDirectClientError as exc:
+        assert "limit order price" in str(exc)
+    else:
+        raise AssertionError("after-hours limit order with zero price should fail")
+
+
 def test_direct_kis_overseas_limit_order_uses_order_endpoint_and_exchange_alias(tmp_path):
     _TOKEN_CACHE.clear()
     session = _FakeSession()

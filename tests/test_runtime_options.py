@@ -67,6 +67,10 @@ def _runtime_payload():
                         "cash_reserve_pct": 0.1,
                         "min_order_notional": 1000,
                         "min_quantity_delta": 2,
+                        "reused_target_churn_guard": True,
+                        "reused_target_churn_max_quantity_delta": 1,
+                        "reused_target_churn_lot_fraction": 0.5,
+                        "reused_target_churn_equity_bps": 5,
                     },
                 },
                 "worker": {
@@ -102,6 +106,10 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.portfolio.rebalance.cash_reserve_pct == 0.1
     assert sleeve.portfolio.rebalance.min_order_notional == 1000
     assert sleeve.portfolio.rebalance.min_quantity_delta == 2
+    assert sleeve.portfolio.rebalance.reused_target_churn_guard is True
+    assert sleeve.portfolio.rebalance.reused_target_churn_max_quantity_delta == 1
+    assert sleeve.portfolio.rebalance.reused_target_churn_lot_fraction == 0.5
+    assert sleeve.portfolio.rebalance.reused_target_churn_equity_bps == 5
     assert sleeve.worker.cycle_interval_seconds == 60
     assert sleeve.indicators.min_ready_ratio == 0.9
 
@@ -223,6 +231,14 @@ def test_runtime_config_validation_rejects_negative_sleeve_cash():
 def test_runtime_config_validation_rejects_invalid_portfolio_rebalance():
     payload = _runtime_payload()
     payload["sleeves"][0]["portfolio"]["rebalance"]["cash_reserve_pct"] = 1.0
+
+    with pytest.raises(ConfigurationValidationError):
+        parse_runtime_config(payload)
+
+
+def test_runtime_config_validation_rejects_invalid_reused_target_churn_policy():
+    payload = _runtime_payload()
+    payload["sleeves"][0]["portfolio"]["rebalance"]["reused_target_churn_lot_fraction"] = -0.1
 
     with pytest.raises(ConfigurationValidationError):
         parse_runtime_config(payload)

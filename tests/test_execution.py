@@ -8,7 +8,8 @@ from leaps_quant_engine.execution import (
     MarketExecutionModel,
     SlicedExecutionModel,
 )
-from leaps_quant_engine.models import Bar, DataSlice, OrderSide, OrderType, PortfolioTarget, Symbol, TimeInForce
+from leaps_quant_engine.market_rules import MarketSession
+from leaps_quant_engine.models import Bar, DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, Symbol, TimeInForce
 from leaps_quant_engine.portfolio import Holding, Portfolio
 
 
@@ -139,3 +140,90 @@ def test_sliced_execution_model_splits_large_delta_into_child_orders():
     assert [order.metadata["slice_index"] for order in batch.order_intents] == [1, 2, 3]
     assert all(order.metadata["slice_count"] == 3 for order in batch.order_intents)
     assert all(order.order_type is OrderType.MARKET for order in batch.order_intents)
+
+
+class _ContextAwareExecutionModel:
+    def create_orders(self, sleeve_id, portfolio, data, targets, execution_context=None):
+        assert execution_context is not None
+        target = targets[0]
+        session = execution_context.session_for_symbol(target.symbol)
+        return [
+            OrderIntent(
+                sleeve_id,
+                target.symbol,
+                OrderSide.BUY,
+                target.quantity,
+                data.get(target.symbol).close,
+                metadata={"model_seen_session": session.session_phase if session else ""},
+            )
+        ]
+
+
+def test_execution_engine_passes_market_session_context_and_stamps_orders():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+    session = MarketSession(
+        market_scope="overseas",
+        session_phase="pre_market",
+        is_orderable=True,
+        is_regular_market_open=False,
+        source="test",
+    )
+
+    batch = ExecutionEngine(model=_ContextAwareExecutionModel()).execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=Portfolio(cash=1_000),
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 3, "entry"),),
+            market_session=session,
+        )
+    )
+
+    order = batch.order_intents[0]
+    assert order.metadata["model_seen_session"] == "pre_market"
+    assert order.metadata["order_session"] == "pre_market"
+    assert order.metadata["market_session_scope"] == "overseas"
+    assert batch.metadata["market_sessions"]["overseas"]["session_phase"] == "pre_market"
+
+
+class _MarketSessionAwareExecutionModel:
+    def create_orders(self, sleeve_id, portfolio, data, targets, market_session=None):
+        target = targets[0]
+        return [
+            OrderIntent(
+                sleeve_id,
+                target.symbol,
+                OrderSide.SELL,
+                target.quantity,
+                data.get(target.symbol).close,
+                metadata={"model_seen_primary_session": market_session.session_phase if market_session else ""},
+            )
+        ]
+
+
+def test_execution_engine_supports_market_session_keyword_for_new_models():
+    symbol = Symbol("005930", "KRX")
+    data = _slice(symbol, 70_000.0)
+    session = MarketSession(
+        market_scope="domestic",
+        session_phase="after_hours_close",
+        is_orderable=True,
+        is_regular_market_open=False,
+        source="test",
+    )
+
+    batch = ExecutionEngine(model=_MarketSessionAwareExecutionModel()).execute(
+        ExecutionContext(
+            sleeve_id="LEaps",
+            generated_at=data.time,
+            portfolio=Portfolio(cash=1_000),
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 1, "reduce"),),
+            market_session=session,
+        )
+    )
+
+    assert batch.order_intents[0].metadata["model_seen_primary_session"] == "after_hours_close"
+    assert batch.order_intents[0].metadata["order_session"] == "after_hours_close"
