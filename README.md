@@ -99,14 +99,14 @@ Implemented now:
 - Alpha: Python Alpha Model loader, `AlphaRuntime`, per-alpha cadence, alpha-specific selected symbol inputs, `Insight`, `InsightBatch`, and example alpha modules.
 - Framework: `InsightManager`, `PortfolioConstructionEngine`, target persistence through rebalance cadence, equal-weight portfolio model, `PortfolioAllocationTarget`, `OrderSizingEngine`, basic risk gates, immediate execution, and order-intent output.
 - Orders: global order coordination, `OrderTicket`, `OrderEvent`, append-only order runtime state, open-ticket polling, execution-history reconciliation, simulated fills, multi-sleeve order orchestration, paper broker gateway, and a StockProgram-style broker-engine gateway.
-- Operations: `runtime-run-once --order-batch-output` persists strategy output as a submit-ready order-intent artifact. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from that artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation and returns a final status report. Order runtime commands can route through sleeve-level broker account profiles.
+- Operations: `runtime-run-once --order-batch-output` persists strategy output as a submit-ready order-intent artifact. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from that artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation, can expire rolled-over `day` tickets, can cancel stale tickets when explicitly requested, and returns a final status report. Order runtime commands can route through sleeve-level broker account profiles.
 - Runtime: config validation, broker account profiles, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
 - Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills and report metrics.
 
 Not complete yet:
 
 - Long-running live submit/poll/fill-sync/reconcile orchestration across all sleeves.
-- Rich cancel/replace handling and broker fill event ingestion beyond execution-history sync.
+- Rich model-driven replace policy beyond bounded stale cancellation, plus broker fill event ingestion beyond execution-history sync.
 - Overseas broker-engine live submit, poll, and account reconciliation. Overseas sleeve routes are explicit now, but broker-engine side effects are blocked until the overseas adapter exists.
 - Long-running production daemon/supervisor with scheduled universe reselection.
 

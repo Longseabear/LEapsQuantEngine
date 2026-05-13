@@ -479,6 +479,29 @@ reconciled
 - Replacements and cancellations should preserve lineage to the original intent.
 - Idempotency keys are required before live broker submission exists.
 
+### Cancellation And Replacement
+
+Cancellation and replacement must stay LEAN-style.
+
+- Execution models decide the policy: order type, limit offset, urgency, max
+  order age, price-drift threshold, minimum replace interval, and replacement
+  count limits.
+- Order runtime owns the lifecycle: `cancel_requested`, `cancelled`,
+  `replace_requested`, `replacement_submitted`, `partially_filled`, `filled`,
+  `expired`, and `reconciled`.
+- Broker adapters only execute approved lifecycle actions through KIS. They do
+  not decide strategy urgency or target changes.
+- Never submit a replacement before the prior live ticket is confirmed
+  cancelled, expired, rejected, or reduced by fills.
+- If a ticket is partially filled, cancel/replace only the remaining quantity.
+- Day orders must be expired or reconciled after their valid session; stale
+  pending quantity must not block fresh targets indefinitely.
+- Do not replace on every quote tick. Use model-provided drift thresholds,
+  bounded intervals, and max replacement counts so a falling market cannot
+  create an endless non-filled cancel/replace loop.
+- Urgent exits such as risk reduction, stop loss, or trailing stop should be
+  expressed as execution policy, not hidden in engine heuristics.
+
 ## Buy/Sell Structure
 
 Buy and sell behavior should be symmetrical where possible:

@@ -23,6 +23,7 @@ class OrderTicketStatus(str, Enum):
     FILLED = "filled"
     CANCEL_REQUESTED = "cancel_requested"
     CANCELLED = "cancelled"
+    EXPIRED = "expired"
     REJECTED = "rejected"
 
 
@@ -34,6 +35,7 @@ class OrderEventType(str, Enum):
     FILLED = "filled"
     CANCEL_REQUESTED = "cancel_requested"
     CANCELLED = "cancelled"
+    EXPIRED = "expired"
     REJECTED = "rejected"
 
 
@@ -208,6 +210,8 @@ class OrderTicket:
             status = OrderTicketStatus.CANCEL_REQUESTED
         elif event.event_type is OrderEventType.CANCELLED:
             status = OrderTicketStatus.CANCELLED
+        elif event.event_type is OrderEventType.EXPIRED:
+            status = OrderTicketStatus.EXPIRED
         elif event.event_type is OrderEventType.REJECTED:
             status = OrderTicketStatus.REJECTED
         elif event.event_type is OrderEventType.CREATED:
@@ -462,7 +466,11 @@ class SimulatedFillModel:
     ) -> tuple[OrderEvent, ...]:
         events: list[OrderEvent] = []
         for ticket in tickets:
-            if ticket.remaining_quantity <= 0 or ticket.status in {OrderTicketStatus.CANCELLED, OrderTicketStatus.REJECTED}:
+            if ticket.remaining_quantity <= 0 or ticket.status in {
+                OrderTicketStatus.CANCELLED,
+                OrderTicketStatus.EXPIRED,
+                OrderTicketStatus.REJECTED,
+            }:
                 continue
             fill_price = self.slippage_model.fill_price(ticket)
             if self.enforce_limit_price and not _is_marketable(ticket, fill_price):

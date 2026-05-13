@@ -171,6 +171,7 @@ _TERMINAL_STATUSES = frozenset(
     {
         OrderTicketStatus.FILLED,
         OrderTicketStatus.CANCELLED,
+        OrderTicketStatus.EXPIRED,
         OrderTicketStatus.REJECTED,
     }
 )

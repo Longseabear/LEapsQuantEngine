@@ -373,7 +373,12 @@ def _open_ticket_reservations(
     except Exception:  # noqa: BLE001
         return buy_notional, buy_quantities, sell_quantities
     for ticket in tickets:
-        if ticket.status in {OrderTicketStatus.CANCELLED, OrderTicketStatus.FILLED, OrderTicketStatus.REJECTED}:
+        if ticket.status in {
+            OrderTicketStatus.CANCELLED,
+            OrderTicketStatus.EXPIRED,
+            OrderTicketStatus.FILLED,
+            OrderTicketStatus.REJECTED,
+        }:
             continue
         key = (ticket.sleeve_id, ticket.symbol.key)
         if ticket.side is OrderSide.BUY:

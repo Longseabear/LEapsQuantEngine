@@ -86,7 +86,10 @@ if ($includeLiveLoopsEnabled -and $includeLeapsLiveLoopEnabled) {
             "-Journal", "data/cycle-journal/leaps_workspace_smoke.jsonl",
             "-LogPath", "data/runtime/live-order-loop/LEaps.log",
             "-SubmitStatePath", "data/runtime/live-order-loop/LEaps_submit_state.json",
-            "-SubmitOncePerDay", "true"
+            "-SubmitOncePerDay", "true",
+            "-StaleAfterSeconds", "300",
+            "-CancelStaleOpenTickets", "true",
+            "-ExpireDayOpenTickets", "true"
         )
 
 }
@@ -106,7 +109,10 @@ if ($includeLiveLoopsEnabled -and $includeUsLiveLoopEnabled) {
             "-Journal", "data/cycle-journal/us_etf_rotation.jsonl",
             "-LogPath", "data/runtime/live-order-loop/us_etf_rotation.log",
             "-SubmitStatePath", "data/runtime/live-order-loop/us_etf_rotation_submit_state.json",
-            "-SubmitOncePerDay", "true"
+            "-SubmitOncePerDay", "true",
+            "-StaleAfterSeconds", "900",
+            "-CancelStaleOpenTickets", "true",
+            "-ExpireDayOpenTickets", "true"
         )
 }
 

@@ -11,7 +11,10 @@ param(
     [string]$FrameworkStatePath = "",
     [string]$SubmitStatePath = "",
     [string]$SubmitOncePerDay = "true",
-    [string]$RequireSupportedSubmitSession = "true"
+    [string]$RequireSupportedSubmitSession = "true",
+    [double]$StaleAfterSeconds = 0,
+    [string]$CancelStaleOpenTickets = "false",
+    [string]$ExpireDayOpenTickets = "true"
 )
 
 $ErrorActionPreference = "Continue"
@@ -242,11 +245,20 @@ function Invoke-OrderRuntimeSupervise {
     if ($Notify) {
         $superviseArgs += "--notify"
     }
+    if ($StaleAfterSeconds -gt 0) {
+        $superviseArgs += @("--stale-after-seconds", ([string]$StaleAfterSeconds))
+    }
+    if (Test-FlagEnabled -Value $CancelStaleOpenTickets) {
+        $superviseArgs += "--cancel-stale-open-tickets"
+    }
+    if (Test-FlagEnabled -Value $ExpireDayOpenTickets) {
+        $superviseArgs += "--expire-day-open-tickets"
+    }
     py @superviseArgs 2>&1 | Out-File -FilePath $logFullPath -Append -Encoding utf8
     Write-LoopLog "$Phase order-runtime-supervise exit=$LASTEXITCODE"
 }
 
-Write-LoopLog "live order loop started config=$Config sleeve=$SleeveId interval=${IntervalSeconds}s max_notional=$MaxSubmitNotional submit_state=$SubmitStatePath framework_state=$frameworkStateRelativePath submit_once_per_day=$SubmitOncePerDay guard_mode=engine_target_lineage reconcile_every_cycles=$ReconcileEveryCycles require_supported_submit_session=$RequireSupportedSubmitSession"
+Write-LoopLog "live order loop started config=$Config sleeve=$SleeveId interval=${IntervalSeconds}s max_notional=$MaxSubmitNotional submit_state=$SubmitStatePath framework_state=$frameworkStateRelativePath submit_once_per_day=$SubmitOncePerDay guard_mode=engine_target_lineage reconcile_every_cycles=$ReconcileEveryCycles require_supported_submit_session=$RequireSupportedSubmitSession stale_after_seconds=$StaleAfterSeconds cancel_stale=$CancelStaleOpenTickets expire_day=$ExpireDayOpenTickets"
 Write-LoopLog "submit guard note: date-level buy block is disabled; order-runtime-submit uses target_quantity/open_ticket/fill state guards"
 Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath"
 $skipReconcileEnabled = Test-FlagEnabled -Value $SkipReconcile

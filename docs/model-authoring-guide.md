@@ -636,6 +636,12 @@ Notes:
 - Stale open tickets and stale partial fills are maintained by the order
   supervisor. Strategy models should not cancel or replace broker orders
   directly.
+- `day` order expiry is also order-runtime responsibility. A model may choose
+  `time_in_force=day`, but it should not manually clear stale pending tickets;
+  the supervisor expires them after the relevant market-local date rolls over.
+- If a model needs more aggressive exit behavior, express that as execution
+  policy through order type, limit offset, urgency metadata, or a future
+  replace policy. Do not hide broker cancel/replace calls inside the model.
 
 ## Validation Checklist
 

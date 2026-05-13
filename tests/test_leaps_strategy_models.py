@@ -8,6 +8,7 @@ import sys
 from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.alpha import SnapshotContext
 from leaps_quant_engine.framework.risk import RiskManagementContext
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Holding, Portfolio
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
@@ -402,6 +403,90 @@ def test_leaps_execution_uses_more_aggressive_limit_for_stop_sells():
     assert orders[0].side is OrderSide.SELL
     assert orders[0].limit_price == 99_500
     assert orders[0].metadata["limit_offset_bps"] == 50
+
+
+def test_leaps_execution_reduces_entries_in_extended_session():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 8, 35)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1_000_000)})
+    model = module.create_execution_model(
+        {
+            "extended_session_buy_multiplier": 0.3,
+            "max_slice_notional": 10_000_000,
+        }
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        Portfolio(cash=2_000_000),
+        data,
+        [PortfolioTarget(symbol, 10, tag="entry")],
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="pre_open_after_hours",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+    )
+
+    assert [order.quantity for order in orders] == [3]
+    assert orders[0].metadata["session_policy"] == "extended_session"
+    assert orders[0].metadata["session_quantity_multiplier"] == 0.3
+    assert orders[0].metadata["session_quantity_clamp"] == "reduced_size"
+
+
+def test_leaps_execution_keeps_exit_size_in_after_hours_close():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 15, 45)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1_000_000)})
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=10, average_price=100_000)})
+    model = module.create_execution_model({"max_slice_notional": 10_000_000})
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        [PortfolioTarget(symbol, 0, tag="no_longer_in_target_portfolio")],
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_close",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+    )
+
+    assert [order.quantity for order in orders] == [10]
+    assert orders[0].side is OrderSide.SELL
+    assert orders[0].metadata["session_policy"] == "extended_session"
+    assert orders[0].metadata["session_quantity_multiplier"] == 1.0
+
+
+def test_leaps_execution_blocks_after_hours_single_price_by_default():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 16, 5)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1_000_000)})
+    model = module.create_execution_model({})
+
+    orders = model.create_orders(
+        "LEaps",
+        Portfolio(cash=2_000_000),
+        data,
+        [PortfolioTarget(symbol, 3, tag="entry")],
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="after_hours_single_price",
+            is_orderable=True,
+            is_regular_market_open=False,
+            source="test",
+        ),
+    )
+
+    assert orders == []
 
 
 def _snapshot(now: datetime, values: dict[str, dict[str, float]]) -> IndicatorSnapshot:

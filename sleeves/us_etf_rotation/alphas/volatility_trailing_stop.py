@@ -6,8 +6,8 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "us_etf_rotation-volatility-trailing-stop"
-VERSION = "0.1.0"
-EVALUATION_CADENCE = "once_per_day"
+VERSION = "0.1.1"
+EVALUATION_CADENCE = "every_cycle"
 INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=1)
 ATR_MULTIPLIER = 2.5

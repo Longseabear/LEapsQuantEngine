@@ -6,8 +6,8 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "us_etf_rotation"
-VERSION = "0.3.0"
-EVALUATION_CADENCE = "once_per_month"
+VERSION = "0.3.1"
+EVALUATION_CADENCE = "every_cycle"
 INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=40)
 MAX_SELECTED = 3

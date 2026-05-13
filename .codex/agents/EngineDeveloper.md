@@ -84,6 +84,32 @@ the narrowest vertical slice that proves the behavior.
 - Preserve the candidate order artifact even when submission is skipped, so an
   operator can inspect the intended action.
 
+## Order Cancellation And Replacement Discipline
+
+Always keep cancellation and replacement LEAN-style:
+
+- Execution models own order style and replacement policy. They may express
+  limit vs marketable limit vs market, time-in-force, urgency, max order age,
+  price drift tolerance, and max replacement count.
+- Order runtime owns the ticket state machine. It converts execution policy
+  into auditable transitions such as `cancel_requested`, `cancelled`,
+  `replace_requested`, `replacement_submitted`, `partially_filled`,
+  `filled`, `expired`, and `reconciled`.
+- Broker adapters only translate an approved lifecycle action into KIS calls.
+  They must not invent strategy urgency or target changes.
+- Never submit a replacement before the previous live ticket is confirmed
+  cancelled, expired, rejected, or reduced by fills. This prevents duplicate
+  buy/sell exposure.
+- If an order is partially filled, replace only the remaining quantity.
+- Day orders that have passed their valid session must not remain as open
+  pending tickets in the engine store. Reconcile or expire them before using
+  pending quantity to block new submits.
+- Do not let every price tick trigger replacement. Use model-provided drift
+  thresholds, minimum replace intervals, and replacement count limits.
+- For urgent exits such as risk reduction, stop loss, or trailing stop, the
+  execution model should explicitly request a more aggressive policy instead
+  of relying on core engine heuristics.
+
 ## Reporting Contract
 
 When reporting an engine change, include:

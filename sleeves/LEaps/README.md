@@ -135,6 +135,18 @@ Alpha v0.2 notes:
 - `risks/kospi_growth_us_hedge.py` applies different risk budgets by currency:
   KRW can carry the growth exposure, while USD is capped as a stability pocket.
 
+Execution v0.2 notes:
+
+- `executions/leaps_immediate.py` is session-aware through the engine
+  `ExecutionContext`. Daily alpha and RL portfolio training remain valid; the
+  session policy is an execution overlay applied after targets are approved.
+- Regular open/close auctions reduce new buy size, while sells keep full size.
+- KRX pre-open after-hours, KRX after-hours close, US pre-market, and US
+  after-market reduce new buy size more aggressively, while exits and
+  reductions keep full size.
+- KRX after-hours single-price remains blocked by default unless symbol/venue
+  support is explicitly verified later.
+
 If the policy file is absent, the runtime model falls back to a deterministic
 configured exposure level so config validation and smoke tests still run.
 

@@ -2,11 +2,11 @@ from datetime import datetime
 
 from leaps_quant_engine.brokerage import BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.execution import OrderIntentBatch
-from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol, TimeInForce
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.order_supervisor import OrderMaintenancePolicy, OrderRuntimeSupervisor
 from leaps_quant_engine.order_worker import OpenTicketPollWorker
-from leaps_quant_engine.orders import OrderCoordinator, OrderEventType
+from leaps_quant_engine.orders import OrderCoordinator, OrderEventType, OrderTicketStatus
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 
 
@@ -77,3 +77,103 @@ def test_order_runtime_supervisor_cancels_stale_open_tickets(tmp_path):
     assert report.maintenance_report.stale_ticket_count == 1
     assert report.maintenance_report.cancel_events[0].event_type is OrderEventType.CANCELLED
     assert report.final_status.order_snapshot.open_tickets == ()
+
+
+def test_order_runtime_supervisor_expires_day_ticket_after_market_date_rollover(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"us_etf_rotation": 1000},
+        default_currency="USD",
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    batch = OrderIntentBatch(
+        sleeve_id="us_etf_rotation",
+        generated_at=datetime(2026, 5, 13, 2, 30),
+        order_intents=(
+            OrderIntent(
+                "us_etf_rotation",
+                Symbol("XLE", "US"),
+                OrderSide.SELL,
+                3,
+                57.74,
+                time_in_force=TimeInForce.DAY,
+            ),
+        ),
+        batch_id="batch-1",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 13, 2, 32, 43)).tickets[0]
+    accepted = ticket.event(
+        OrderEventType.ACCEPTED,
+        occurred_at=datetime(2026, 5, 13, 2, 32, 43),
+        broker_order_id="01790:0030899460",
+    )
+    order_store.record_tickets((ticket,), recorded_at=datetime(2026, 5, 13, 2, 32, 43))
+    order_store.record_event(accepted, recorded_at=datetime(2026, 5, 13, 2, 32, 43))
+    account_store.register_order_ticket(ticket)
+    account_store.apply_order_event(accepted)
+
+    report = OrderRuntimeSupervisor(
+        runtime_id="us-etf",
+        sleeve_ids=("us_etf_rotation",),
+        order_state_store=order_store,
+        account_store=account_store,
+        maintenance_policy=OrderMaintenancePolicy(expire_day_orders=True),
+    ).run_once(
+        poll=False,
+        reconcile=False,
+        run_at=datetime(2026, 5, 14, 0, 2),
+    )
+
+    assert report.maintenance_report is not None
+    assert report.maintenance_report.expired_ticket_count == 1
+    assert report.maintenance_report.expire_events[0].event_type is OrderEventType.EXPIRED
+    assert report.final_status.order_snapshot.open_tickets == ()
+    assert report.final_status.order_snapshot.terminal_tickets[0].status is OrderTicketStatus.EXPIRED
+
+
+def test_order_runtime_supervisor_keeps_us_day_ticket_across_kst_midnight_same_us_date(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"us_etf_rotation": 1000},
+        default_currency="USD",
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    batch = OrderIntentBatch(
+        sleeve_id="us_etf_rotation",
+        generated_at=datetime(2026, 5, 13, 23, 0),
+        order_intents=(
+            OrderIntent(
+                "us_etf_rotation",
+                Symbol("XLE", "US"),
+                OrderSide.SELL,
+                3,
+                57.74,
+                time_in_force=TimeInForce.DAY,
+            ),
+        ),
+        batch_id="batch-1",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 13, 23, 0)).tickets[0]
+    accepted = ticket.event(
+        OrderEventType.ACCEPTED,
+        occurred_at=datetime(2026, 5, 13, 23, 0),
+        broker_order_id="01790:0030899460",
+    )
+    order_store.record_tickets((ticket,), recorded_at=datetime(2026, 5, 13, 23, 0))
+    order_store.record_event(accepted, recorded_at=datetime(2026, 5, 13, 23, 0))
+
+    report = OrderRuntimeSupervisor(
+        runtime_id="us-etf",
+        sleeve_ids=("us_etf_rotation",),
+        order_state_store=order_store,
+        account_store=account_store,
+        maintenance_policy=OrderMaintenancePolicy(expire_day_orders=True),
+    ).run_once(
+        poll=False,
+        reconcile=False,
+        run_at=datetime(2026, 5, 14, 0, 30),
+    )
+
+    assert report.maintenance_report is not None
+    assert report.maintenance_report.expired_ticket_count == 0
+    assert len(report.final_status.order_snapshot.open_tickets) == 1

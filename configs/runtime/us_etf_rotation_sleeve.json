@@ -101,7 +101,7 @@
           "min_order_notional": 75.0,
           "min_quantity_delta": 1,
           "allow_exit_below_min_notional": true,
-          "cadence": "once_per_day"
+          "cadence": "every_5_minutes"
         }
       },
       "risk": {

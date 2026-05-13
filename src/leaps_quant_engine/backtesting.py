@@ -7,7 +7,9 @@ import csv
 import json
 import math
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
+from leaps_quant_engine.broker_routing import market_scope_for_symbol, market_scope_from_market
 from leaps_quant_engine.cycle_journal import CycleJournalEntry, CycleJournalStore
 from leaps_quant_engine.framework import FrameworkCycleResult, FrameworkRunner
 from leaps_quant_engine.fundamentals import PointInTimeFundamentalStore
@@ -16,6 +18,7 @@ from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.history import get_daily_history
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataError, MarketDataProvider
+from leaps_quant_engine.market_rules import synthetic_domestic_market_session, synthetic_us_market_session
 from leaps_quant_engine.models import Bar, DataResolution, DataSlice, OrderIntent, OrderSide, Symbol
 from leaps_quant_engine.orders import (
     FixedBpsSlippageModel,
@@ -35,6 +38,13 @@ from leaps_quant_engine.universe.selection import (
     UniverseSelectionResult,
     build_composite_universe_selection_result,
 )
+
+
+_SESSION_AWARE_BACKTEST_RESOLUTIONS = {
+    DataResolution.MINUTE.value,
+    DataResolution.LIVE.value,
+    DataResolution.QUOTE.value,
+}
 
 
 @dataclass(slots=True)
@@ -541,12 +551,15 @@ def run_framework_backtest(
                 alpha_input_selections,
                 fallback=alpha_symbols_by_model,
             )
+        market_sessions = _market_sessions_for_backtest(universe, data)
         cycle = framework_runner.run_once(
             indicator_snapshot=indicator_snapshot,
             fundamental_snapshot=fundamental_snapshot,
             data=data,
             portfolio=portfolio,
             alpha_symbols_by_model=cycle_alpha_symbols,
+            market_session=_primary_market_session(universe, market_sessions),
+            market_sessions=market_sessions,
         )
         if cycle_journal_store is not None:
             cycle_journal_store.append(
@@ -677,12 +690,15 @@ def run_framework_replay(
                 alpha_input_selections,
                 fallback=alpha_symbols_by_model,
             )
+        market_sessions = _market_sessions_for_backtest(universe, data)
         cycle = framework_runner.run_once(
             indicator_snapshot=indicator_snapshot,
             fundamental_snapshot=fundamental_snapshot,
             data=data,
             portfolio=portfolio,
             alpha_symbols_by_model=cycle_alpha_symbols,
+            market_session=_primary_market_session(universe, market_sessions),
+            market_sessions=market_sessions,
         )
         if cycle_journal_store is not None:
             cycle_journal_store.append(
@@ -1264,6 +1280,47 @@ def _select_backtest_universe(
         context,
         tuple(model.select(context) for model in selection_models),
     )
+
+
+def _market_sessions_for_backtest(universe: UniverseDefinition, data: DataSlice) -> dict[str, Any]:
+    resolution = str(data.resolution or "").strip().lower()
+    if resolution not in _SESSION_AWARE_BACKTEST_RESOLUTIONS:
+        return {}
+
+    scopes = {
+        market_scope_for_symbol(bar.symbol)
+        for bar in data.bars.values()
+    }
+    if not scopes:
+        scopes.add(market_scope_from_market(universe.market))
+    return {
+        scope: _synthetic_market_session_for_backtest(scope, data.time)
+        for scope in sorted(scopes)
+    }
+
+
+def _primary_market_session(universe: UniverseDefinition, sessions: Mapping[str, Any]):
+    if not sessions:
+        return None
+    primary_scope = market_scope_from_market(universe.market)
+    if primary_scope in sessions:
+        return sessions[primary_scope]
+    if "domestic" in sessions:
+        return sessions["domestic"]
+    return next(iter(sessions.values()))
+
+
+def _synthetic_market_session_for_backtest(market_scope: str, when: datetime):
+    scope = str(market_scope or "").strip().lower()
+    if scope == "overseas":
+        return synthetic_us_market_session(_with_default_timezone(when, ZoneInfo("America/New_York")))
+    return synthetic_domestic_market_session(_with_default_timezone(when, ZoneInfo("Asia/Seoul")))
+
+
+def _with_default_timezone(when: datetime, timezone: ZoneInfo) -> datetime:
+    if when.tzinfo is None:
+        return when.replace(tzinfo=timezone)
+    return when.astimezone(timezone)
 
 
 def _alpha_symbols_by_model_from_selection(

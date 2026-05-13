@@ -258,6 +258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     order_runtime_supervise.add_argument("--stale-after-seconds", type=float, default=0.0)
     order_runtime_supervise.add_argument("--cancel-stale-open-tickets", action="store_true")
     order_runtime_supervise.add_argument("--keep-partially-filled-stale", action="store_true")
+    order_runtime_supervise.add_argument("--expire-day-open-tickets", action="store_true")
     order_runtime_supervise.add_argument("--recent-events", type=int, default=10)
     order_runtime_supervise.add_argument("--journal", type=Path)
     order_runtime_supervise.add_argument("--notify", action="store_true")
@@ -2685,6 +2686,7 @@ def _run_order_runtime_supervisor_for_route(snapshot, args, route: _OrderRuntime
             stale_after_seconds=args.stale_after_seconds,
             cancel_stale=args.cancel_stale_open_tickets,
             cancel_partially_filled=not args.keep_partially_filled_stale,
+            expire_day_orders=args.expire_day_open_tickets,
         ),
     ).run_once(
         poll=not args.skip_poll,

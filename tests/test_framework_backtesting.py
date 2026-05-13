@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +21,9 @@ from leaps_quant_engine.models import Bar, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.universe.loader import parse_universe_definition
 from leaps_quant_engine.universe.selection import build_universe_selection_result
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class EntryThenFlatAlpha:
@@ -122,6 +127,15 @@ def _bar(symbol: Symbol, day: int, close: float) -> Bar:
         close=close,
         volume=1000,
     )
+
+
+def _load_module(relative_path: str):
+    path = ROOT / relative_path
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_backtest_metrics_report_marks_cross_currency_aggregate_without_fx():
@@ -303,6 +317,64 @@ def test_minute_replay_does_not_advance_default_daily_indicator():
     insight = result.framework_cycles[0].new_insight_batch.insights[0]
     assert insight.metadata["close"] == 100.0
     assert indicator_engine.value("us", symbol, "close") == 100.0
+
+
+def test_framework_minute_replay_passes_domestic_session_to_leaps_execution():
+    symbol = Symbol("005930", "KRX")
+    universe = parse_universe_definition(
+        {
+            "id": "session-aware-minute-replay",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "close", "type": "close", "period": 1, "resolution": "minute"}],
+        }
+    )
+    feed = build_minute_replay_feed_from_bars(
+        [
+            Bar(
+                symbol,
+                datetime(2026, 5, 15, 8, 35),
+                100.0,
+                100.0,
+                100.0,
+                100.0,
+                1_000_000,
+                resolution="minute",
+            )
+        ]
+    )
+    module = _load_module("sleeves/LEaps/executions/leaps_immediate.py")
+    runner = FrameworkRunner(
+        sleeve_id="LEaps",
+        alpha_runtime=AlphaRuntime(active_models=(CloseValueAlpha(),)),
+        execution_model=module.create_execution_model(
+            {
+                "extended_session_buy_multiplier": 0.3,
+                "max_slice_notional": 10_000_000,
+                "max_daily_volume_participation_bps": 10_000,
+            }
+        ),
+    )
+
+    result = run_framework_replay(
+        feed,
+        universe,
+        sleeve_id="LEaps",
+        framework_runner=runner,
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    assert len(result.orders) == 1
+    assert result.orders[0].quantity == 3
+    assert result.orders[0].metadata["session_policy"] == "extended_session"
+    assert result.orders[0].metadata["session_phase"] == "pre_open_after_hours"
+    assert result.orders[0].metadata["market_session_scope"] == "domestic"
+    assert result.framework_cycles[0].execution_batch.metadata["market_sessions"]["domestic"]["session_phase"] == (
+        "pre_open_after_hours"
+    )
+    assert result.framework_cycles[0].stage_decisions["execution"]["market_session"]["session_phase"] == (
+        "pre_open_after_hours"
+    )
 
 
 def test_framework_backtest_report_can_include_insight_ledger_without_orders():

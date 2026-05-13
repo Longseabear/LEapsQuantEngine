@@ -1028,6 +1028,16 @@ Current v0 behavior:
   stale open tickets or cancel them through the same broker gateway, including
   stale partial fills when policy allows it. This keeps cancel/replace-style
   maintenance out of alpha/portfolio/risk code.
+- `OrderRuntimeSupervisor` can also expire open `day` tickets when the
+  market-local trading date has rolled over. This prevents an old accepted day
+  order from remaining as pending quantity forever and blocking the next
+  target. For US orders the rollover is evaluated in `America/New_York`, so a
+  KST midnight crossing during the same US session does not expire the order.
+- The standard live order loop can pass `--expire-day-open-tickets`,
+  `--stale-after-seconds`, and `--cancel-stale-open-tickets` into supervisor
+  passes. That gives a bounded cancel-then-replace path: old tickets are first
+  expired or cancelled through the lifecycle, and a later cycle may submit the
+  newly computed order intent if guards still approve it.
 - `NotificationService` brings over the StockProgram local-first Telegram alert pattern. It writes outbox/history JSON records under `data/notification-engine`, sends Telegram only when `LEAPS_TELEGRAM_BOT_TOKEN` and chat id are available, accepts StockProgram env names as migration fallback, and never lets alert failure block order reflection.
 - `leaps_quant_engine.telegram.TelegramClient` is now the engine-owned Telegram
   module. It supports outbound `sendMessage`, inbound `getUpdates`, and common

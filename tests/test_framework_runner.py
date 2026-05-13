@@ -260,6 +260,53 @@ def test_framework_runner_reuses_portfolio_targets_until_rebalance_cadence_due()
     assert second.order_intents == ()
 
 
+def test_framework_runner_runs_portfolio_again_after_minute_rebalance_cadence():
+    symbol = Symbol("NVDA", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 9, 34)
+    third_time = datetime(2026, 5, 9, 9, 35)
+    insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=first_time,
+        expires_at=datetime(2026, 5, 10, 9, 30),
+        source_snapshot_id="market-0930",
+        alpha_id="cycle-alpha",
+        alpha_version="1.0",
+    )
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(insight),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="every_5_minutes"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    portfolio = Portfolio(cash=1_000)
+
+    first = runner.run_once(
+        indicator_snapshot=_snapshot(first_time, symbol),
+        data=_slice(first_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    second = runner.run_once(
+        indicator_snapshot=_snapshot(second_time, symbol),
+        data=_slice(second_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    third = runner.run_once(
+        indicator_snapshot=_snapshot(third_time, symbol),
+        data=_slice(third_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert first.stage_decisions["portfolio"]["ran"] is True
+    assert second.stage_decisions["portfolio"]["ran"] is False
+    assert third.stage_decisions["portfolio"]["ran"] is True
+
+
 def test_framework_runner_restores_rebalance_state_across_run_once_processes(tmp_path):
     symbol = Symbol("NVDA", "US")
     first_time = datetime(2026, 5, 9, 9, 30)

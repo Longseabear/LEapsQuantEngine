@@ -102,7 +102,12 @@ class BrokerExecutionService:
         generated_at = occurred_at or datetime.now()
         updated_tickets: list[OrderTicket] = []
         events: list[OrderEvent] = []
-        terminal = {OrderTicketStatus.CANCELLED, OrderTicketStatus.FILLED, OrderTicketStatus.REJECTED}
+        terminal = {
+            OrderTicketStatus.CANCELLED,
+            OrderTicketStatus.EXPIRED,
+            OrderTicketStatus.FILLED,
+            OrderTicketStatus.REJECTED,
+        }
         for ticket in tickets:
             if ticket.status in terminal:
                 updated_tickets.append(ticket)
@@ -121,7 +126,12 @@ class BrokerExecutionService:
         generated_at = occurred_at or datetime.now()
         updated_tickets: list[OrderTicket] = []
         events: list[OrderEvent] = []
-        terminal = {OrderTicketStatus.CANCELLED, OrderTicketStatus.FILLED, OrderTicketStatus.REJECTED}
+        terminal = {
+            OrderTicketStatus.CANCELLED,
+            OrderTicketStatus.EXPIRED,
+            OrderTicketStatus.FILLED,
+            OrderTicketStatus.REJECTED,
+        }
         for ticket in tickets:
             current = ticket
             if current.status in terminal:

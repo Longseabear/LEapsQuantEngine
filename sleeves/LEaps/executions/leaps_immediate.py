@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from typing import Any
+
+from leaps_quant_engine.execution import ExecutionContext
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, TimeInForce
 from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
+
+
+_REGULAR_AUCTION_PHASES = frozenset({"regular_open_auction", "regular_close_auction"})
+_EXTENDED_SESSION_PHASES = frozenset({"pre_open_after_hours", "after_hours_close", "pre_market", "after_market"})
+_BLOCKED_SINGLE_PRICE_PHASE = "after_hours_single_price"
 
 
 class LeapsMomentumExecutionModel:
@@ -19,6 +28,11 @@ class LeapsMomentumExecutionModel:
         max_daily_volume_participation_bps: float | None = 50.0,
         chase_guard_intraday_return_bps: float | None = 900.0,
         chase_guard_size_multiplier: float = 0.5,
+        regular_auction_buy_multiplier: float = 0.65,
+        regular_auction_sell_multiplier: float = 1.0,
+        extended_session_buy_multiplier: float = 0.35,
+        extended_session_sell_multiplier: float = 1.0,
+        block_after_hours_single_price: bool = True,
     ) -> None:
         self.tag_prefix = tag_prefix
         self.order_type = OrderType(str(order_type or "limit").strip().lower())
@@ -32,6 +46,11 @@ class LeapsMomentumExecutionModel:
         self.max_daily_volume_participation_bps = max_daily_volume_participation_bps
         self.chase_guard_intraday_return_bps = chase_guard_intraday_return_bps
         self.chase_guard_size_multiplier = float(chase_guard_size_multiplier)
+        self.regular_auction_buy_multiplier = float(regular_auction_buy_multiplier)
+        self.regular_auction_sell_multiplier = float(regular_auction_sell_multiplier)
+        self.extended_session_buy_multiplier = float(extended_session_buy_multiplier)
+        self.extended_session_sell_multiplier = float(extended_session_sell_multiplier)
+        self.block_after_hours_single_price = bool(block_after_hours_single_price)
 
     def create_orders(
         self,
@@ -39,6 +58,8 @@ class LeapsMomentumExecutionModel:
         portfolio: Portfolio,
         data: DataSlice,
         targets: list[PortfolioTarget],
+        execution_context: ExecutionContext | None = None,
+        market_session: MarketSession | None = None,
     ) -> list[OrderIntent]:
         orders: list[OrderIntent] = []
         for target in targets:
@@ -56,6 +77,7 @@ class LeapsMomentumExecutionModel:
                 parent_quantity,
                 side=side,
                 bar=bar,
+                session=_session_for_target(target, execution_context=execution_context, market_session=market_session),
             )
             if executable_quantity <= 0:
                 continue
@@ -106,12 +128,28 @@ class LeapsMomentumExecutionModel:
                 )
         return orders
 
-    def _execution_quantity(self, quantity: int, *, side: OrderSide, bar) -> tuple[int, dict[str, object]]:
+    def _execution_quantity(
+        self,
+        quantity: int,
+        *,
+        side: OrderSide,
+        bar,
+        session: MarketSession | None,
+    ) -> tuple[int, dict[str, object]]:
         result = int(quantity)
         notes: dict[str, object] = {
             "volume": int(bar.volume or 0),
             "volume_participation_bps": self.max_daily_volume_participation_bps,
         }
+        session_multiplier, session_notes = self._session_quantity_policy(side=side, session=session)
+        notes.update(session_notes)
+        if session_multiplier <= 0.0:
+            return 0, notes
+        if session_multiplier < 1.0:
+            notes["session_original_quantity"] = result
+            result = max(1, int(result * session_multiplier))
+            notes["session_quantity_clamp"] = "reduced_size"
+
         if side is OrderSide.BUY and self.chase_guard_intraday_return_bps is not None and bar.open > 0:
             intraday_return_bps = ((bar.close / bar.open) - 1.0) * 10_000.0
             notes["intraday_return_bps"] = intraday_return_bps
@@ -126,6 +164,34 @@ class LeapsMomentumExecutionModel:
                 notes["participation_cap"] = "clamped"
                 notes["participation_cap_quantity"] = volume_cap
         return result, notes
+
+    def _session_quantity_policy(self, *, side: OrderSide, session: MarketSession | None) -> tuple[float, dict[str, object]]:
+        if session is None:
+            return 1.0, {}
+        notes: dict[str, object] = {
+            "session_phase": session.session_phase,
+            "session_orderable": session.is_orderable,
+            "session_regular_open": session.is_regular_market_open,
+        }
+        if not session.is_orderable:
+            notes["session_policy"] = "blocked_not_orderable"
+            return 0.0, notes
+        if session.session_phase == _BLOCKED_SINGLE_PRICE_PHASE and self.block_after_hours_single_price:
+            notes["session_policy"] = "blocked_after_hours_single_price"
+            return 0.0, notes
+        if session.session_phase in _REGULAR_AUCTION_PHASES:
+            notes["session_policy"] = "regular_auction"
+            multiplier = self.regular_auction_buy_multiplier if side is OrderSide.BUY else self.regular_auction_sell_multiplier
+            notes["session_quantity_multiplier"] = multiplier
+            return max(multiplier, 0.0), notes
+        if session.session_phase in _EXTENDED_SESSION_PHASES:
+            notes["session_policy"] = "extended_session"
+            multiplier = self.extended_session_buy_multiplier if side is OrderSide.BUY else self.extended_session_sell_multiplier
+            notes["session_quantity_multiplier"] = multiplier
+            return max(multiplier, 0.0), notes
+        notes["session_policy"] = "regular"
+        notes["session_quantity_multiplier"] = 1.0
+        return 1.0, notes
 
     def _limit_offset_bps(self, side: OrderSide, target_tag: str) -> float:
         if side is OrderSide.BUY:
@@ -150,7 +216,23 @@ def create_execution_model(params):
         max_daily_volume_participation_bps=_optional_float(params.get("max_daily_volume_participation_bps"), default=50.0),
         chase_guard_intraday_return_bps=_optional_float(params.get("chase_guard_intraday_return_bps"), default=900.0),
         chase_guard_size_multiplier=float(params.get("chase_guard_size_multiplier", 0.5)),
+        regular_auction_buy_multiplier=float(params.get("regular_auction_buy_multiplier", 0.65)),
+        regular_auction_sell_multiplier=float(params.get("regular_auction_sell_multiplier", 1.0)),
+        extended_session_buy_multiplier=float(params.get("extended_session_buy_multiplier", 0.35)),
+        extended_session_sell_multiplier=float(params.get("extended_session_sell_multiplier", 1.0)),
+        block_after_hours_single_price=_bool(params.get("block_after_hours_single_price"), default=True),
     )
+
+
+def _session_for_target(
+    target: PortfolioTarget,
+    *,
+    execution_context: ExecutionContext | None,
+    market_session: MarketSession | None,
+) -> MarketSession | None:
+    if execution_context is not None:
+        return execution_context.session_for_symbol(target.symbol)
+    return market_session
 
 
 def _limit_price(
@@ -206,6 +288,14 @@ def _optional_float(value, *, default=None):
     if value is None or str(value).strip() == "":
         return default
     return float(value)
+
+
+def _bool(value: Any, *, default: bool = False) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 LeapsImmediateExecutionModel = LeapsMomentumExecutionModel
