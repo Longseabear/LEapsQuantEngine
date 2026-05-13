@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from leaps_quant_engine.broker_routing import currency_for_market_scope, currency_for_symbol
@@ -248,6 +249,49 @@ class CashTransfer:
 
 
 @dataclass(frozen=True, slots=True)
+class PositionState:
+    sleeve_id: str
+    symbol: Symbol
+    quantity: int
+    average_entry_price: float
+    entry_time: datetime
+    high_watermark_price: float
+    high_watermark_at: datetime
+    last_price: float | None = None
+    last_updated_at: datetime | None = None
+    last_stop_price: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sleeve_id": self.sleeve_id,
+            "symbol": _symbol_to_dict(self.symbol),
+            "quantity": self.quantity,
+            "average_entry_price": self.average_entry_price,
+            "entry_time": self.entry_time.isoformat(),
+            "high_watermark_price": self.high_watermark_price,
+            "high_watermark_at": self.high_watermark_at.isoformat(),
+            "last_price": self.last_price,
+            "last_updated_at": self.last_updated_at.isoformat() if self.last_updated_at else "",
+            "last_stop_price": self.last_stop_price,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PositionState":
+        return cls(
+            sleeve_id=str(payload.get("sleeve_id") or UNKNOWN_SLEEVE_ID),
+            symbol=_symbol_from_dict(payload["symbol"]),
+            quantity=int(payload.get("quantity") or 0),
+            average_entry_price=float(payload.get("average_entry_price") or 0.0),
+            entry_time=datetime.fromisoformat(str(payload["entry_time"])),
+            high_watermark_price=float(payload.get("high_watermark_price") or 0.0),
+            high_watermark_at=datetime.fromisoformat(str(payload["high_watermark_at"])),
+            last_price=_float_or_none(payload.get("last_price")),
+            last_updated_at=_parse_optional_datetime(payload.get("last_updated_at")),
+            last_stop_price=_float_or_none(payload.get("last_stop_price")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CashReconciliationReport:
     account_id: str
     currency: str
@@ -263,6 +307,8 @@ class CashReconciliationReport:
 
     @property
     def status(self) -> str:
+        if self.residual_cash < -1e-6:
+            return "overallocated"
         return "matched" if abs(self.difference) < 1e-6 else "mismatch"
 
     def to_dict(self) -> dict[str, Any]:
@@ -391,6 +437,61 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         sleeve = state["sleeves"][sleeve_id]
         return _portfolio_from_dict(sleeve)
 
+    def position_state(self, sleeve_id: str, symbol: Symbol) -> PositionState | None:
+        state = self._load_state()
+        payload = (
+            state.get("position_states", {})
+            .get(sleeve_id, {})
+            .get(symbol.key)
+        )
+        return PositionState.from_dict(payload) if payload is not None else None
+
+    def position_states(self, sleeve_id: str) -> tuple[PositionState, ...]:
+        state = self._load_state()
+        raw_states = state.get("position_states", {}).get(sleeve_id, {})
+        return tuple(
+            PositionState.from_dict(payload)
+            for _, payload in sorted(raw_states.items())
+        )
+
+    def update_position_mark(
+        self,
+        *,
+        sleeve_id: str,
+        symbol: Symbol,
+        price: float,
+        marked_at: datetime | None = None,
+        stop_price: float | None = None,
+    ) -> PositionState | None:
+        if price <= 0:
+            raise ValueError("position mark price must be positive.")
+        state = self._load_state()
+        payload = state.get("position_states", {}).get(sleeve_id, {}).get(symbol.key)
+        if payload is None:
+            return None
+        position = PositionState.from_dict(payload)
+        as_of = marked_at or datetime.now().astimezone()
+        high_price = position.high_watermark_price
+        high_at = position.high_watermark_at
+        if price > high_price:
+            high_price = price
+            high_at = as_of
+        updated = PositionState(
+            sleeve_id=position.sleeve_id,
+            symbol=position.symbol,
+            quantity=position.quantity,
+            average_entry_price=position.average_entry_price,
+            entry_time=position.entry_time,
+            high_watermark_price=high_price,
+            high_watermark_at=high_at,
+            last_price=price,
+            last_updated_at=as_of,
+            last_stop_price=stop_price if stop_price is not None else position.last_stop_price,
+        )
+        state.setdefault("position_states", {}).setdefault(sleeve_id, {})[symbol.key] = updated.to_dict()
+        self._write_state(state)
+        return updated
+
     def initialize_sleeve(
         self,
         sleeve_id: str,
@@ -475,10 +576,11 @@ class VirtualSleeveAccountStore(PortfolioProvider):
             for sleeve_id, raw in state["sleeves"].items()
             if sleeve_id != residual_sleeve_id
         )
+        residual_cash = snapshot.cash_balance - non_residual_cash
         _set_sleeve_cash_for_currency(
             state["sleeves"][residual_sleeve_id],
             code,
-            snapshot.cash_balance - non_residual_cash,
+            max(residual_cash, 0.0),
         )
         self._write_state(state)
         return self.cash_reconciliation_report(
@@ -825,6 +927,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                 "fill_allocations": {},
                 "account_cash_snapshots": {},
                 "cash_transfers": {},
+                "position_states": {},
             }
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -838,6 +941,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         payload.setdefault("fill_allocations", {})
         payload.setdefault("account_cash_snapshots", {})
         payload.setdefault("cash_transfers", {})
+        payload.setdefault("position_states", {})
         for raw in dict(payload.get("sleeves") or {}).values():
             if isinstance(raw, dict):
                 _normalize_sleeve_cash(raw, self.default_currency)
@@ -847,7 +951,14 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp_path, self.path)
+        for attempt in range(6):
+            try:
+                os.replace(tmp_path, self.path)
+                return
+            except PermissionError:
+                if attempt >= 5:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def _apply_fill_to_state(
         self,
@@ -860,8 +971,17 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         sleeve_id = fill.sleeve_id or ownership.sleeve_id if ownership else fill.sleeve_id or UNKNOWN_SLEEVE_ID
         self._ensure_sleeve(state, sleeve_id)
         portfolio = _portfolio_from_dict(state["sleeves"][sleeve_id])
+        previous_holding = portfolio.holdings.get(fill.symbol.key)
+        previous_quantity = previous_holding.quantity if previous_holding is not None else 0
         _apply_fill_to_portfolio(portfolio, fill)
         state["sleeves"][sleeve_id] = _portfolio_to_dict(portfolio)
+        _apply_fill_to_position_state(
+            state,
+            sleeve_id=sleeve_id,
+            fill=fill,
+            previous_quantity=previous_quantity,
+            portfolio=portfolio,
+        )
         fill_payload = fill.to_dict()
         fill_payload["sleeve_id"] = sleeve_id
         state["fills"][fill.fill_id] = fill_payload
@@ -898,6 +1018,58 @@ def _apply_fill_to_portfolio(portfolio: Portfolio, fill: VirtualFillEvent) -> No
         portfolio.holdings.pop(fill.symbol.key, None)
         return
     holding.quantity = new_quantity
+
+
+def _apply_fill_to_position_state(
+    state: dict[str, Any],
+    *,
+    sleeve_id: str,
+    fill: VirtualFillEvent,
+    previous_quantity: int,
+    portfolio: Portfolio,
+) -> None:
+    position_states = state.setdefault("position_states", {}).setdefault(sleeve_id, {})
+    symbol_key = fill.symbol.key
+    holding = portfolio.holdings.get(symbol_key)
+    if holding is None or holding.quantity <= 0:
+        position_states.pop(symbol_key, None)
+        return
+
+    existing_payload = position_states.get(symbol_key)
+    existing = PositionState.from_dict(existing_payload) if existing_payload is not None else None
+    if existing is None or previous_quantity <= 0:
+        updated = PositionState(
+            sleeve_id=sleeve_id,
+            symbol=fill.symbol,
+            quantity=holding.quantity,
+            average_entry_price=holding.average_price,
+            entry_time=fill.filled_at,
+            high_watermark_price=fill.fill_price,
+            high_watermark_at=fill.filled_at,
+            last_price=fill.fill_price,
+            last_updated_at=fill.filled_at,
+        )
+        position_states[symbol_key] = updated.to_dict()
+        return
+
+    high_watermark_price = existing.high_watermark_price
+    high_watermark_at = existing.high_watermark_at
+    if fill.fill_price > high_watermark_price:
+        high_watermark_price = fill.fill_price
+        high_watermark_at = fill.filled_at
+    updated = PositionState(
+        sleeve_id=sleeve_id,
+        symbol=fill.symbol,
+        quantity=holding.quantity,
+        average_entry_price=holding.average_price,
+        entry_time=existing.entry_time,
+        high_watermark_price=high_watermark_price,
+        high_watermark_at=high_watermark_at,
+        last_price=fill.fill_price,
+        last_updated_at=fill.filled_at,
+        last_stop_price=existing.last_stop_price,
+    )
+    position_states[symbol_key] = updated.to_dict()
 
 
 def _portfolio_from_dict(payload: dict[str, Any]) -> Portfolio:

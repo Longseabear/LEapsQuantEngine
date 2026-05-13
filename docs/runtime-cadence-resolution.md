@@ -85,7 +85,7 @@ Python alpha modules may declare cadence metadata:
 ```python
 ALPHA_ID = "leaps-kospi-conviction"
 VERSION = "0.1.0"
-EVALUATION_CADENCE = "once_per_day"
+EVALUATION_CADENCE = "every_cycle"
 INPUT_RESOLUTION = "daily"
 ```
 
@@ -93,6 +93,8 @@ Supported cadence values:
 
 - `every_cycle`: run on every framework cycle.
 - `once_per_day`: run at most once per calendar day per `alpha_id`.
+- `every_5m` / `every_5_minutes`: interval cadence used mainly by portfolio
+  construction.
 - `manual`: do not run automatically after startup unless the runtime adds an
   explicit trigger later.
 
@@ -126,7 +128,7 @@ Runtime config controls portfolio target rebuild cadence:
       "cash_reserve_pct": 0.0,
       "min_order_notional": 0.0,
       "min_quantity_delta": 1,
-      "cadence": "once_per_day"
+      "cadence": "every_5_minutes"
     }
   }
 }
@@ -159,6 +161,30 @@ targets. This gives the engine a stable target state instead of interpreting
 "no new daily alpha this minute" as "sell everything", while still responding
 to fills, cash changes, and price/equity changes.
 
+## Process Boundary State
+
+The current live PowerShell order loop starts a fresh Python process for each
+`runtime-run-once`. Plain in-memory cadence state is therefore not enough for
+live operation. Use the framework state file:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/leaps_workspace_smoke.json `
+  --sleeve-id LEaps `
+  --framework-state data/runtime/framework-state/LEaps.json `
+  --order-batch-output data/runtime/live-order-loop/LEaps_candidate_orders.json
+```
+
+The state file persists:
+
+- active insights
+- alpha last-run timestamps
+- last portfolio run timestamp
+- last portfolio target batch
+
+Operator/reporting commands may pass `--framework-state-read-only` so they can
+inspect the current target state without advancing cadence or changing the live
+state file.
+
 ## Exit And Safety Path
 
 Daily cadence must not be the only exit path.
@@ -181,16 +207,15 @@ for all safety behavior.
 
 ```text
 LEaps alpha:
-  leaps-kospi-conviction       -> once_per_day, daily
-  leaps-us-stability-hedge     -> once_per_day, daily
-  leaps-volatility-trailing-stop -> once_per_day, daily
+  leaps-kospi-conviction         -> every_cycle, daily
+  leaps-volatility-trailing-stop -> every_cycle, daily
 
 LEaps portfolio:
   rl_ppo_constructor.py
-  rebalance.cadence = once_per_day
+  rebalance.cadence = every_5_minutes
 
 LEaps indicators:
-  configs/universes/leaps_kr_us_research_core.json
+  configs/universes/leaps_kr_research_core.json
   strategy indicators are resolution=daily
 ```
 

@@ -178,16 +178,15 @@ class ReinforcementLearningPortfolioConstructionModel:
                     tag=f"rl:{self.model_name}:{insight.alpha_id}:gross={exposure:.2f}:w={weight:.3f}",
                 )
 
-        managed = {symbol.key: symbol for symbol in (*context.managed_symbols, *context.held_symbols)}
-        for symbol_key, symbol in managed.items():
-            if symbol_key in targets:
+        for insight in _latest_exit_insights(context):
+            if insight.symbol_key in targets:
                 continue
-            if context.portfolio.quantity(symbol) == 0:
+            if context.portfolio.quantity(insight.symbol) == 0:
                 continue
-            targets[symbol_key] = PortfolioAllocationTarget(
-                symbol=symbol,
+            targets[insight.symbol_key] = PortfolioAllocationTarget(
+                symbol=insight.symbol,
                 target_percent=0.0,
-                tag="rl:insight_inactive",
+                tag=f"rl:{insight.alpha_id}:{insight.direction.value}",
             )
         return tuple(targets.values())
 
@@ -203,7 +202,14 @@ class ReinforcementLearningPortfolioConstructionModel:
                 gross_exposure=max(0.0, min(float(self.fallback_gross_exposure), 1.0)),
                 temperature=self.weight_temperature,
             )
-        return _action_to_insight_weights(action, ranked_insights, top_k=self.top_k)
+        weights = _action_to_insight_weights(action, ranked_insights, top_k=self.top_k)
+        if not weights and ranked_insights and self.min_signal_action > 0:
+            return _score_weighted_targets(
+                ranked_insights,
+                gross_exposure=max(0.0, min(float(self.fallback_gross_exposure), 1.0)),
+                temperature=self.weight_temperature,
+            )
+        return weights
 
     def _exposure_for_observation(self, observation: np.ndarray) -> float:
         action = self._predict_action(observation)
@@ -213,9 +219,7 @@ class ReinforcementLearningPortfolioConstructionModel:
         return float(self.exposure_levels[action])
 
     def _predict_action(self, observation: np.ndarray) -> int:
-        model_paths = tuple(Path(path) for path in self.policy_paths if path)
-        if not model_paths and self.policy_path:
-            model_paths = (Path(self.policy_path),)
+        model_paths = self._resolved_policy_paths()
         actions: list[int] = []
         for model_path in model_paths:
             if not model_path.exists():
@@ -231,9 +235,7 @@ class ReinforcementLearningPortfolioConstructionModel:
         return int(self.fallback_action)
 
     def _predict_weight_action(self, observation: np.ndarray) -> np.ndarray | None:
-        model_paths = tuple(Path(path) for path in self.policy_paths if path)
-        if not model_paths and self.policy_path:
-            model_paths = (Path(self.policy_path),)
+        model_paths = self._resolved_policy_paths()
         actions: list[np.ndarray] = []
         for model_path in model_paths:
             if not model_path.exists():
@@ -251,6 +253,14 @@ class ReinforcementLearningPortfolioConstructionModel:
         min_size = min(action.size for action in actions)
         stacked = np.vstack([action[:min_size] for action in actions])
         return np.median(stacked, axis=0)
+
+    def _resolved_policy_paths(self) -> tuple[Path, ...]:
+        model_paths = tuple(Path(path) for path in self.policy_paths if path)
+        if model_paths:
+            return model_paths
+        if self.policy_path:
+            return (Path(self.policy_path),)
+        return _policy_paths_from_metadata(self.metadata_path)
 
 
 def train_ppo_portfolio_constructor(
@@ -583,6 +593,17 @@ def _latest_non_up_symbol_keys(insights: tuple[Any, ...]) -> set[str]:
     }
 
 
+def _latest_exit_insights(context: PortfolioConstructionContext) -> tuple[Any, ...]:
+    latest = {}
+    for insight in context.active_insights:
+        if insight.direction.value not in {"flat", "down"}:
+            continue
+        previous = latest.get(insight.symbol_key)
+        if previous is None or _is_newer_or_equal_priority(insight, previous):
+            latest[insight.symbol_key] = insight
+    return tuple(latest.values())
+
+
 def _is_newer_or_equal_priority(candidate: Any, previous: Any) -> bool:
     if candidate.generated_at > previous.generated_at:
         return True
@@ -845,6 +866,29 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _policy_paths_from_metadata(metadata_path: str | Path | None) -> tuple[Path, ...]:
+    if not metadata_path:
+        return ()
+    path = Path(metadata_path)
+    if not path.exists():
+        return ()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    raw_paths = payload.get("policy_paths") or ()
+    if not isinstance(raw_paths, list):
+        return ()
+    base = path.parent
+    resolved: list[Path] = []
+    for raw_path in raw_paths:
+        candidate = Path(str(raw_path))
+        if not candidate.is_absolute() and not candidate.exists():
+            candidate = base / candidate.name
+        resolved.append(candidate)
+    return tuple(resolved)
 
 
 def _average(values: list[float]) -> float:

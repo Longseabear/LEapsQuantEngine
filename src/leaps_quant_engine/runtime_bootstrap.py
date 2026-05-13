@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 import importlib.util
 import inspect
@@ -125,6 +125,7 @@ class RuntimeSleeveRuntime:
             portfolio_state=portfolio_state,
         )
         status = self._agent_status(report)
+        report = replace(report, agent_status=status)
         agent_status_logger.info(
             "engine_status %s",
             json.dumps(status, ensure_ascii=False, separators=(",", ":")),
@@ -205,7 +206,7 @@ class RuntimeSleeveRuntime:
             return None
         return pending.framework_runner.run_once(
             indicator_snapshot=active_snapshot,
-            data=_data_slice_from_indicator_snapshot(active_snapshot),
+            data=self._latest_data_slice(active_snapshot),
             portfolio=self.portfolio_provider.current_portfolio(self.sleeve_id),
             alpha_symbols_by_model=pending._alpha_symbols_by_model(),
         )
@@ -215,7 +216,7 @@ class RuntimeSleeveRuntime:
         active_snapshot = indicator_snapshot.active() if indicator_snapshot is not None else None
         if active_snapshot is None:
             return None
-        data = _data_slice_from_indicator_snapshot(active_snapshot)
+        data = self._latest_data_slice(active_snapshot)
         self.portfolio = self.portfolio_provider.current_portfolio(self.sleeve_id)
         return self.framework_runner.run_once(
             indicator_snapshot=active_snapshot,
@@ -242,8 +243,14 @@ class RuntimeSleeveRuntime:
         return PortfolioEngineState.from_cycle(
             cycle=framework,
             portfolio=self.portfolio,
-            data=_data_slice_from_indicator_snapshot(active_snapshot),
+            data=self._latest_data_slice(active_snapshot),
         )
+
+    def _latest_data_slice(self, indicator_snapshot: IndicatorSnapshot) -> DataSlice:
+        market_snapshot = self.worker.last_market_snapshot
+        if market_snapshot is not None and market_snapshot.bars:
+            return market_snapshot.as_data_slice()
+        return _data_slice_from_indicator_snapshot(indicator_snapshot)
 
     def _agent_status(self, report: "RuntimeRunOnceReport") -> dict[str, Any]:
         cycle = report.worker.cycles[-1] if report.worker.cycles else None
@@ -253,7 +260,7 @@ class RuntimeSleeveRuntime:
         if cycle is not None:
             active_snapshot_store = self.worker.stores_by_sleeve.get(self.sleeve_id)
             active_snapshot = active_snapshot_store.active() if active_snapshot_store is not None else None
-            data = _data_slice_from_indicator_snapshot(active_snapshot) if active_snapshot is not None else None
+            data = self._latest_data_slice(active_snapshot) if active_snapshot is not None else None
         if data is not None:
             portfolio_equity_by_currency = self.portfolio.equity_by_currency(
                 data,
@@ -324,6 +331,7 @@ class RuntimeRunOnceReport:
     worker: SnapshotWorkerRunReport
     framework: FrameworkCycleResult | None = None
     portfolio_state: PortfolioEngineState | None = None
+    agent_status: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(
         self,
@@ -356,6 +364,7 @@ class RuntimeRunOnceReport:
             "portfolio_state": self.portfolio_state.to_dict(include_details=include_framework_details)
             if self.portfolio_state is not None
             else None,
+            "engine_status": dict(self.agent_status),
         }
 
 

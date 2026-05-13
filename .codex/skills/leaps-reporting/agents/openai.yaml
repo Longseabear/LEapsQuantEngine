@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEaps Reporting"
+  short_description: "Run and interpret LEaps live and backtest portfolio reports."
+  default_prompt: "Use this skill to produce LEaps live or backtest reports with current-vs-target quantities, order lifecycle status, and Telegram/operator output."

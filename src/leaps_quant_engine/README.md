@@ -65,7 +65,7 @@ The engine should stay LEAN-like at the strategy boundary, but sleeve-aware at e
 - Portfolio and virtual sleeve account holdings change from fill or reconciliation events.
 - KIS-specific payloads belong behind adapters or sync code, never inside strategy, alpha, portfolio, risk, or execution models.
 - Domestic and overseas broker accounts must be explicit routes. A sleeve should choose a `broker_account_id`; account-level order runtime commands use that route before old portfolio store fallbacks.
-- The current broker-engine gateway is domestic-only. Overseas routes may run status and paper flows, but live broker-engine submit, poll, and reconciliation must stay blocked until an overseas adapter exists.
+- The broker gateway supports domestic KRX cash orders and overseas KIS stock/ETF order submission through explicit route/account boundaries. Overseas execution-history reconciliation is still not enabled in v0; supervise those routes with polling and separate fill sync until that adapter exists.
 
 ## Sleeve Rules
 

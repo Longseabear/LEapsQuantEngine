@@ -17,6 +17,7 @@ from leaps_quant_engine.framework.portfolio_construction import (
     PortfolioTargetBatch,
 )
 from leaps_quant_engine.framework.order_sizing import OrderSizingBatch, OrderSizingContext, OrderSizingEngine
+from leaps_quant_engine.framework.state import FrameworkRunnerState
 from leaps_quant_engine.framework.risk import (
     BasicRiskManagementModel,
     RiskDecisionBatch,
@@ -196,6 +197,40 @@ class FrameworkRunner:
         if self.execution_engine is None:
             self.execution_engine = ExecutionEngine(model=self.execution_model)
 
+    def restore_state(self, state: FrameworkRunnerState | None) -> None:
+        if state is None:
+            return
+        if state.sleeve_id and state.sleeve_id != self.sleeve_id:
+            return
+        self._last_portfolio_run_at = state.last_portfolio_run_at
+        self._last_portfolio_target_batch = state.last_portfolio_target_batch
+        self.alpha_runtime.restore_last_run_state(state.alpha_last_run_by_alpha_id)
+        self.insight_manager = InsightManager()
+        if state.active_insights:
+            self.insight_manager.ingest(
+                InsightBatch(
+                    sleeve_id=self.sleeve_id,
+                    universe_id=None,
+                    source_snapshot_id=None,
+                    generated_at=state.updated_at,
+                    alpha_ids=tuple(sorted({insight.alpha_id for insight in state.active_insights})),
+                    insights=state.active_insights,
+                    metadata={"restored_from_framework_state": True},
+                ),
+                as_of=state.updated_at,
+            )
+
+    def export_state(self, *, as_of: datetime | None = None) -> FrameworkRunnerState:
+        state_time = as_of or datetime.now()
+        return FrameworkRunnerState(
+            sleeve_id=self.sleeve_id,
+            updated_at=state_time,
+            active_insights=self.insight_manager.active(state_time, sleeve_id=self.sleeve_id),
+            alpha_last_run_by_alpha_id=self.alpha_runtime.last_run_state(),
+            last_portfolio_run_at=self._last_portfolio_run_at,
+            last_portfolio_target_batch=self._last_portfolio_target_batch,
+        )
+
     def run_once(
         self,
         *,
@@ -274,6 +309,7 @@ class FrameworkRunner:
                 portfolio=portfolio,
                 targets=order_sizing_batch.targets,
                 snapshot_quality=indicator_snapshot.quality_report,
+                active_insights=active_insights,
             )
         )
         risk_ms = _elapsed_ms(started)

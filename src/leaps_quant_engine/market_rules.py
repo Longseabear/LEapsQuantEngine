@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from math import ceil, floor
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from leaps_quant_engine.models import OrderSide, OrderType, Symbol, TimeInForce
 
@@ -90,6 +92,25 @@ def round_krx_price_to_tick(price: float, *, side: OrderSide) -> int:
     return int(max(units, 0) * tick)
 
 
+def overseas_order_tick_size(price: float, *, exchange: str | None = None) -> Decimal:
+    normalized_exchange = str(exchange or "").strip().upper()
+    value = _decimal_price(price)
+    if normalized_exchange in {"NASD", "NASDAQ", "NAS", "NYSE", "NYS", "AMEX", "AMS", "US"}:
+        return Decimal("0.0001") if value < Decimal("1") else Decimal("0.01")
+    return Decimal("0.0001")
+
+
+def round_overseas_price_to_tick(price: float, *, side: OrderSide, exchange: str | None = None) -> float:
+    value = _decimal_price(price)
+    if value <= 0:
+        return float(value)
+    tick = overseas_order_tick_size(float(value), exchange=exchange)
+    rounding = ROUND_CEILING if side is OrderSide.BUY else ROUND_FLOOR
+    units = (value / tick).to_integral_value(rounding=rounding)
+    normalized = max(units * tick, tick)
+    return float(normalized)
+
+
 def is_whole_share_quantity(quantity: Any) -> bool:
     try:
         numeric = float(quantity)
@@ -107,6 +128,28 @@ def synthetic_domestic_market_session(now: datetime) -> MarketSession:
         is_orderable=phase in ORDERABLE_PHASES,
         is_regular_market_open=phase in REGULAR_ORDERABLE_PHASES,
         source="synthetic_kst_clock",
+    )
+
+
+def synthetic_us_market_session(now: datetime) -> MarketSession:
+    eastern_now = now.astimezone(ZoneInfo("America/New_York"))
+    current = eastern_now.time()
+    if eastern_now.weekday() >= 5:
+        phase = "closed"
+    elif time(4, 0) <= current < time(9, 30):
+        phase = "pre_market"
+    elif time(9, 30) <= current < time(16, 0):
+        phase = "regular_continuous"
+    elif time(16, 0) <= current < time(20, 0):
+        phase = "after_market"
+    else:
+        phase = "closed"
+    return MarketSession(
+        market_scope="overseas",
+        session_phase=phase,
+        is_orderable=phase == "regular_continuous",
+        is_regular_market_open=phase == "regular_continuous",
+        source="synthetic_us_eastern_clock",
     )
 
 
@@ -128,3 +171,10 @@ def _domestic_session_phase(current: time) -> str:
 
 def is_domestic_symbol(symbol: Symbol) -> bool:
     return symbol.market.upper() in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _decimal_price(price: float) -> Decimal:
+    try:
+        return Decimal(str(price))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("price must be numeric.") from exc

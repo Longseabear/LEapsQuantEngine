@@ -63,6 +63,8 @@ class KISDirectClient:
         args = dict(arguments or {})
         if operation in {"get_stock_price", "get_latest_quote"}:
             return self._get_stock_price(args)
+        if operation == "get_domestic_orderbook":
+            return self._get_domestic_orderbook(_required_text(args, "symbol"))
         if operation == "get_daily_ohlcv":
             return self._get_daily_ohlcv(args)
         if operation == "get_or_cache_daily_ohlcv":
@@ -72,15 +74,21 @@ class KISDirectClient:
         if operation == "get_intraday_bars":
             return self._get_domestic_intraday_bars(args)
         if operation == "get_account_balance_summary":
-            return self._get_account_balance_summary()
+            return self._get_account_balance_summary(args)
         if operation == "get_account_holdings":
-            return self._get_account_holdings()
+            return self._get_account_holdings(args)
         if operation == "get_account_execution_history":
             return self._get_account_execution_history(args)
+        if operation == "get_overseas_account_buying_power":
+            return self._get_overseas_account_buying_power(args)
         if operation == "place_domestic_cash_order":
             return self._place_domestic_cash_order(args)
         if operation == "revise_or_cancel_domestic_order":
             return self._revise_or_cancel_domestic_order(args)
+        if operation == "place_overseas_stock_order":
+            return self._place_overseas_stock_order(args)
+        if operation == "revise_or_cancel_overseas_stock_order":
+            return self._revise_or_cancel_overseas_stock_order(args)
         if operation == "request_hashkey":
             payload = args.get("payload")
             if not isinstance(payload, dict):
@@ -179,27 +187,118 @@ class KISDirectClient:
         return filtered
 
     def _get_domestic_price(self, symbol: str) -> dict[str, Any]:
+        normalized_symbol = symbol.strip()
         payload = self._get_json(
             "/uapi/domestic-stock/v1/quotations/inquire-price",
             tr_id="FHKST01010100",
             params={
                 "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": symbol.strip(),
+                "FID_INPUT_ISCD": normalized_symbol,
             },
             label=f"domestic quote {symbol}",
         )
         output = _required_mapping(payload, "output")
-        return {
-            "symbol": symbol.strip(),
+        last_price = _to_int(output.get("stck_prpr"), "stck_prpr")
+        open_price = _to_int(output.get("stck_oprc"), "stck_oprc")
+        high_price = _to_int(output.get("stck_hgpr"), "stck_hgpr")
+        low_price = _to_int(output.get("stck_lwpr"), "stck_lwpr")
+        volume = _to_int(output.get("acml_vol"), "acml_vol")
+        result = {
+            "symbol": normalized_symbol,
             "name": str(output.get("hts_kor_isnm", "")).strip(),
             "market_code": str(output.get("rprs_mrkt_kor_name", "")).strip(),
-            "last_price": _to_int(output.get("stck_prpr"), "stck_prpr"),
+            "last_price": last_price,
             "change": _to_int(output.get("prdy_vrss"), "prdy_vrss"),
             "change_rate_percent": _to_float(output.get("prdy_ctrt"), "prdy_ctrt"),
-            "open_price": _to_int(output.get("stck_oprc"), "stck_oprc"),
-            "high_price": _to_int(output.get("stck_hgpr"), "stck_hgpr"),
-            "low_price": _to_int(output.get("stck_lwpr"), "stck_lwpr"),
-            "volume": _to_int(output.get("acml_vol"), "acml_vol"),
+            "open_price": open_price,
+            "high_price": high_price,
+            "low_price": low_price,
+            "volume": volume,
+            "live_price_usable": True,
+            "price_source": "inquire-price",
+            "raw_output": output,
+        }
+        if _looks_like_domestic_reference_price(output, last_price, open_price, high_price, low_price):
+            try:
+                orderbook = self._get_domestic_orderbook(normalized_symbol)
+            except KISDirectClientError as exc:
+                result["live_price_usable"] = False
+                result["price_quality_reason"] = f"reference_price_without_orderbook: {exc}"
+                return result
+            orderbook_price = int(orderbook.get("reference_price") or 0)
+            if orderbook_price > 0 and orderbook_price != last_price:
+                result.update(
+                    {
+                        "last_price": orderbook_price,
+                        "open_price": orderbook_price if open_price <= 0 else open_price,
+                        "high_price": max(high_price, orderbook_price),
+                        "low_price": orderbook_price if low_price <= 0 else min(low_price, orderbook_price),
+                        "price_source": str(orderbook.get("reference_price_source") or "orderbook"),
+                        "orderbook": {
+                            "quote_time": orderbook.get("quote_time"),
+                            "best_ask": orderbook.get("best_ask"),
+                            "best_bid": orderbook.get("best_bid"),
+                            "total_ask_size": orderbook.get("total_ask_size"),
+                            "total_bid_size": orderbook.get("total_bid_size"),
+                        },
+                    }
+                )
+            else:
+                result["live_price_usable"] = False
+                result["price_quality_reason"] = "reference_price_without_distinct_orderbook_price"
+                result["orderbook"] = {
+                    "quote_time": orderbook.get("quote_time"),
+                    "best_ask": orderbook.get("best_ask"),
+                    "best_bid": orderbook.get("best_bid"),
+                    "total_ask_size": orderbook.get("total_ask_size"),
+                    "total_bid_size": orderbook.get("total_bid_size"),
+                }
+        return result
+
+    def _get_domestic_orderbook(self, symbol: str) -> dict[str, Any]:
+        normalized_symbol = symbol.strip()
+        payload = self._get_json(
+            "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            tr_id="FHKST01010200",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": normalized_symbol,
+            },
+            label=f"domestic orderbook {symbol}",
+        )
+        output = _required_mapping(payload, "output1")
+        levels: list[dict[str, int]] = []
+        for level in range(1, 11):
+            levels.append(
+                {
+                    "level": level,
+                    "ask_price": _to_int(output.get(f"askp{level}"), f"askp{level}"),
+                    "ask_size": _to_int(output.get(f"askp_rsqn{level}"), f"askp_rsqn{level}"),
+                    "bid_price": _to_int(output.get(f"bidp{level}"), f"bidp{level}"),
+                    "bid_size": _to_int(output.get(f"bidp_rsqn{level}"), f"bidp_rsqn{level}"),
+                }
+            )
+        best_ask = levels[0]["ask_price"]
+        best_bid = levels[0]["bid_price"]
+        raw_last_price = _optional_int(output.get("stck_prpr"), default=0)
+        reference_price = raw_last_price
+        reference_price_source = "orderbook_last_price"
+        if reference_price <= 0:
+            positive_prices = [price for price in (best_ask, best_bid) if price > 0]
+            reference_price = int(sum(positive_prices) / len(positive_prices)) if positive_prices else 0
+            reference_price_source = "orderbook_best_bid_ask_mid"
+        return {
+            "symbol": normalized_symbol,
+            "market": "domestic",
+            "quote_time": str(output.get("aspr_acpt_hour", "")).strip(),
+            "last_price": raw_last_price,
+            "reference_price": reference_price,
+            "reference_price_source": reference_price_source,
+            "best_ask": best_ask,
+            "best_bid": best_bid,
+            "total_ask_size": _to_int(output.get("total_askp_rsqn"), "total_askp_rsqn"),
+            "total_bid_size": _to_int(output.get("total_bidp_rsqn"), "total_bidp_rsqn"),
+            "levels": levels,
             "raw_output": output,
         }
 
@@ -368,7 +467,10 @@ class KISDirectClient:
             "candles": candles,
         }
 
-    def _get_account_balance_summary(self) -> dict[str, Any]:
+    def _get_account_balance_summary(self, args: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        market = _normalize_market((args or {}).get("market"))
+        if market == "overseas":
+            return self._get_overseas_account_balance_summary(args or {})
         payload = self._get_account_balance_raw()
         holdings = _list_or_empty(payload.get("output1"))
         summary = _first_mapping(payload.get("output2"), "output2")
@@ -386,7 +488,10 @@ class KISDirectClient:
             "holdings_count": len(holdings),
         }
 
-    def _get_account_holdings(self) -> dict[str, Any]:
+    def _get_account_holdings(self, args: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        market = _normalize_market((args or {}).get("market"))
+        if market == "overseas":
+            return self._get_overseas_account_holdings(args or {})
         payload = self._get_account_balance_raw()
         holdings: list[dict[str, Any]] = []
         for row in _list_or_empty(payload.get("output1")):
@@ -409,7 +514,78 @@ class KISDirectClient:
             )
         return {"account_type": "domestic_stock", "holdings": holdings, "holdings_count": len(holdings)}
 
+    def _get_overseas_account_balance_summary(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        payload = self._get_overseas_account_balance_raw(args)
+        holdings = _list_or_empty(payload.get("output1"))
+        summary = _first_mapping(payload.get("output3"), "output3")
+        present_cash_balance = _to_float(
+            summary.get("wdrw_psbl_tot_amt", summary.get("nxdy_frcr_drwg_psbl_amt", "0")),
+            "wdrw_psbl_tot_amt",
+        )
+        buying_power = self._get_overseas_account_buying_power(args)
+        cash_balance = float(buying_power.get("orderable_foreign_amount") or 0.0)
+        return {
+            "account_type": "overseas_stock",
+            "currency": str(buying_power.get("currency") or _overseas_cash_currency(args)),
+            "cash_balance": cash_balance,
+            "present_cash_balance": present_cash_balance,
+            "deposit_total_amount": _to_float(summary.get("tot_dncl_amt", summary.get("dncl_amt", "0")), "tot_dncl_amt"),
+            "previous_settlement_amount": cash_balance,
+            "next_day_settlement_amount": _to_float(
+                summary.get("nxdy_frcr_drwg_psbl_amt", summary.get("wdrw_psbl_tot_amt", "0")),
+                "nxdy_frcr_drwg_psbl_amt",
+            ),
+            "securities_evaluation_amount": _to_float(
+                summary.get("evlu_amt_smtl_amt", summary.get("evlu_amt_smtl", "0")),
+                "evlu_amt_smtl_amt",
+            ),
+            "total_evaluation_amount": _to_float(summary.get("tot_asst_amt", "0"), "tot_asst_amt"),
+            "net_asset_amount": _to_float(summary.get("tot_asst_amt", "0"), "tot_asst_amt"),
+            "purchase_amount_total": _to_float(
+                summary.get("pchs_amt_smtl_amt", summary.get("pchs_amt_smtl", "0")),
+                "pchs_amt_smtl_amt",
+            ),
+            "evaluation_profit_loss_total": _to_float(summary.get("tot_evlu_pfls_amt", "0"), "tot_evlu_pfls_amt"),
+            "holdings_count": len(holdings),
+            "buying_power": buying_power,
+        }
+
+    def _get_overseas_account_holdings(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        payload = self._get_overseas_account_balance_raw(args)
+        holdings: list[dict[str, Any]] = []
+        for row in _list_or_empty(payload.get("output1")):
+            symbol = str(row.get("pdno") or row.get("ovrs_pdno") or row.get("std_pdno") or "").strip()
+            if not symbol:
+                continue
+            holdings.append(
+                {
+                    "symbol": symbol,
+                    "market": _canonical_market_from_overseas_exchange(str(row.get("ovrs_excg_cd", "")).strip()),
+                    "name": str(row.get("prdt_name", "")).strip(),
+                    "exchange": str(row.get("ovrs_excg_cd", "")).strip(),
+                    "currency": str(row.get("crcy_cd") or row.get("buy_crcy_cd") or row.get("tr_crcy_cd") or "").strip(),
+                    "holding_quantity": _to_int(row.get("cblc_qty13", row.get("ovrs_cblc_qty", "0")), "cblc_qty13"),
+                    "orderable_quantity": _to_int(row.get("ord_psbl_qty1", row.get("ord_psbl_qty", "0")), "ord_psbl_qty1"),
+                    "average_purchase_price": _to_float(row.get("avg_unpr3", row.get("pchs_avg_pric", "0")), "avg_unpr3"),
+                    "purchase_amount": _to_float(
+                        row.get("pchs_rmnd_wcrc_amt", row.get("frcr_pchs_amt", row.get("frcr_pchs_amt1", "0"))),
+                        "pchs_rmnd_wcrc_amt",
+                    ),
+                    "current_price": _to_float(row.get("ovrs_now_pric1", row.get("now_pric2", "0")), "ovrs_now_pric1"),
+                    "evaluation_amount": _to_float(row.get("frcr_evlu_amt2", row.get("ovrs_stck_evlu_amt", "0")), "frcr_evlu_amt2"),
+                    "evaluation_profit_loss_amount": _to_float(
+                        row.get("evlu_pfls_amt2", row.get("frcr_evlu_pfls_amt", "0")),
+                        "evlu_pfls_amt2",
+                    ),
+                    "evaluation_profit_loss_rate": _to_float(row.get("evlu_pfls_rt1", row.get("evlu_pfls_rt", "0")), "evlu_pfls_rt1"),
+                }
+            )
+        return {"account_type": "overseas_stock", "holdings": holdings, "holdings_count": len(holdings)}
+
     def _get_account_execution_history(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        market = _normalize_market(args.get("market"))
+        if market == "overseas":
+            return self._get_overseas_account_execution_history(args)
         start_date = _required_date(args, "start_date")
         end_date = _required_date(args, "end_date")
         side_filter = _normalize_side_filter(str(args.get("side") or "all"))
@@ -466,6 +642,71 @@ class KISDirectClient:
             "symbol_filter": symbol,
             "exchange_scope_filter": "ALL",
             "source_note": "Rows come from KIS daily order/execution inquiry and may aggregate fills.",
+        }
+
+    def _get_overseas_account_execution_history(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        start_date = _required_date(args, "start_date")
+        end_date = _required_date(args, "end_date")
+        side_filter = _normalize_side_filter(str(args.get("side") or "all"))
+        symbol = str(args.get("symbol") or "").strip().upper()
+        exchange = str(args.get("exchange") or "%%").strip().upper() or "%%"
+        payload = self._get_json(
+            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            tr_id="VTTS3035R" if self.settings.mock else "TTTS3035R",
+            params={
+                **self._account_params(),
+                "PDNO": symbol or "%",
+                "ORD_STRT_DT": start_date,
+                "ORD_END_DT": end_date,
+                "SLL_BUY_DVSN": side_filter,
+                "CCLD_NCCS_DVSN": "01",
+                "OVRS_EXCG_CD": exchange,
+                "SORT_SQN": "DS",
+                "ORD_DT": "",
+                "ORD_GNO_BRNO": str(args.get("branch_no") or "").strip(),
+                "ODNO": str(args.get("order_no") or "").strip(),
+                "CTX_AREA_NK200": "",
+                "CTX_AREA_FK200": "",
+            },
+            label="overseas account execution history",
+        )
+        executions = []
+        for row in _list_or_empty(payload.get("output")):
+            filled_quantity = _to_int(row.get("ft_ccld_qty", "0"), "ft_ccld_qty")
+            if filled_quantity <= 0:
+                continue
+            exchange_code = str(row.get("ovrs_excg_cd") or "").strip().upper()
+            executions.append(
+                {
+                    "order_id": str(row.get("odno", "")).strip(),
+                    "symbol": str(row.get("pdno", "")).strip().upper(),
+                    "name": str(row.get("prdt_name", "")).strip(),
+                    "side": _normalize_history_side(row),
+                    "execution_date": str(row.get("ord_dt", "")).strip(),
+                    "execution_time": str(row.get("ord_tmd", "")).strip(),
+                    "execution_timestamp": _join_kis_timestamp(row.get("ord_dt"), row.get("ord_tmd")),
+                    "execution_quantity": filled_quantity,
+                    "execution_price": _to_float(row.get("ft_ccld_unpr3", "0"), "ft_ccld_unpr3"),
+                    "execution_amount": _to_float(row.get("ft_ccld_amt3", "0"), "ft_ccld_amt3"),
+                    "order_quantity": _to_int(row.get("ft_ord_qty", "0"), "ft_ord_qty"),
+                    "order_price": _to_float(row.get("ft_ord_unpr3", "0"), "ft_ord_unpr3"),
+                    "unfilled_quantity": _to_int(row.get("nccs_qty", "0"), "nccs_qty"),
+                    "exchange": exchange_code,
+                    "market": _canonical_market_from_overseas_exchange(exchange_code),
+                    "currency": str(row.get("tr_crcy_cd") or "").strip().upper(),
+                    "source_granularity": "order_execution_summary",
+                }
+            )
+        return {
+            "account_type": "overseas_stock",
+            "executions": executions,
+            "execution_count": len(executions),
+            "start_date": start_date,
+            "end_date": end_date,
+            "side_filter": str(args.get("side") or "all").strip().lower(),
+            "symbol_filter": symbol,
+            "exchange_scope_filter": exchange,
+            "source_note": "Rows come from KIS overseas order/execution inquiry and may aggregate fills.",
         }
 
     def _place_domestic_cash_order(self, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -547,6 +788,98 @@ class KISDirectClient:
             "raw_output": output,
         }
 
+    def _place_overseas_stock_order(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        side = _normalize_order_side(args.get("side"))
+        exchange = _normalize_overseas_order_exchange(args.get("exchange"))
+        symbol = _required_text(args, "symbol").upper()
+        order_division = _normalize_order_division(args.get("order_division") or "00")
+        quantity = _positive_int(args.get("quantity"), "quantity")
+        price = _normalize_overseas_order_price(args.get("price"), order_division=order_division)
+        tr_id = _overseas_order_tr_id(side=side, exchange=exchange, mock=self.settings.mock)
+        body = {
+            **self._account_params(),
+            "OVRS_EXCG_CD": exchange,
+            "PDNO": symbol,
+            "ORD_QTY": str(quantity),
+            "OVRS_ORD_UNPR": price,
+            "CTAC_TLNO": str(args.get("contact_phone") or "").strip(),
+            "MGCO_APTM_ODNO": str(args.get("auto_order_no") or "").strip(),
+            "SLL_TYPE": "" if side == "buy" else str(args.get("sell_type") or "00").strip(),
+            "ORD_SVR_DVSN_CD": str(args.get("order_server_division_code") or "0").strip(),
+            "ORD_DVSN": order_division,
+        }
+        payload = self._post_json(
+            "/uapi/overseas-stock/v1/trading/order",
+            tr_id=tr_id,
+            body=body,
+            label="overseas stock order",
+            use_hashkey=bool(args.get("use_hashkey", False)),
+        )
+        output = _required_mapping(payload, "output")
+        return {
+            "rt_cd": str(payload.get("rt_cd", "")).strip(),
+            "msg_cd": str(payload.get("msg_cd", "")).strip(),
+            "msg1": str(payload.get("msg1", "")).strip(),
+            "branch_no": str(output.get("KRX_FWDG_ORD_ORGNO", "")).strip(),
+            "order_no": str(output.get("ODNO", "")).strip(),
+            "order_time": str(output.get("ORD_TMD", "")).strip(),
+            "market": "overseas",
+            "side": side,
+            "exchange": exchange,
+            "symbol": symbol,
+            "quantity": quantity,
+            "price": float(price),
+            "order_division": order_division,
+            "raw_output": output,
+        }
+
+    def _revise_or_cancel_overseas_stock_order(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        exchange = _normalize_overseas_order_exchange(args.get("exchange"))
+        symbol = _required_text(args, "symbol").upper()
+        order_division = _normalize_order_division(args.get("order_division") or "00")
+        cancel_type = _normalize_cancel_type(args.get("rvse_cncl_dvsn_cd") or "02")
+        quantity = _positive_int(args.get("quantity"), "quantity")
+        price = _normalize_overseas_order_price(
+            args.get("price"),
+            order_division=order_division,
+            allow_zero=True,
+        )
+        body = {
+            **self._account_params(),
+            "OVRS_EXCG_CD": exchange,
+            "PDNO": symbol,
+            "ORGN_ODNO": _required_text(args, "original_order_no"),
+            "RVSE_CNCL_DVSN_CD": cancel_type,
+            "ORD_QTY": str(quantity),
+            "OVRS_ORD_UNPR": price,
+            "MGCO_APTM_ODNO": str(args.get("auto_order_no") or "").strip(),
+            "ORD_SVR_DVSN_CD": str(args.get("order_server_division_code") or "0").strip(),
+        }
+        payload = self._post_json(
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+            tr_id=_overseas_revise_cancel_tr_id(exchange=exchange, mock=self.settings.mock),
+            body=body,
+            label="overseas revise/cancel order",
+            use_hashkey=bool(args.get("use_hashkey", False)),
+        )
+        output = _required_mapping(payload, "output")
+        return {
+            "rt_cd": str(payload.get("rt_cd", "")).strip(),
+            "msg_cd": str(payload.get("msg_cd", "")).strip(),
+            "msg1": str(payload.get("msg1", "")).strip(),
+            "branch_no": str(output.get("KRX_FWDG_ORD_ORGNO", "")).strip(),
+            "order_no": str(output.get("ODNO", "")).strip(),
+            "order_time": str(output.get("ORD_TMD", "")).strip(),
+            "market": "overseas",
+            "exchange": exchange,
+            "symbol": symbol,
+            "original_order_no": body["ORGN_ODNO"],
+            "rvse_cncl_dvsn_cd": cancel_type,
+            "quantity": quantity,
+            "price": float(price),
+            "raw_output": output,
+        }
+
     def _get_account_balance_raw(self) -> dict[str, Any]:
         return self._get_json(
             "/uapi/domestic-stock/v1/trading/inquire-balance",
@@ -565,6 +898,52 @@ class KISDirectClient:
             },
             label="domestic account balance",
         )
+
+    def _get_overseas_account_balance_raw(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        return self._get_json(
+            "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+            tr_id="VTRP6504R" if self.settings.mock else "CTRP6504R",
+            params={
+                **self._account_params(),
+                "WCRC_FRCR_DVSN_CD": _normalize_currency_basis(args.get("currency_basis") or "02"),
+                "NATN_CD": str(args.get("nation_code") or "000").strip() or "000",
+                "TR_MKET_CD": str(args.get("market_code") or "00").strip() or "00",
+                "INQR_DVSN_CD": str(args.get("inquiry_division") or "00").strip() or "00",
+            },
+            label="overseas account balance",
+        )
+
+    def _get_overseas_account_buying_power(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = str(args.get("symbol") or self.settings.default_overseas_symbol or "SMH").strip().upper()
+        exchange = _normalize_overseas_order_exchange(args.get("exchange") or self.settings.default_overseas_exchange or "NAS")
+        price = str(args.get("price") or "").strip()
+        payload = self._get_json(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            tr_id="VTTS3007R" if self.settings.mock else "TTTS3007R",
+            params={
+                **self._account_params(),
+                "OVRS_EXCG_CD": exchange,
+                "OVRS_ORD_UNPR": price,
+                "ITEM_CD": symbol,
+            },
+            label="overseas buying power",
+        )
+        output = _required_mapping(payload, "output")
+        return {
+            "account_type": "overseas_stock",
+            "currency": str(output.get("tr_crcy_cd") or "").strip() or "USD",
+            "orderable_foreign_amount": _to_float(output.get("ord_psbl_frcr_amt", "0"), "ord_psbl_frcr_amt"),
+            "overseas_orderable_amount": _to_float(output.get("ovrs_ord_psbl_amt", "0"), "ovrs_ord_psbl_amt"),
+            "foreign_orderable_amount_detail": _to_float(output.get("frcr_ord_psbl_amt1", "0"), "frcr_ord_psbl_amt1"),
+            "sell_reusable_amount": _to_float(output.get("sll_ruse_psbl_amt", "0"), "sll_ruse_psbl_amt"),
+            "exchange_after_orderable_amount": _to_float(output.get("echm_af_ord_psbl_amt", "0"), "echm_af_ord_psbl_amt"),
+            "exchange_after_orderable_quantity": _to_int(output.get("echm_af_ord_psbl_qty", "0"), "echm_af_ord_psbl_qty"),
+            "max_orderable_quantity": _to_int(output.get("max_ord_psbl_qty", output.get("ovrs_max_ord_psbl_qty", "0")), "max_ord_psbl_qty"),
+            "orderable_quantity": _to_int(output.get("ord_psbl_qty", "0"), "ord_psbl_qty"),
+            "exchange_rate": _to_float(output.get("exrt", "0"), "exrt"),
+            "exchange": exchange,
+            "symbol": symbol,
+        }
 
     def _account_params(self) -> dict[str, str]:
         if not self.settings.cano:
@@ -760,6 +1139,7 @@ _TOKEN_CACHE: dict[str, KISAccessToken] = {}
 _SUPPORTED_OPERATIONS = {
     "get_stock_price",
     "get_latest_quote",
+    "get_domestic_orderbook",
     "get_daily_ohlcv",
     "get_or_cache_daily_ohlcv",
     "get_or_cache_domestic_minute_bars",
@@ -767,12 +1147,49 @@ _SUPPORTED_OPERATIONS = {
     "get_account_balance_summary",
     "get_account_holdings",
     "get_account_execution_history",
+    "get_overseas_account_buying_power",
     "place_domestic_cash_order",
     "revise_or_cancel_domestic_order",
+    "place_overseas_stock_order",
+    "revise_or_cancel_overseas_stock_order",
     "request_hashkey",
 }
 
 _SUPPORTED_OVERSEAS_EXCHANGES = {"NAS", "NYS", "AMS", "HKS", "TSE", "SHS", "SZS"}
+_SUPPORTED_OVERSEAS_ORDER_EXCHANGES = {"NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE"}
+_OVERSEAS_BUY_TR_IDS = {
+    "NASD": "TTTT1002U",
+    "NYSE": "TTTT1002U",
+    "AMEX": "TTTT1002U",
+    "SEHK": "TTTS1002U",
+    "SHAA": "TTTS0202U",
+    "SZAA": "TTTS0305U",
+    "TKSE": "TTTS0308U",
+    "HASE": "TTTS0311U",
+    "VNSE": "TTTS0311U",
+}
+_OVERSEAS_SELL_TR_IDS = {
+    "NASD": "TTTT1006U",
+    "NYSE": "TTTT1006U",
+    "AMEX": "TTTT1006U",
+    "SEHK": "TTTS1001U",
+    "SHAA": "TTTS1005U",
+    "SZAA": "TTTS0304U",
+    "TKSE": "TTTS0307U",
+    "HASE": "TTTS0310U",
+    "VNSE": "TTTS0310U",
+}
+_OVERSEAS_REVISE_CANCEL_TR_IDS = {
+    "NASD": "TTTT1004U",
+    "NYSE": "TTTT1004U",
+    "AMEX": "TTTT1004U",
+    "SEHK": "TTTS1003U",
+    "SHAA": "TTTS0302U",
+    "SZAA": "TTTS0306U",
+    "TKSE": "TTTS0309U",
+    "HASE": "TTTS0312U",
+    "VNSE": "TTTS0312U",
+}
 _MARKET_PRICE_ORDER_DIVISIONS = {"01", "13", "14"}
 _LIMIT_PRICE_ORDER_DIVISIONS = {"00", "11", "12"}
 
@@ -819,6 +1236,45 @@ def _normalize_exchange(value: str) -> str:
     if text not in _SUPPORTED_OVERSEAS_EXCHANGES:
         raise KISDirectClientError(f"Unsupported overseas exchange: {value}")
     return text
+
+
+def _normalize_currency_basis(value: Any) -> str:
+    text = str(value or "02").strip()
+    if text not in {"01", "02"}:
+        raise KISDirectClientError("currency_basis must be '01' (KRW) or '02' (foreign).")
+    return text
+
+
+def _overseas_cash_currency(args: Mapping[str, Any]) -> str:
+    currency = str(args.get("currency") or "").strip().upper()
+    if currency:
+        return currency
+    return "KRW" if _normalize_currency_basis(args.get("currency_basis") or "02") == "01" else "USD"
+
+
+def _normalize_overseas_order_exchange(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    aliases = {
+        "NAS": "NASD",
+        "NASDAQ": "NASD",
+        "NYS": "NYSE",
+        "AMS": "AMEX",
+        "HKS": "SEHK",
+        "SHS": "SHAA",
+        "SZS": "SZAA",
+    }
+    text = aliases.get(text, text)
+    if text not in _SUPPORTED_OVERSEAS_ORDER_EXCHANGES:
+        supported = ", ".join(sorted(_SUPPORTED_OVERSEAS_ORDER_EXCHANGES))
+        raise KISDirectClientError(f"Unsupported overseas order exchange: {value}. Supported: {supported}.")
+    return text
+
+
+def _canonical_market_from_overseas_exchange(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"NAS", "NASD", "NASDAQ", "NYS", "NYSE", "AMS", "AMEX"}:
+        return "US"
+    return text or "overseas"
 
 
 def _optional_date(value: Any) -> str | None:
@@ -868,6 +1324,18 @@ def _to_int(value: Any, field_name: str) -> int:
         raise KISDirectClientError(f"Field '{field_name}' could not be parsed as int.") from exc
 
 
+def _optional_int(value: Any, *, default: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        text = str(value).replace(",", "").strip()
+        if text == "":
+            return default
+        return int(Decimal(text))
+    except (AttributeError, TypeError, ValueError, InvalidOperation):
+        return default
+
+
 def _to_float(value: Any, field_name: str) -> float:
     try:
         text = str(value).replace(",", "").strip()
@@ -885,6 +1353,28 @@ def _optional_float(value: Any, *, default: float) -> float:
         return float(str(value).replace(",", "").strip())
     except (AttributeError, TypeError, ValueError):
         return default
+
+
+def _looks_like_domestic_reference_price(
+    output: Mapping[str, Any],
+    last_price: int,
+    open_price: int,
+    high_price: int,
+    low_price: int,
+) -> bool:
+    standard_price = _optional_int(output.get("stck_sdpr"), default=0)
+    change = _optional_int(output.get("prdy_vrss"), default=0)
+    change_rate = _optional_float(output.get("prdy_ctrt"), default=0.0)
+    return (
+        last_price > 0
+        and standard_price > 0
+        and last_price == standard_price
+        and open_price <= 0
+        and high_price <= 0
+        and low_price <= 0
+        and change == 0
+        and abs(change_rate) < 0.000001
+    )
 
 
 def _required_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
@@ -1027,6 +1517,35 @@ def _normalize_order_price(value: Any, *, order_division: str) -> int:
     if order_division in _MARKET_PRICE_ORDER_DIVISIONS:
         return 0
     return price
+
+
+def _normalize_overseas_order_price(value: Any, *, order_division: str, allow_zero: bool = False) -> str:
+    try:
+        price = Decimal(str(value).replace(",", "").strip() or "0")
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise KISDirectClientError("price must be numeric.") from exc
+    if price < 0:
+        raise KISDirectClientError("price must be greater than or equal to zero.")
+    if price == 0 and order_division in _LIMIT_PRICE_ORDER_DIVISIONS and not allow_zero:
+        raise KISDirectClientError("limit order price must be greater than zero.")
+    if order_division in _MARKET_PRICE_ORDER_DIVISIONS:
+        return "0"
+    return format(price, "f")
+
+
+def _mock_tr_id(real_tr_id: str) -> str:
+    return f"V{real_tr_id[1:]}"
+
+
+def _overseas_order_tr_id(*, side: str, exchange: str, mock: bool) -> str:
+    lookup = _OVERSEAS_BUY_TR_IDS if side == "buy" else _OVERSEAS_SELL_TR_IDS
+    tr_id = lookup[exchange]
+    return _mock_tr_id(tr_id) if mock else tr_id
+
+
+def _overseas_revise_cancel_tr_id(*, exchange: str, mock: bool) -> str:
+    tr_id = _OVERSEAS_REVISE_CANCEL_TR_IDS[exchange]
+    return _mock_tr_id(tr_id) if mock else tr_id
 
 
 def _normalize_exchange_scope(value: Any) -> str:

@@ -1,5 +1,5 @@
 from leaps_quant_engine.adapters.kis import MarketDataEngineClient, MarketDataEngineLiveQuoteProvider
-from leaps_quant_engine.settings import load_kis_settings
+from leaps_quant_engine.settings import kis_account_env_prefix, load_kis_settings, load_kis_settings_for_account
 
 
 def test_market_data_engine_rate_limit_is_configurable_from_env(monkeypatch, tmp_path):
@@ -27,3 +27,56 @@ def test_market_data_live_provider_clamps_override_to_kis_limit(monkeypatch, tmp
     provider = MarketDataEngineLiveQuoteProvider.from_env(rate_limit_per_second=30)
 
     assert provider.client.rate_limit_per_second == 20
+
+
+def test_kis_account_env_prefix_matches_stockprogram_normalization():
+    assert kis_account_env_prefix("us-growth") == "KIS_ACCOUNT_US_GROWTH"
+    assert kis_account_env_prefix("kis-overseas") == "KIS_ACCOUNT_KIS_OVERSEAS"
+
+
+def test_load_kis_settings_for_account_uses_scoped_credentials_and_account(monkeypatch, tmp_path):
+    monkeypatch.setenv("KIS_APP_KEY", "base-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "base-secret")
+    monkeypatch.setenv("KIS_CANO", "base-cano")
+    monkeypatch.setenv("KIS_ACNT_PRDT_CD", "01")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_APP_KEY", "us-key")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_APP_SECRET", "us-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_CANO", "us-cano")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_ACNT_PRDT_CD", "22")
+
+    settings = load_kis_settings_for_account(
+        "kis-overseas",
+        metadata={"kis_account_id": "us-growth"},
+        env_file=tmp_path / "missing.env",
+    )
+
+    assert settings.app_key == "us-key"
+    assert settings.app_secret == "us-secret"
+    assert settings.cano == "us-cano"
+    assert settings.account_product_code == "22"
+
+
+def test_load_kis_settings_for_account_can_split_credentials_from_account_number(monkeypatch, tmp_path):
+    monkeypatch.setenv("KIS_APP_KEY", "base-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "base-secret")
+    monkeypatch.setenv("KIS_CANO", "base-cano")
+    monkeypatch.setenv("KIS_ACNT_PRDT_CD", "01")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_APP_KEY", "default-key")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_APP_SECRET", "default-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_CANO", "default-cano")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_ACNT_PRDT_CD", "01")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_APP_KEY", "wrong-us-key")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_APP_SECRET", "wrong-us-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_CANO", "us-cano")
+    monkeypatch.setenv("KIS_ACCOUNT_US_GROWTH_ACNT_PRDT_CD", "22")
+
+    settings = load_kis_settings_for_account(
+        "kis-overseas",
+        metadata={"kis_account_id": "us-growth", "credential_account_id": "default"},
+        env_file=tmp_path / "missing.env",
+    )
+
+    assert settings.app_key == "default-key"
+    assert settings.app_secret == "default-secret"
+    assert settings.cano == "us-cano"
+    assert settings.account_product_code == "22"

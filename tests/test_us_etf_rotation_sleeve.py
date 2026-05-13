@@ -24,6 +24,7 @@ def test_us_etf_rotation_alpha_ranks_etfs_and_flattens_unselected():
     snapshot = _snapshot(
         now,
         {
+            "US:SPY": _values(close=600, fast=590, slow=560, momentum=0.05, momentum_5=0.01, vol=0.02),
             "US:QQQ": _values(close=500, fast=510, slow=480, momentum=0.12, momentum_5=0.04, vol=0.03),
             "US:TLT": _values(close=95, fast=96, slow=94, momentum=0.03, momentum_5=0.01, vol=0.01),
             "US:XLE": _values(close=90, fast=88, slow=92, momentum=0.08, momentum_5=0.02, vol=0.02),
@@ -98,6 +99,48 @@ def test_us_etf_rotation_alpha_uses_intermediate_dual_momentum():
     assert by_symbol["US:XLE"].direction.value == "flat"
 
 
+def test_us_etf_rotation_alpha_treats_missing_spy_gate_as_risk_off():
+    module = _load("sleeves/us_etf_rotation/alphas/etf_rotation.py")
+    now = datetime(2026, 5, 8)
+    snapshot = _snapshot(
+        now,
+        {
+            "US:QQQ": _values(
+                close=500,
+                fast=490,
+                slow=470,
+                momentum=0.20,
+                momentum_5=0.04,
+                vol=0.03,
+                momentum_3m=0.22,
+                momentum_6m=0.24,
+                momentum_12m=0.26,
+                long_trend=430,
+            ),
+            "US:TLT": _values(
+                close=95,
+                fast=96,
+                slow=92,
+                momentum=0.04,
+                momentum_5=0.01,
+                vol=0.01,
+                momentum_3m=0.04,
+                momentum_6m=0.05,
+                momentum_12m=0.06,
+                long_trend=90,
+            ),
+        },
+    )
+
+    context = SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("US:QQQ", "US:TLT"))
+    insights = module.generate(context)
+    by_symbol = {insight.symbol.key: insight for insight in insights}
+
+    assert by_symbol["US:QQQ"].direction.value == "flat"
+    assert by_symbol["US:TLT"].direction.value == "up"
+    assert by_symbol["US:TLT"].metadata["risk_on"] is False
+
+
 def test_us_etf_rotation_selection_keeps_etf_universe_only():
     module = _load("sleeves/us_etf_rotation/selections/etf_rotation.py")
     now = datetime(2026, 5, 8)
@@ -106,6 +149,7 @@ def test_us_etf_rotation_selection_keeps_etf_universe_only():
             "id": "mixed-us-test",
             "market": "US",
             "symbols": [
+                {"ticker": "SPY", "market": "US", "asset_type": "etf", "is_etf": True},
                 {"ticker": "QQQ", "market": "US", "asset_type": "etf", "is_etf": True},
                 {"ticker": "SMH", "market": "US", "asset_type": "etf", "is_etf": True},
                 {"ticker": "AAPL", "market": "US", "asset_type": "stock"},
@@ -115,6 +159,7 @@ def test_us_etf_rotation_selection_keeps_etf_universe_only():
     snapshot = _snapshot(
         now,
         {
+            "US:SPY": _values(close=600, fast=590, slow=560, momentum=0.05, momentum_5=0.01, vol=0.02),
             "US:QQQ": _values(close=500, fast=510, slow=480, momentum=0.12, momentum_5=0.04, vol=0.03),
             "US:SMH": _values(close=250, fast=255, slow=240, momentum=0.18, momentum_5=0.07, vol=0.05),
             "US:AAPL": _values(close=210, fast=212, slow=200, momentum=0.50, momentum_5=0.08, vol=0.04),
@@ -160,6 +205,35 @@ def test_us_etf_rotation_selection_prefers_defensive_etfs_when_market_risk_off()
     )
 
     assert [symbol.key for symbol in result.selected_symbols] == ["US:TLT", "US:GLD"]
+    assert result.rejected["US:QQQ"] == ("market_risk_off",)
+
+
+def test_us_etf_rotation_selection_treats_missing_spy_gate_as_risk_off():
+    module = _load("sleeves/us_etf_rotation/selections/etf_rotation.py")
+    now = datetime(2026, 5, 8)
+    universe = parse_universe_definition(
+        {
+            "id": "missing-spy-gate-test",
+            "market": "US",
+            "symbols": [
+                {"ticker": "QQQ", "market": "US", "asset_type": "etf", "is_etf": True},
+                {"ticker": "TLT", "market": "US", "asset_type": "etf", "is_etf": True},
+            ],
+        }
+    )
+    snapshot = _snapshot(
+        now,
+        {
+            "US:QQQ": _values(close=500, fast=510, slow=480, momentum=0.20, momentum_5=0.04, vol=0.03, long_trend=470),
+            "US:TLT": _values(close=95, fast=96, slow=92, momentum=0.04, momentum_5=0.01, vol=0.01, long_trend=90),
+        },
+    )
+
+    result = module.EtfRotationSelectionModel(max_active_symbols=2).select(
+        UniverseSelectionContext(sleeve_id="us_etf_rotation", universe=universe, indicator_snapshot=snapshot)
+    )
+
+    assert [symbol.key for symbol in result.selected_symbols] == ["US:TLT"]
     assert result.rejected["US:QQQ"] == ("market_risk_off",)
 
 

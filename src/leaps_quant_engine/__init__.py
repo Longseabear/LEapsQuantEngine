@@ -180,6 +180,7 @@ from leaps_quant_engine.notifications import (
     notify_order_submit_report,
     notify_order_supervisor_report,
 )
+from leaps_quant_engine.telegram import normalize_agent_text
 from leaps_quant_engine.orders import (
     FeeEstimate,
     FeeModel,
@@ -330,6 +331,7 @@ from leaps_quant_engine.virtual_account import (
     FillAllocation,
     FillAllocationStatus,
     OrderOwnership,
+    PositionState,
     PositionReconciliationRow,
     UNKNOWN_SLEEVE_ID,
     VirtualAccountReconciliationReport,
@@ -451,6 +453,7 @@ __all__ = [
     "MarketDataRuntimeConfig",
     "Momentum",
     "MomentumUniverseSelectionModel",
+    "normalize_agent_text",
     "MultiSleeveOrderOrchestrationResult",
     "MultiSleeveOrderOrchestrator",
     "ModuleReference",
@@ -506,6 +509,7 @@ __all__ = [
     "PortfolioRuntimeConfig",
     "PointInTimeFundamentalStore",
     "PositionReconciliationRow",
+    "PositionState",
     "PythonPortfolioConstructionModelLoader",
     "PythonExecutionModelLoader",
     "PythonRiskManagementModelLoader",

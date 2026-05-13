@@ -303,6 +303,7 @@ class ExecutionHistoryReconcileWorker:
                 continue
 
             if self.account_store.fill_exists(fill.fill_id):
+                self._record_imported_fill_event(fill)
                 duplicate += 1
                 continue
             if _matches_existing_order_event_fill(fill, existing_fill_events):
@@ -334,6 +335,7 @@ class ExecutionHistoryReconcileWorker:
                 skipped += 1
                 rejected.append({"reason": str(exc), "execution": row})
                 continue
+            self._record_imported_fill_event(fill)
             imported += 1
 
         reconciliation = None
@@ -380,6 +382,34 @@ class ExecutionHistoryReconcileWorker:
         except Exception:  # noqa: BLE001
             return ()
 
+    def _record_imported_fill_event(self, fill: VirtualFillEvent) -> None:
+        if self.order_state_store is None:
+            return
+        try:
+            snapshot = self.order_state_store.snapshot()
+        except Exception:  # noqa: BLE001
+            return
+        if _matches_existing_order_event_fill(fill, snapshot.fill_events):
+            return
+        ticket = _matching_open_ticket_for_fill(fill, snapshot.open_tickets)
+        if ticket is None:
+            return
+        event_type = (
+            OrderEventType.FILLED
+            if fill.quantity >= ticket.remaining_quantity
+            else OrderEventType.PARTIALLY_FILLED
+        )
+        event = ticket.event(
+            event_type,
+            occurred_at=fill.filled_at,
+            quantity=fill.quantity,
+            fill_price=fill.fill_price,
+            broker_order_id=ticket.broker_order_id or fill.broker_order_id,
+            reason="execution_history_reconcile_fill",
+            metadata={"fill_id": fill.fill_id},
+        )
+        self.order_state_store.record_event(event, recorded_at=fill.filled_at)
+
 
 def _extract_executions(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     executions = payload.get("executions", [])
@@ -404,6 +434,19 @@ def _matches_existing_order_event_fill(fill: VirtualFillEvent, events: Iterable[
             continue
         return True
     return False
+
+
+def _matching_open_ticket_for_fill(fill: VirtualFillEvent, tickets: Iterable[OrderTicket]) -> OrderTicket | None:
+    fill_aliases = _broker_order_aliases(fill.broker_order_id or fill.order_id)
+    for ticket in tickets:
+        if ticket.symbol != fill.symbol or ticket.side is not fill.side:
+            continue
+        ticket_aliases = _broker_order_aliases(ticket.broker_order_id or ticket.order_intent_id)
+        if fill_aliases and ticket_aliases and not fill_aliases.isdisjoint(ticket_aliases):
+            return ticket
+        if fill.order_id and fill.order_id == ticket.order_intent_id:
+            return ticket
+    return None
 
 
 def _broker_order_aliases(broker_order_id: str) -> set[str]:

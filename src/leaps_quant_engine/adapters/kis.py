@@ -518,7 +518,7 @@ class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
             "get_stock_price",
             _latest_quote_arguments(symbol, exchange_by_symbol=self.exchange_by_symbol),
         )
-        return _quote_to_bar(symbol, result)
+        return _quote_to_bar(symbol, result, require_live_price=True)
 
     def get_history(
         self,
@@ -686,12 +686,18 @@ def _row_to_bar(symbol: Symbol, row: dict[str, Any], *, default_date: datetime |
     )
 
 
-def _quote_to_bar(symbol: Symbol, payload: dict[str, Any]) -> Bar:
+def _quote_to_bar(symbol: Symbol, payload: dict[str, Any], *, require_live_price: bool = False) -> Bar:
     price = _extract_price(payload)
     open_price = _float_first_present(payload, ("open", "open_price", "day_open"), default=price)
     high_price = _float_first_present(payload, ("high", "high_price", "day_high"), default=max(open_price, price))
     low_price = _float_first_present(payload, ("low", "low_price", "day_low"), default=min(open_price, price))
     volume = int(_first_present(payload, ("volume", "acml_vol", "accumulated_volume"), default=0))
+    if require_live_price and _kis_market(symbol.market) == "domestic":
+        if payload.get("live_price_usable") is False:
+            reason = payload.get("price_quality_reason") or "domestic live quote is not usable"
+            raise MarketDataError(f"Domestic live quote for {symbol.key} is not usable: {reason}")
+        if _looks_like_zero_ohlc_reference_price(payload, price, open_price, high_price, low_price):
+            raise MarketDataError(f"Domestic live quote for {symbol.key} looks like a reference price.")
     return Bar(
         symbol=symbol,
         time=datetime.now(),
@@ -754,6 +760,31 @@ def _float_first_present(payload: dict[str, Any], names: tuple[str, ...], *, def
         return float(str(value).replace(",", ""))
     except (TypeError, ValueError):
         return default
+
+
+def _looks_like_zero_ohlc_reference_price(
+    payload: dict[str, Any],
+    price: float,
+    open_price: float,
+    high_price: float,
+    low_price: float,
+) -> bool:
+    raw_output = payload.get("raw_output")
+    if not isinstance(raw_output, dict):
+        return False
+    standard = _float_first_present(raw_output, ("stck_sdpr",), default=0.0)
+    change = _float_first_present(raw_output, ("prdy_vrss",), default=0.0)
+    change_rate = _float_first_present(raw_output, ("prdy_ctrt",), default=0.0)
+    return (
+        price > 0
+        and standard > 0
+        and price == standard
+        and open_price <= 0
+        and high_price <= 0
+        and low_price <= 0
+        and change == 0
+        and abs(change_rate) < 0.000001
+    )
 
 
 def _first_present(payload: dict[str, Any], names: tuple[str, ...], default: Any = None) -> Any:

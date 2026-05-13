@@ -105,6 +105,37 @@ def test_cli_notify_user_message_saves_local_record(monkeypatch, tmp_path, capsy
     assert (tmp_path / "notification-engine" / "history" / f"{payload['record_id']}.json").exists()
 
 
+def test_cli_notify_user_message_reads_utf8_message_file(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("LEAPS_TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("STOCKPROGRAM_TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("LEAPS_TELEGRAM_CHAT_ID", "")
+    monkeypatch.setenv("STOCKPROGRAM_TELEGRAM_CHAT_ID", "")
+    message_file = tmp_path / "message.txt"
+    message_file.write_text("장 시작 점검\n삼성전자 후보", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "notify-user-message",
+            "--root",
+            str(tmp_path / "notification-engine"),
+            "--category",
+            "status",
+            "--title",
+            "한글 알림",
+            "--message-file",
+            str(message_file),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    history = json.loads(
+        (tmp_path / "notification-engine" / "history" / f"{payload['record_id']}.json").read_text(encoding="utf-8")
+    )
+    assert history["title"] == "한글 알림"
+    assert history["message"] == "장 시작 점검\n삼성전자 후보"
+
+
 def test_cli_notification_status_reports_local_counts(tmp_path, capsys):
     root = tmp_path / "notification-engine"
     (root / "history").mkdir(parents=True)
@@ -116,6 +147,26 @@ def test_cli_notification_status_reports_local_counts(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["engine"] == "leaps-notification"
     assert payload["history_count"] == 1
+
+
+def test_cli_notification_fetch_updates_saves_only_without_telegram(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("LEAPS_TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("STOCKPROGRAM_TELEGRAM_BOT_TOKEN", "")
+
+    exit_code = main(
+        [
+            "notification-fetch-telegram-updates",
+            "--root",
+            str(tmp_path / "notification-engine"),
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "saved_only"
+    assert payload["fetched_count"] == 0
+    assert payload["stored_count"] == 0
 
 
 def test_cli_runtime_backtest_daily_uses_config_selection_wiring(monkeypatch, tmp_path, capsys):
@@ -1303,7 +1354,7 @@ def test_cli_order_runtime_status_rejects_mismatched_explicit_broker_account(tmp
         )
 
 
-def test_cli_order_runtime_supervise_blocks_overseas_broker_engine_side_effects(monkeypatch, tmp_path, capsys):
+def test_cli_order_runtime_supervise_allows_overseas_broker_engine_poll_and_reconcile_setup(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "runtime.json"
     config_path.write_text(
         json.dumps(
@@ -1336,12 +1387,24 @@ def test_cli_order_runtime_supervise_blocks_overseas_broker_engine_side_effects(
         default_cash_by_sleeve={"LEaps": 1000},
     ).current_portfolio("LEaps")
 
-    class FailIfCalledAccountClient:
-        @classmethod
-        def from_env(cls):
-            raise AssertionError("domestic KIS account client must not be created for overseas account routes")
+    class FakeBroker:
+        def get_snapshots(self, *, consumer_id, snapshot_type="", resource_id="", limit=200):
+            return {"snapshots": []}
 
-    monkeypatch.setattr(cli, "KISAccountClient", FailIfCalledAccountClient)
+    class FakeAccountClient:
+        broker = FakeBroker()
+
+        @classmethod
+        def from_env(cls, *args, **kwargs):
+            return cls()
+
+        def get_execution_history(self, **kwargs):
+            return {"executions": []}
+
+        def get_holdings(self, **kwargs):
+            return {"holdings": []}
+
+    monkeypatch.setattr(cli, "KISAccountClient", FakeAccountClient)
 
     exit_code = main(
         [
@@ -1357,9 +1420,9 @@ def test_cli_order_runtime_supervise_blocks_overseas_broker_engine_side_effects(
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "warnings"
-    assert "broker_engine_overseas_poll_not_supported" in payload["errors"]
-    assert "broker_engine_overseas_reconcile_not_supported" in payload["errors"]
+    assert payload["status"] in {"ok", "needs_attention"}
+    assert "broker_engine_overseas_poll_not_supported" not in payload["errors"]
+    assert "broker_engine_overseas_reconcile_not_supported" not in payload["errors"]
     assert payload["final_status"]["broker_account_id"] == "kis-overseas"
     assert payload["final_status"]["market_scope"] == "overseas"
 
@@ -1440,6 +1503,84 @@ def test_cli_order_runtime_supervise_polls_open_tickets_with_paper_broker(tmp_pa
     assert payload["final_status"]["sleeves"][0]["portfolio"]["cash"] == 900
 
 
+def test_cli_order_runtime_supervise_cancels_stale_open_tickets_with_paper_broker(tmp_path, capsys):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "test",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "cash": 1000,
+                        "universe": {"coarse_path": "universe.json"},
+                        "portfolio": {"account_store_path": "accounts/leaps.json"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    VirtualSleeveAccountStore(
+        tmp_path / "accounts" / "leaps.json",
+        default_cash_by_sleeve={"LEaps": 1000},
+    ).current_portfolio("LEaps")
+    order_store = FileOrderRuntimeStateStore(tmp_path / "order-runtime" / "leaps.jsonl")
+    coordination = OrderCoordinator().coordinate(
+        (
+            OrderIntentBatch(
+                sleeve_id="LEaps",
+                generated_at=cli.datetime(2026, 5, 10, 9, 30),
+                order_intents=(
+                    OrderIntent(
+                        sleeve_id="LEaps",
+                        symbol=Symbol("005930", "KRX"),
+                        side=OrderSide.BUY,
+                        quantity=1,
+                        reference_price=100,
+                        tag="cli-supervise-cancel",
+                    ),
+                ),
+                batch_id="batch-1",
+            ),
+        ),
+        generated_at=cli.datetime(2026, 5, 10, 9, 31),
+    )
+    submitted = coordination.tickets[0].event(
+        OrderEventType.SUBMITTED,
+        occurred_at=cli.datetime(2026, 5, 10, 9, 32),
+        broker_order_id="paper:ticket",
+    )
+    order_store.record_tickets(coordination.tickets)
+    order_store.record_events(coordination.events)
+    order_store.record_event(submitted)
+
+    exit_code = main(
+        [
+            "order-runtime-supervise",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--broker",
+            "paper",
+            "--paper-no-fill",
+            "--skip-reconcile",
+            "--stale-after-seconds",
+            "0.01",
+            "--cancel-stale-open-tickets",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["maintenance_report"]["stale_ticket_count"] == 1
+    assert payload["maintenance_report"]["cancel_event_count"] == 1
+    assert payload["final_status"]["order_runtime"]["open_ticket_count"] == 0
+
+
 def test_cli_order_runtime_submit_commits_paper_order_batches(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("LEAPS_TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("STOCKPROGRAM_TELEGRAM_BOT_TOKEN", "")
@@ -1511,6 +1652,64 @@ def test_cli_order_runtime_submit_commits_paper_order_batches(monkeypatch, tmp_p
     assert payload["final_status"]["sleeves"][0]["portfolio"]["holdings"][0]["quantity"] == 2
     assert payload["notification"]["delivery_status"] == "saved_only"
     assert (tmp_path / "notifications" / "history" / f"{payload['notification']['record_id']}.json").exists()
+
+
+def test_cli_order_runtime_submit_rejects_live_confirm_with_paper_broker(tmp_path, capsys):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "test",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "cash": 1000,
+                        "universe": {"coarse_path": "universe.json"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    batch_path = tmp_path / "order_batches.json"
+    batch_path.write_text(
+        json.dumps(
+            {
+                "batch_id": "batch-1",
+                "sleeve_id": "LEaps",
+                "generated_at": "2026-05-10T09:30:00",
+                "orders": [
+                    {
+                        "symbol": "KRX:005930",
+                        "side": "buy",
+                        "quantity": 2,
+                        "reference_price": 100,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "order-runtime-submit",
+            str(config_path),
+            str(batch_path),
+            "--sleeve-id",
+            "LEaps",
+            "--commit",
+            "--confirm-live-submit",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["status"] == "error"
+    assert "broker-engine" in payload["error"]
 
 
 def test_cli_order_runtime_submit_splits_same_sleeve_orders_by_market_route(tmp_path, capsys):

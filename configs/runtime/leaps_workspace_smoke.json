@@ -18,7 +18,8 @@
       "order_store_path": "../../data/order-runtime/kis_overseas.jsonl",
       "broker_gateway": "broker-engine",
       "metadata": {
-        "note": "US/overseas virtual sleeve account route. Live overseas broker submit/reconcile is intentionally blocked until the overseas broker-engine adapter exists."
+        "kis_account_id": "us-growth",
+        "note": "US/overseas virtual sleeve account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_US_GROWTH_* env values."
       }
     },
     {
@@ -27,7 +28,11 @@
       "currency": "KRW",
       "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
       "order_store_path": "../../data/order-runtime/kis_domestic.jsonl",
-      "broker_gateway": "broker-engine"
+      "broker_gateway": "broker-engine",
+      "metadata": {
+        "kis_account_id": "default",
+        "note": "Domestic account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_DEFAULT_* env values."
+      }
     }
   ],
   "journal_path": "../../data/cycle-journal/leaps_workspace_smoke.jsonl",
@@ -85,12 +90,12 @@
         "model": "portfolios/rl_ppo_constructor.py",
         "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
         "parameters": {
-          "policy_path": null,
-          "policy_paths": [
-            "data/rl/kr_only_20260510/kr_top8_volfilter_exec_s401/leaps_ppo_portfolio_allocator_seed403.zip",
-            "data/rl/kr_only_20260510/kr_top8_volfilter_exec_s401/leaps_ppo_portfolio_allocator_seed407.zip"
-          ],
-          "metadata_path": "data/rl/kr_only_20260510/kr_top8_volfilter_exec_s401/leaps_ppo_portfolio_allocator.json",
+            "policy_path": null,
+            "policy_paths": [
+              "data/rl/kr_only_20260511/kr_top8_regime95_cash5m_s911/leaps_ppo_portfolio_allocator_seed913.zip",
+              "data/rl/kr_only_20260511/kr_top8_regime95_cash5m_s911/leaps_ppo_portfolio_allocator_seed917.zip"
+            ],
+            "metadata_path": "data/rl/kr_only_20260511/kr_top8_regime95_cash5m_s911/leaps_ppo_portfolio_allocator.json",
           "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
           "fallback_action": 3,
           "top_k": 8,
@@ -116,7 +121,7 @@
           "min_order_notional": 0.0,
           "min_quantity_delta": 1,
           "allow_exit_below_min_notional": true,
-          "cadence": "once_per_day"
+          "cadence": "every_5_minutes"
         }
       },
       "risk": {
@@ -131,6 +136,15 @@
           },
           "cash_buffer_pct_by_currency": {
             "KRW": 0.1
+          },
+          "regime_exposure_enabled": true,
+          "regime_total_exposure_pct_by_currency": {
+            "KRW": {
+              "risk_off": 0.35,
+              "neutral": 0.60,
+              "risk_on": 0.78,
+              "strong_risk_on": 0.95
+            }
           },
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true

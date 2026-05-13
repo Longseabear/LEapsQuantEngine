@@ -35,6 +35,19 @@ class AlphaRuntime:
             self._last_run_by_alpha_id.clear()
         logger.info("alpha_runtime.active.replace", extra={"alpha_ids": [_model_id(model) for model in prepared]})
 
+    def last_run_state(self) -> dict[str, datetime]:
+        with self._lock:
+            return dict(self._last_run_by_alpha_id)
+
+    def restore_last_run_state(self, state: Mapping[str, datetime]) -> None:
+        with self._lock:
+            active_ids = {_model_id(model) for model in self.active_models}
+            self._last_run_by_alpha_id = {
+                str(alpha_id): ran_at
+                for alpha_id, ran_at in state.items()
+                if alpha_id in active_ids
+            }
+
     def stage(
         self,
         models: list[AlphaModel] | tuple[AlphaModel, ...],

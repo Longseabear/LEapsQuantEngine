@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping, Protocol
 
 from leaps_quant_engine.models import OrderSide, OrderType, TimeInForce
 from leaps_quant_engine.orders import OrderEvent, OrderEventType, OrderTicket, OrderTicketStatus
-from leaps_quant_engine.market_rules import round_krx_price_to_tick
+from leaps_quant_engine.market_rules import round_krx_price_to_tick, round_overseas_price_to_tick
 
 
 class BrokerExecutionError(RuntimeError):
@@ -72,7 +72,18 @@ class BrokerExecutionService:
             if ticket.status is not OrderTicketStatus.CREATED:
                 updated_tickets.append(ticket)
                 continue
-            event = self.gateway.submit(ticket, occurred_at=generated_at)
+            try:
+                event = self.gateway.submit(ticket, occurred_at=generated_at)
+            except Exception as exc:  # noqa: BLE001
+                event = ticket.event(
+                    OrderEventType.REJECTED,
+                    occurred_at=generated_at,
+                    reason=f"broker_submit_failed: {exc}",
+                    metadata={
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
             events.append(event)
             updated_tickets.append(ticket.apply_event(event))
         return BrokerExecutionResult(generated_at=generated_at, tickets=tuple(updated_tickets), events=tuple(events))
@@ -190,16 +201,26 @@ class BrokerEngineExecutionGateway:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     def submit(self, ticket: OrderTicket, *, occurred_at: datetime | None = None) -> OrderEvent:
-        arguments = _domestic_order_arguments(
-            ticket,
-            order_division=self.order_division,
-            exchange_scope=self.exchange_scope,
-            use_hashkey=self.use_hashkey,
-        )
+        overseas_ticket = _is_overseas_ticket(ticket)
+        if overseas_ticket:
+            operation = "place_overseas_stock_order" if self.submit_operation == "place_domestic_cash_order" else self.submit_operation
+            arguments = _overseas_order_arguments(
+                ticket,
+                order_division=self.order_division,
+                use_hashkey=self.use_hashkey,
+            )
+        else:
+            operation = self.submit_operation
+            arguments = _domestic_order_arguments(
+                ticket,
+                order_division=self.order_division,
+                exchange_scope=self.exchange_scope,
+                use_hashkey=self.use_hashkey,
+            )
         metadata = self._command_metadata(ticket, desired_action="submit")
         if self.use_command_queue and _has_method(self.client, "enqueue_command"):
             result = self.client.enqueue_command(  # type: ignore[attr-defined]
-                self.submit_operation,
+                operation,
                 arguments=arguments,
                 metadata=metadata,
             )
@@ -211,13 +232,13 @@ class BrokerEngineExecutionGateway:
                 reason="broker_engine_command_enqueued",
                 metadata={
                     "submit_mode": "command_queue",
-                    "operation": self.submit_operation,
+                    "operation": operation,
                     "arguments": arguments,
                     "result": result,
                 },
             )
 
-        result = self.client.call_operation(self.submit_operation, arguments)
+        result = self.client.call_operation(operation, arguments)
         broker_order_id = _broker_order_id_from_result(result)
         return ticket.event(
             OrderEventType.ACCEPTED,
@@ -226,7 +247,7 @@ class BrokerEngineExecutionGateway:
             reason="broker_engine_order_accepted",
             metadata={
                 "submit_mode": "call_operation",
-                "operation": self.submit_operation,
+                "operation": operation,
                 "arguments": arguments,
                 "result": result,
             },
@@ -241,16 +262,26 @@ class BrokerEngineExecutionGateway:
     ) -> OrderEvent:
         if not ticket.broker_order_id:
             raise BrokerExecutionError("Cannot cancel a ticket without broker_order_id.")
-        arguments = _domestic_cancel_arguments(
-            ticket,
-            order_division=self.order_division,
-            exchange_scope=self.exchange_scope,
-            use_hashkey=self.use_hashkey,
-        )
+        overseas_ticket = _is_overseas_ticket(ticket)
+        if overseas_ticket:
+            operation = "revise_or_cancel_overseas_stock_order" if self.cancel_operation == "revise_or_cancel_domestic_order" else self.cancel_operation
+            arguments = _overseas_cancel_arguments(
+                ticket,
+                order_division=self.order_division,
+                use_hashkey=self.use_hashkey,
+            )
+        else:
+            operation = self.cancel_operation
+            arguments = _domestic_cancel_arguments(
+                ticket,
+                order_division=self.order_division,
+                exchange_scope=self.exchange_scope,
+                use_hashkey=self.use_hashkey,
+            )
         metadata = self._command_metadata(ticket, desired_action="cancel")
         if self.use_command_queue and _has_method(self.client, "enqueue_command"):
             result = self.client.enqueue_command(  # type: ignore[attr-defined]
-                self.cancel_operation,
+                operation,
                 arguments=arguments,
                 metadata=metadata,
             )
@@ -261,21 +292,21 @@ class BrokerEngineExecutionGateway:
                 reason=reason or "broker_engine_cancel_enqueued",
                 metadata={
                     "submit_mode": "command_queue",
-                    "operation": self.cancel_operation,
+                    "operation": operation,
                     "arguments": arguments,
                     "result": result,
                 },
             )
 
-        result = self.client.call_operation(self.cancel_operation, arguments)
+        result = self.client.call_operation(operation, arguments)
         return ticket.event(
-            OrderEventType.CANCEL_REQUESTED,
+            OrderEventType.CANCELLED,
             occurred_at=occurred_at,
             broker_order_id=ticket.broker_order_id,
-            reason=reason or "broker_engine_cancel_requested",
+            reason=reason or "broker_engine_cancelled",
             metadata={
                 "submit_mode": "call_operation",
-                "operation": self.cancel_operation,
+                "operation": operation,
                 "arguments": arguments,
                 "result": result,
             },
@@ -360,6 +391,26 @@ def _domestic_order_arguments(
     }
 
 
+def _overseas_order_arguments(
+    ticket: OrderTicket,
+    *,
+    order_division: str,
+    use_hashkey: bool,
+) -> dict[str, Any]:
+    if ticket.remaining_quantity <= 0:
+        raise BrokerExecutionError("Cannot submit a ticket with no remaining quantity.")
+    exchange = _overseas_order_exchange(ticket)
+    return {
+        "side": ticket.side.value,
+        "exchange": exchange,
+        "symbol": ticket.symbol.ticker,
+        "quantity": ticket.remaining_quantity,
+        "price": _overseas_order_price(ticket, exchange=exchange),
+        "order_division": _overseas_order_division(ticket, fallback=order_division),
+        "use_hashkey": use_hashkey,
+    }
+
+
 def _domestic_cancel_arguments(
     ticket: OrderTicket,
     *,
@@ -383,6 +434,26 @@ def _domestic_cancel_arguments(
     }
 
 
+def _overseas_cancel_arguments(
+    ticket: OrderTicket,
+    *,
+    order_division: str,
+    use_hashkey: bool,
+) -> dict[str, Any]:
+    _branch_no, order_no = _split_broker_order_id(ticket.broker_order_id or "")
+    exchange = _overseas_order_exchange(ticket)
+    return {
+        "exchange": exchange,
+        "symbol": ticket.symbol.ticker,
+        "original_order_no": order_no,
+        "rvse_cncl_dvsn_cd": "02",
+        "quantity": max(ticket.remaining_quantity, 1),
+        "price": _overseas_order_price(ticket, allow_zero=True, exchange=exchange),
+        "order_division": _overseas_order_division(ticket, fallback=order_division),
+        "use_hashkey": use_hashkey,
+    }
+
+
 _DOMESTIC_ORDER_DIVISION_BY_STYLE = {
     (OrderType.LIMIT, TimeInForce.DAY): "00",
     (OrderType.MARKET, TimeInForce.DAY): "01",
@@ -393,11 +464,95 @@ _DOMESTIC_ORDER_DIVISION_BY_STYLE = {
 }
 
 
+_OVERSEAS_ORDER_DIVISION_BY_STYLE = {
+    (OrderType.LIMIT, TimeInForce.DAY): "00",
+    (OrderType.MARKET, TimeInForce.DAY): "01",
+}
+
+
+_COMMON_US_ETF_ORDER_EXCHANGES = {
+    "QQQ": "NASD",
+    "SMH": "NASD",
+    "TLT": "NASD",
+    "IEF": "NASD",
+    "SPY": "AMEX",
+    "IWM": "AMEX",
+    "DIA": "AMEX",
+    "XLK": "AMEX",
+    "XLF": "AMEX",
+    "XLV": "AMEX",
+    "XLE": "AMEX",
+    "XLI": "AMEX",
+    "XLP": "AMEX",
+    "XLU": "AMEX",
+    "USMV": "AMEX",
+    "GLD": "AMEX",
+}
+
+
 def _domestic_order_division(ticket: OrderTicket, *, fallback: str) -> str:
     explicit = str(ticket.metadata.get("order_division") or "").strip()
     if explicit:
         return explicit
     return _DOMESTIC_ORDER_DIVISION_BY_STYLE.get((ticket.order_type, ticket.time_in_force), fallback)
+
+
+def _overseas_order_division(ticket: OrderTicket, *, fallback: str) -> str:
+    explicit = str(ticket.metadata.get("order_division") or "").strip()
+    if explicit:
+        return explicit
+    return _OVERSEAS_ORDER_DIVISION_BY_STYLE.get((ticket.order_type, ticket.time_in_force), fallback)
+
+
+def _overseas_order_price(ticket: OrderTicket, *, allow_zero: bool = False, exchange: str | None = None) -> float:
+    if ticket.order_type is OrderType.MARKET:
+        return 0.0
+    price = ticket.limit_price if ticket.limit_price is not None else ticket.reference_price
+    if price <= 0 and not allow_zero:
+        raise BrokerExecutionError("Overseas limit order price must be greater than zero.")
+    return round_overseas_price_to_tick(float(price), side=ticket.side, exchange=exchange)
+
+
+def _overseas_order_exchange(ticket: OrderTicket) -> str:
+    explicit = str(
+        ticket.metadata.get("order_exchange")
+        or ticket.metadata.get("kis_order_exchange")
+        or ticket.metadata.get("exchange")
+        or ""
+    ).strip().upper()
+    if explicit:
+        return _normalize_overseas_order_exchange(explicit)
+    ticker = ticket.symbol.ticker.upper()
+    if ticker in _COMMON_US_ETF_ORDER_EXCHANGES:
+        return _COMMON_US_ETF_ORDER_EXCHANGES[ticker]
+    market = ticket.symbol.market.upper()
+    if market in {"NAS", "NASDAQ", "NASD"}:
+        return "NASD"
+    if market in {"NYS", "NYSE"}:
+        return "NYSE"
+    if market in {"AMS", "AMEX", "US"}:
+        return "AMEX"
+    raise BrokerExecutionError(f"Overseas order exchange is required for {ticket.symbol.key}.")
+
+
+def _normalize_overseas_order_exchange(value: str) -> str:
+    aliases = {
+        "NAS": "NASD",
+        "NASDAQ": "NASD",
+        "NYS": "NYSE",
+        "AMS": "AMEX",
+        "HKS": "SEHK",
+        "SHS": "SHAA",
+        "SZS": "SZAA",
+    }
+    normalized = aliases.get(str(value or "").strip().upper(), str(value or "").strip().upper())
+    if normalized not in {"NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE"}:
+        raise BrokerExecutionError(f"Unsupported overseas order exchange: {value}.")
+    return normalized
+
+
+def _is_overseas_ticket(ticket: OrderTicket) -> bool:
+    return ticket.symbol.market.upper() not in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
 
 
 def _domestic_order_price(ticket: OrderTicket) -> int:

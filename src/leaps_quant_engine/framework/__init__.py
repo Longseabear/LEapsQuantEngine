@@ -35,11 +35,14 @@ from leaps_quant_engine.framework.risk_model_loader import (
     RiskManagementModelLoadResult,
 )
 from leaps_quant_engine.framework.runner import FrameworkCycleResult, FrameworkRunner, StageTiming
+from leaps_quant_engine.framework.state import FileFrameworkRunnerStateStore, FrameworkRunnerState
 
 __all__ = [
     "BasicRiskManagementModel",
     "EqualWeightPortfolioConstructionModel",
+    "FileFrameworkRunnerStateStore",
     "FrameworkCycleResult",
+    "FrameworkRunnerState",
     "FrameworkRunner",
     "PassThroughRiskManagementModel",
     "PortfolioAllocationTarget",

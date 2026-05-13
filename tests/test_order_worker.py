@@ -278,6 +278,18 @@ def test_execution_history_reconcile_worker_imports_owned_fill_by_broker_alias(t
         order_id="intent-1",
         broker_order_id="001:00012345",
     )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    coordination = OrderCoordinator().coordinate(
+        (_batch(quantity=2),),
+        generated_at=datetime(2026, 5, 8, 9, 29),
+    )
+    accepted = coordination.tickets[0].event(
+        OrderEventType.ACCEPTED,
+        occurred_at=datetime(2026, 5, 8, 9, 30),
+        broker_order_id="001:00012345",
+    )
+    order_store.record_tickets(coordination.tickets)
+    order_store.record_events((*coordination.events, accepted))
     worker = ExecutionHistoryReconcileWorker(
         account_client=FakeExecutionHistoryClient(
             executions=[
@@ -301,6 +313,7 @@ def test_execution_history_reconcile_worker_imports_owned_fill_by_broker_alias(t
             },
         ),
         account_store=account_store,
+        order_state_store=order_store,
     )
 
     report = worker.reconcile_once(
@@ -315,6 +328,71 @@ def test_execution_history_reconcile_worker_imports_owned_fill_by_broker_alias(t
     assert report.touched_sleeve_ids == ("LEaps",)
     assert account_store.current_portfolio("LEaps").quantity(Symbol("005930", "KRX")) == 2
     assert report.reconciliation["status"] == "matched"
+    assert order_store.snapshot().open_tickets == ()
+    assert order_store.snapshot().fill_events[-1].reason == "execution_history_reconcile_fill"
+
+
+def test_execution_history_reconcile_worker_closes_ticket_when_fill_was_already_imported(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    account_store.register_order_intent(
+        OrderIntent(
+            sleeve_id="LEaps",
+            symbol=Symbol("005930", "KRX"),
+            side=OrderSide.BUY,
+            quantity=2,
+            reference_price=70_000,
+        ),
+        order_id="intent-1",
+        broker_order_id="001:00012345",
+    )
+    fill_row = {
+        "order_id": "00012345",
+        "symbol": "005930",
+        "side": "buy",
+        "execution_quantity": "2",
+        "execution_price": "70000",
+        "execution_timestamp": "20260508T093000",
+    }
+    worker_without_order_store = ExecutionHistoryReconcileWorker(
+        account_client=FakeExecutionHistoryClient(executions=[fill_row]),
+        account_store=account_store,
+    )
+    worker_without_order_store.reconcile_once(
+        start_date="20260508",
+        end_date="20260508",
+        reconcile_holdings=False,
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    coordination = OrderCoordinator().coordinate(
+        (_batch(quantity=2),),
+        generated_at=datetime(2026, 5, 8, 9, 29),
+    )
+    accepted = coordination.tickets[0].event(
+        OrderEventType.ACCEPTED,
+        occurred_at=datetime(2026, 5, 8, 9, 30),
+        broker_order_id="001:00012345",
+    )
+    order_store.record_tickets(coordination.tickets)
+    order_store.record_events((*coordination.events, accepted))
+    worker = ExecutionHistoryReconcileWorker(
+        account_client=FakeExecutionHistoryClient(executions=[fill_row]),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+
+    report = worker.reconcile_once(
+        start_date="20260508",
+        end_date="20260508",
+        reconcile_holdings=False,
+    )
+
+    assert report.duplicate_fill_count == 1
+    assert report.imported_fill_count == 0
+    assert order_store.snapshot().open_tickets == ()
+    assert order_store.snapshot().fill_events[-1].reason == "execution_history_reconcile_fill"
 
 
 def test_execution_history_reconcile_worker_records_unknown_and_continues_past_bad_rows(tmp_path):

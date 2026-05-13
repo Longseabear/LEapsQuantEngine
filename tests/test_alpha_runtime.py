@@ -53,33 +53,37 @@ class SymbolEchoAlpha:
 
 
 def _snapshot():
+    return _snapshot_at(datetime(2026, 5, 8, 9, 0))
+
+
+def _snapshot_at(now: datetime):
     quality = SnapshotFreshnessPolicy().evaluate(
         requested_symbol_count=1,
         collected_symbol_count=1,
         failed_symbol_count=0,
-        completed_at=datetime(2026, 5, 8, 9, 0),
+        completed_at=now,
         elapsed_ms=10.0,
-        now=datetime(2026, 5, 8, 9, 0),
+        now=now,
     )
     return IndicatorSnapshot(
         snapshot_id="indicator-test",
         sleeve_id="swing-kor",
         universe_id="test-universe",
-        as_of=datetime(2026, 5, 8, 9, 0),
-        created_at=datetime(2026, 5, 8, 9, 0),
+        as_of=now,
+        created_at=now,
         symbols=("KRX:005930",),
         source_snapshot_id="market-test",
         quality_report=quality,
         values={
             "KRX:005930": {
-                "close": IndicatorValue("close", 110.0, True, 1, datetime(2026, 5, 8, 9, 0)),
-                "sma_3_close": IndicatorValue("sma_3_close", 100.0, True, 3, datetime(2026, 5, 8, 9, 0)),
+                "close": IndicatorValue("close", 110.0, True, 1, now),
+                "sma_3_close": IndicatorValue("sma_3_close", 100.0, True, 3, now),
                 "momentum_2_close": IndicatorValue(
                     "momentum_2_close",
                     0.03,
                     True,
                     3,
-                    datetime(2026, 5, 8, 9, 0),
+                    now,
                 ),
             }
         },
@@ -167,6 +171,24 @@ def test_alpha_runtime_skips_once_per_day_model_after_first_run_same_day():
     assert second.metadata["ran_alpha_ids"] == []
     assert second.metadata["skipped_alpha_ids"] == ["daily-alpha"]
     assert daily.seen_symbol_keys == ("KRX:005930",)
+
+
+def test_alpha_runtime_skips_once_per_month_model_until_next_month():
+    monthly = SymbolEchoAlpha("monthly-alpha")
+    monthly.evaluation_cadence = "once_per_month"
+    context = SnapshotContext.from_indicator_snapshot(_snapshot())
+    next_day_same_month = SnapshotContext.from_indicator_snapshot(_snapshot_at(datetime(2026, 5, 9, 9, 0)))
+    next_month = SnapshotContext.from_indicator_snapshot(_snapshot_at(datetime(2026, 6, 1, 9, 0)))
+    runtime = AlphaRuntime(active_models=(monthly,))
+
+    first = runtime.run(context)
+    second = runtime.run(next_day_same_month)
+    third = runtime.run(next_month)
+
+    assert first.insight_count == 1
+    assert second.insight_count == 0
+    assert second.metadata["skipped_alpha_ids"] == ["monthly-alpha"]
+    assert third.insight_count == 1
 
 
 def test_python_alpha_loader_loads_generate_function(tmp_path):

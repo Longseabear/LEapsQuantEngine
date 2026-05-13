@@ -6,11 +6,11 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "us_etf_rotation"
-VERSION = "0.2.0"
-EVALUATION_CADENCE = "once_per_day"
+VERSION = "0.3.0"
+EVALUATION_CADENCE = "once_per_month"
 INPUT_RESOLUTION = "daily"
-HORIZON = timedelta(days=45)
-MAX_SELECTED = 4
+HORIZON = timedelta(days=40)
+MAX_SELECTED = 3
 MIN_RISK_ADJUSTED_SCORE = 0.0
 EMIT_FLAT_FOR_UNSELECTED = True
 DEFENSIVE_TICKERS = {"TLT", "IEF", "GLD", "USMV", "XLP", "XLU"}
@@ -145,7 +145,7 @@ def _market_risk_on(context: SnapshotContext) -> bool:
     trend = _first_value(context, "US:SPY", ("sma_200_close", "sma_100_close", "sma_20_close"))
     momentum = _first_value(context, "US:SPY", ("roc_126_close", "roc_63_close", "roc_20_close"))
     if close is None or trend is None or momentum is None:
-        return True
+        return False
     return close > trend and momentum > 0
 
 

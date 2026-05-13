@@ -384,6 +384,8 @@ def test_bootstrapped_runtime_can_run_one_worker_cycle(tmp_path):
     assert payload["framework"]["new_insights"]["insight_count"] == 1
     assert len(payload["framework"]["order_intents"]) == 1
     assert payload["portfolio_state"]["pending"]["order_intent_count"] == 1
+    assert payload["engine_status"]["event"] == "engine_status"
+    assert payload["engine_status"]["framework"]["order_intent_count"] == 1
 
 
 def test_runtime_wires_active_selection_symbols_into_alpha_context(tmp_path):
@@ -518,6 +520,10 @@ class WarmupReadySelectionModel:
     assert runtime.worker.universe.symbol_keys == ("US:NVDA",)
     assert [symbol.key for symbol in runtime.worker.indicator_engine.symbols_for_sleeve("us-live")] == ["US:NVDA"]
     assert runtime.worker.indicator_engine.value("us-live", Symbol("NVDA", "US"), "momentum_2_close") is not None
+    report = runtime.run_once()
+    assert report.framework is not None
+    assert len(report.framework.order_intents) == 1
+    assert report.framework.order_intents[0].reference_price == 120
 
 
 def test_fallback_history_provider_uses_secondary_history_when_primary_fails():

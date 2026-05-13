@@ -18,7 +18,8 @@
       "order_store_path": "../../data/order-runtime/kis_overseas.jsonl",
       "broker_gateway": "broker-engine",
       "metadata": {
-        "note": "US ETF rotation account route. Overseas live submit remains blocked until the overseas broker-engine adapter is explicitly enabled."
+        "kis_account_id": "us-growth",
+        "note": "US ETF rotation account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_US_GROWTH_* env values."
       }
     }
   ],
@@ -33,7 +34,7 @@
       },
       "cash": 0,
       "cash_by_currency": {
-        "USD": 3434.25
+        "USD": 0
       },
       "universe": {
         "coarse_path": "configs/universes/us_etf_rotation_core.json",
@@ -73,28 +74,30 @@
           "us_etf_rotation-volatility-trailing-stop": "us_etf_rotation-operational-symbols"
         }
       },
-      "portfolio": {
-        "model": "portfolios/rl_ppo_constructor.py",
-        "account_store_path": "../../data/virtual-accounts/us_etf_rotation.json",
-        "parameters": {
+        "portfolio": {
+          "model": "portfolios/rl_ppo_constructor.py",
+          "account_store_path": "../../data/virtual-accounts/kis_overseas.json",
+          "parameters": {
           "policy_path": null,
-          "policy_paths": [],
+          "policy_paths": [
+            "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.zip"
+          ],
           "metadata_path": "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.json",
           "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
           "fallback_action": 3,
           "top_k": 8,
           "model_name": "attention_ppo",
-          "weight_temperature": 0.35,
+          "weight_temperature": 0.50,
           "min_position_pct": 0.0,
           "min_signal_action": 1,
           "allocation_mode": "rl_weights",
-          "fallback_gross_exposure": 0.70,
+          "fallback_gross_exposure": 0.90,
           "max_portfolio_pct": 1.0,
           "max_position_pct": 0.30,
           "long_only": true
         },
         "rebalance": {
-          "cash_reserve_pct": 0.08,
+          "cash_reserve_pct": 0.05,
           "min_order_notional": 75.0,
           "min_quantity_delta": 1,
           "allow_exit_below_min_notional": true,

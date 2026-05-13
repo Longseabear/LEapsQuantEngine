@@ -11,7 +11,7 @@ from leaps_quant_engine.universe.selection import (
 
 @dataclass(frozen=True, slots=True)
 class EtfRotationSelectionModel:
-    max_active_symbols: int = 20
+    max_active_symbols: int = 8
     selection_id: str = "us_etf_rotation"
     defensive_tickers: tuple[str, ...] = ("TLT", "IEF", "GLD", "USMV", "XLP", "XLU")
 
@@ -61,10 +61,16 @@ class EtfRotationSelectionModel:
             score = composite_momentum - volatility_penalty + liquidity_bonus + defensive_bonus
             scored.append((score, symbol, composite_momentum, normalized_volatility, liquidity, risk_on, defensive))
 
-        selected = tuple(
+        ranked_selected = tuple(
             item[1]
             for item in sorted(scored, key=lambda item: (item[0], item[1].key), reverse=True)[: self.max_active_symbols]
         )
+        forced_etfs = tuple(
+            symbol
+            for symbol in context.forced_symbols
+            if _is_etf(context, symbol.key)
+        )
+        selected = _dedupe_symbols((*ranked_selected, *forced_etfs))
         selected_keys = {symbol.key for symbol in selected}
         for score, symbol, momentum, volatility, liquidity, risk_on, defensive in scored:
             candidates[symbol.key] = UniverseSelectionCandidate(
@@ -106,7 +112,7 @@ def _market_risk_on(context: UniverseSelectionContext) -> bool:
     trend = _first_value(context, "US:SPY", ("sma_200_close", "sma_100_close", "sma_20_close"))
     momentum = _first_value(context, "US:SPY", ("roc_126_close", "roc_63_close", "roc_20_close"))
     if close is None or trend is None or momentum is None:
-        return True
+        return False
     return close > trend and momentum > 0
 
 
@@ -122,3 +128,14 @@ def _is_etf(context: UniverseSelectionContext, symbol_key: str) -> bool:
         return True
     value = properties.get("is_etf")
     return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _dedupe_symbols(symbols):
+    result = []
+    seen = set()
+    for symbol in symbols:
+        if symbol.key in seen:
+            continue
+        seen.add(symbol.key)
+        result.append(symbol)
+    return tuple(result)

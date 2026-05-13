@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -37,7 +38,7 @@ from leaps_quant_engine.broker_routing import (
 )
 from leaps_quant_engine.brokerage import BrokerEngineExecutionGateway, BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.cycle_journal import CycleJournalEntry, FileCycleJournalStore
-from leaps_quant_engine.framework import FrameworkRunner
+from leaps_quant_engine.framework import FileFrameworkRunnerStateStore, FrameworkRunner
 from leaps_quant_engine.fundamentals import (
     DEFAULT_FUNDAMENTAL_ARTIFACT_ROOT,
     FileFundamentalArtifactStore,
@@ -46,6 +47,7 @@ from leaps_quant_engine.fundamentals import (
 from leaps_quant_engine.logging import configure_logging
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
+from leaps_quant_engine.market_rules import synthetic_domestic_market_session, synthetic_us_market_session
 from leaps_quant_engine.minute_feed import YFinanceMinuteBarProvider, download_us_minute_feed
 from leaps_quant_engine.models import OrderIntent
 from leaps_quant_engine.models import Symbol
@@ -59,7 +61,7 @@ from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.order_smoke import OrderRuntimePaperSmokeRunner
 from leaps_quant_engine.order_status import build_order_runtime_status
 from leaps_quant_engine.order_submit import OrderRuntimeSubmitter, load_order_intent_batches, write_order_intent_batches
-from leaps_quant_engine.order_supervisor import OrderRuntimeSupervisor
+from leaps_quant_engine.order_supervisor import OrderMaintenancePolicy, OrderRuntimeSupervisor
 from leaps_quant_engine.order_worker import ExecutionHistoryReconcileWorker, OpenTicketPollWorker
 from leaps_quant_engine.portfolio import Portfolio, StaticPortfolioProvider
 from leaps_quant_engine.runtime import build_indicator_engine_from_file, run_once_from_file
@@ -116,6 +118,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_run_once.add_argument("--skip-warmup", action="store_true")
     runtime_run_once.add_argument("--order-batch-output", type=Path)
     runtime_run_once.add_argument("--journal", type=Path)
+    runtime_run_once.add_argument("--framework-state", type=Path)
+    runtime_run_once.add_argument("--framework-state-read-only", action="store_true")
     runtime_run_once.add_argument("--summary-only", action="store_true")
 
     sleeve_alpha_list = subparsers.add_parser("sleeve-alpha-list")
@@ -152,7 +156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     kis_account_sync.add_argument("--sleeve-id", required=True)
     kis_account_sync.add_argument("--start-date", required=True)
     kis_account_sync.add_argument("--end-date", required=True)
-    kis_account_sync.add_argument("--market", default="domestic", choices=("domestic",))
+    kis_account_sync.add_argument("--market", default="domestic", choices=("domestic", "overseas"))
     kis_account_sync.add_argument("--side", default="all", choices=("all", "buy", "sell"))
     kis_account_sync.add_argument("--symbol", default="")
     kis_account_sync.add_argument("--assign-unknown-to-sleeve", action="store_true")
@@ -169,13 +173,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     virtual_account_reconcile = subparsers.add_parser("virtual-account-reconcile")
     virtual_account_reconcile.add_argument("config", type=Path)
     virtual_account_reconcile.add_argument("--sleeve-id", required=True)
-    virtual_account_reconcile.add_argument("--market", default="domestic", choices=("domestic",))
+    virtual_account_reconcile.add_argument("--market", default="domestic", choices=("domestic", "overseas"))
     virtual_account_reconcile.add_argument("--summary-only", action="store_true")
 
     virtual_account_cash_sync = subparsers.add_parser("virtual-account-sync-cash")
     virtual_account_cash_sync.add_argument("config", type=Path)
     virtual_account_cash_sync.add_argument("--sleeve-id", required=True)
-    virtual_account_cash_sync.add_argument("--currency", default="KRW")
+    virtual_account_cash_sync.add_argument("--currency")
     virtual_account_cash_sync.add_argument("--residual-sleeve-id", default="default sleeve")
 
     virtual_account_cash_transfer = subparsers.add_parser("virtual-account-transfer-cash")
@@ -244,13 +248,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     order_runtime_supervise.add_argument("--skip-reconcile", action="store_true")
     order_runtime_supervise.add_argument("--start-date")
     order_runtime_supervise.add_argument("--end-date")
-    order_runtime_supervise.add_argument("--market", default="domestic", choices=("domestic",))
+    order_runtime_supervise.add_argument("--market", choices=("domestic", "overseas"))
     order_runtime_supervise.add_argument("--side", default="all", choices=("all", "buy", "sell"))
     order_runtime_supervise.add_argument("--symbol", default="")
     order_runtime_supervise.add_argument("--assign-unknown-to-sleeve-id")
     order_runtime_supervise.add_argument("--drop-unknown-fills", action="store_true")
     order_runtime_supervise.add_argument("--max-executions", type=int, default=500)
     order_runtime_supervise.add_argument("--skip-holdings-reconcile", action="store_true")
+    order_runtime_supervise.add_argument("--stale-after-seconds", type=float, default=0.0)
+    order_runtime_supervise.add_argument("--cancel-stale-open-tickets", action="store_true")
+    order_runtime_supervise.add_argument("--keep-partially-filled-stale", action="store_true")
     order_runtime_supervise.add_argument("--recent-events", type=int, default=10)
     order_runtime_supervise.add_argument("--journal", type=Path)
     order_runtime_supervise.add_argument("--notify", action="store_true")
@@ -262,10 +269,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     notification_status = subparsers.add_parser("notification-status")
     notification_status.add_argument("--root", type=Path)
 
+    notification_fetch = subparsers.add_parser("notification-fetch-telegram-updates")
+    notification_fetch.add_argument("--root", type=Path)
+    notification_fetch.add_argument("--offset", type=int)
+    notification_fetch.add_argument("--limit", type=int, default=20)
+    notification_fetch.add_argument("--summary-only", action="store_true")
+
     notify_user_message = subparsers.add_parser("notify-user-message")
     notify_user_message.add_argument("--category", default="status")
     notify_user_message.add_argument("--title", required=True)
-    notify_user_message.add_argument("--message", required=True)
+    notify_user_message.add_argument("--message")
+    notify_user_message.add_argument("--message-file", type=Path)
+    notify_user_message.add_argument("--message-stdin", action="store_true")
     notify_user_message.add_argument("--root", type=Path)
     notify_user_message.add_argument("--chat-id")
     notify_user_message.add_argument("--disable-notification", action="store_true")
@@ -581,7 +596,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             manual_symbols=_parse_symbol_refs(args.manual, default_market),
             preselect_warmup=False if args.skip_warmup else None,
         )
+        framework_state_store = None
+        framework_state_summary = None
+        if args.framework_state is not None:
+            framework_state_path = resolve_runtime_path(snapshot, args.framework_state)
+            framework_state_store = FileFrameworkRunnerStateStore(framework_state_path)
+            restored_state = framework_state_store.load()
+            runtime.framework_runner.restore_state(restored_state)
+            framework_state_summary = {
+                "path": str(framework_state_path.resolve()),
+                "restored": restored_state is not None,
+                "read_only": bool(args.framework_state_read_only),
+            }
         report = runtime.run_once(warmup=False if args.skip_warmup else None)
+        if framework_state_store is not None and not args.framework_state_read_only:
+            state_as_of = report.framework.new_insight_batch.generated_at if report.framework is not None else datetime.now()
+            framework_state_store.save(runtime.framework_runner.export_state(as_of=state_as_of))
+            if framework_state_summary is not None:
+                framework_state_summary["saved"] = True
         journal_summary = None
         journal_path = _runtime_journal_path(snapshot, args.journal)
         if journal_path is not None:
@@ -625,6 +657,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_payload["order_batch_artifact"] = order_batch_artifact
         if journal_summary is not None:
             print_payload["cycle_journal"] = journal_summary
+        if framework_state_summary is not None:
+            print_payload["framework_state"] = framework_state_summary
         print(
             json.dumps(
                 print_payload,
@@ -731,16 +765,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         sleeve_config = snapshot.config.sleeve(args.sleeve_id)
         if sleeve_config.portfolio.account_store_path is None:
             raise RuntimeError("portfolio.account_store_path is required for virtual account cash sync.")
-        default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, args.currency)
-        store = VirtualSleeveAccountStore(
-            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
-            default_cash_by_sleeve=default_cash_by_sleeve,
-            default_currency=args.currency,
+        account = _broker_account_for_order_runtime(snapshot, None, (args.sleeve_id,))
+        account_id = account.account_id if account is not None else getattr(sleeve_config, "broker_account_id", None)
+        market = account.market_scope if account is not None else "domestic"
+        currency = args.currency or (account.currency if account is not None else _sleeve_default_currency(snapshot, sleeve_config))
+        account_store_path = (
+            resolve_runtime_path(snapshot, account.account_store_path).resolve()
+            if account is not None
+            else resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path)
         )
-        balance = KISVirtualAccountSync.from_env().account_client.get_balance_summary()
-        report = store.sync_account_cash(balance, currency=args.currency, residual_sleeve_id=args.residual_sleeve_id)
+        account_metadata = dict(account.metadata) if account is not None else {}
+        default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, currency, account_id)
+        store = VirtualSleeveAccountStore(
+            account_store_path,
+            default_cash_by_sleeve=default_cash_by_sleeve,
+            default_currency=currency,
+        )
+        try:
+            sync = KISVirtualAccountSync.from_env(account_id, metadata=account_metadata)
+        except TypeError:
+            sync = KISVirtualAccountSync.from_env()
+        try:
+            balance = sync.account_client.get_balance_summary(market=market)
+        except TypeError:
+            balance = sync.account_client.get_balance_summary()
+        report = store.sync_account_cash(
+            balance,
+            account_id=account_id or "default",
+            currency=currency,
+            residual_sleeve_id=args.residual_sleeve_id,
+        )
         payload = report.to_dict()
         payload["account_store_path"] = str(store.path)
+        payload["market"] = market
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "virtual-account-transfer-cash":
@@ -799,6 +856,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         return 0
     if args.command == "order-runtime-submit":
+        if args.confirm_live_submit and args.broker != "broker-engine":
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "--confirm-live-submit requires --broker broker-engine.",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 2
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_ids = _status_sleeve_ids(snapshot, args.sleeve_id)
         batches = load_order_intent_batches(resolve_runtime_path(snapshot, args.batch_file))
@@ -992,12 +1062,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         service = NotificationService.from_env(root=args.root)
         print(json.dumps(service.health_check(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "notification-fetch-telegram-updates":
+        service = NotificationService.from_env(root=args.root)
+        result = service.fetch_telegram_updates(offset=args.offset, limit=args.limit)
+        if args.summary_only:
+            result = {
+                "status": result["status"],
+                "delivery_mode": result["delivery_mode"],
+                "fetched_count": result["fetched_count"],
+                "stored_count": result["stored_count"],
+                "root": result["root"],
+            }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "notify-user-message":
         service = NotificationService.from_env(root=args.root)
+        message = _notification_message_from_args(args)
         result = service.notify_user_message(
             category=args.category,
             title=args.title,
-            message=args.message,
+            message=message,
             chat_id=args.chat_id,
             disable_notification=args.disable_notification,
         )
@@ -1991,6 +2075,21 @@ def _parse_cli_minute_start(value: str) -> datetime:
     return parsed
 
 
+def _notification_message_from_args(args) -> str:
+    sources = [
+        bool(getattr(args, "message", None)),
+        getattr(args, "message_file", None) is not None,
+        bool(getattr(args, "message_stdin", False)),
+    ]
+    if sum(1 for enabled in sources if enabled) != 1:
+        raise RuntimeError("Pass exactly one of --message, --message-file, or --message-stdin.")
+    if getattr(args, "message_file", None) is not None:
+        return args.message_file.read_text(encoding="utf-8-sig")
+    if getattr(args, "message_stdin", False):
+        return sys.stdin.read()
+    return str(args.message)
+
+
 def _parse_cli_minute_end(value: str) -> datetime:
     parsed = _parse_cli_datetime(value)
     if parsed is None:
@@ -2450,14 +2549,18 @@ def _run_order_runtime_submit_for_route(snapshot, args, route: _OrderRuntimeRout
         default_currency=route.currency,
     )
     order_state_store = FileOrderRuntimeStateStore(route.order_store_path)
-    setup_errors: list[str] = []
     orchestrator = None
-    if args.commit and args.broker == "broker-engine" and route.market_scope == "overseas":
-        setup_errors.append("broker_engine_overseas_submit_not_supported")
-    elif args.commit and (args.broker != "broker-engine" or args.confirm_live_submit):
+    setup_errors: list[str] = []
+    if args.commit and (args.broker != "broker-engine" or args.confirm_live_submit):
         try:
             orchestrator = MultiSleeveOrderOrchestrator(
-                broker=_order_supervisor_broker(args.broker, args.paper_no_fill, None),
+                broker=_order_supervisor_broker(
+                    args.broker,
+                    args.paper_no_fill,
+                    None,
+                    account_id=route.account_id,
+                    account_metadata=_broker_account_metadata(snapshot, route.account_id),
+                ),
                 account_store=account_store,
                 order_state_store=order_state_store,
                 poll_after_submit=args.poll_after_submit,
@@ -2474,6 +2577,7 @@ def _run_order_runtime_submit_for_route(snapshot, args, route: _OrderRuntimeRout
         broker_account_id=route.account_id,
         market_scope=route.market_scope,
         currency=route.currency,
+        market_session=_market_session_for_route(route),
     ).submit_batches(
         batches,
         allowed_sleeve_ids=sleeve_ids,
@@ -2486,6 +2590,14 @@ def _run_order_runtime_submit_for_route(snapshot, args, route: _OrderRuntimeRout
         recent_events=args.recent_events,
         initial_errors=tuple(setup_errors),
     )
+
+
+def _market_session_for_route(route: _OrderRuntimeRoute):
+    if route.market_scope == "domestic":
+        return synthetic_domestic_market_session(datetime.now(timezone(timedelta(hours=9))))
+    if route.market_scope == "overseas":
+        return synthetic_us_market_session(datetime.now(timezone.utc))
+    return None
 
 
 def _run_order_runtime_paper_smoke_for_route(snapshot, args, route: _OrderRuntimeRoute, sleeve_ids: tuple[str, ...], batches):
@@ -2522,23 +2634,24 @@ def _run_order_runtime_supervisor_for_route(snapshot, args, route: _OrderRuntime
     )
     order_state_store = FileOrderRuntimeStateStore(route.order_store_path)
     setup_errors: list[str] = []
-    overseas_route = route.market_scope == "overseas"
-    if overseas_route and args.broker == "broker-engine" and not args.skip_poll:
-        setup_errors.append("broker_engine_overseas_poll_not_supported")
-    if overseas_route and not args.skip_reconcile:
-        setup_errors.append("broker_engine_overseas_reconcile_not_supported")
     needs_account_client = (
-        (not args.skip_reconcile and not overseas_route)
-        or (not args.skip_poll and args.broker == "broker-engine" and not overseas_route)
+        not args.skip_reconcile
+        or (not args.skip_poll and args.broker == "broker-engine")
     )
     account_client = None
     if needs_account_client:
         try:
-            account_client = KISAccountClient.from_env()
+            try:
+                account_client = KISAccountClient.from_env(
+                    route.account_id,
+                    metadata=_broker_account_metadata(snapshot, route.account_id),
+                )
+            except TypeError:
+                account_client = KISAccountClient.from_env()
         except Exception as exc:  # noqa: BLE001
             setup_errors.append(f"account_client_setup_failed: {exc}")
     poll_worker = None
-    if not args.skip_poll and not (overseas_route and args.broker == "broker-engine"):
+    if not args.skip_poll:
         try:
             poll_worker = OpenTicketPollWorker(
                 broker=_order_supervisor_broker(args.broker, args.paper_no_fill, account_client),
@@ -2568,12 +2681,17 @@ def _run_order_runtime_supervisor_for_route(snapshot, args, route: _OrderRuntime
         broker_account_id=route.account_id,
         market_scope=route.market_scope,
         currency=route.currency,
+        maintenance_policy=OrderMaintenancePolicy(
+            stale_after_seconds=args.stale_after_seconds,
+            cancel_stale=args.cancel_stale_open_tickets,
+            cancel_partially_filled=not args.keep_partially_filled_stale,
+        ),
     ).run_once(
         poll=not args.skip_poll,
         reconcile=not args.skip_reconcile,
         start_date=args.start_date or today,
         end_date=args.end_date or today,
-        market=args.market,
+        market=args.market or route.market_scope or "domestic",
         side=args.side,
         symbol=args.symbol,
         assign_unknown_to_sleeve_id=args.assign_unknown_to_sleeve_id,
@@ -2724,14 +2842,26 @@ def _order_supervisor_broker(
     broker: str,
     paper_no_fill: bool,
     account_client: KISAccountClient | None,
+    *,
+    account_id: str | None = None,
+    account_metadata: dict | None = None,
 ) -> BrokerExecutionService:
     if broker == "paper":
         return BrokerExecutionService(PaperBrokerExecutionGateway(fill_on_poll=not paper_no_fill))
     if broker == "broker-engine":
         if account_client is None:
-            account_client = KISAccountClient.from_env()
+            account_client = KISAccountClient.from_env(account_id, metadata=account_metadata)
         return BrokerExecutionService(BrokerEngineExecutionGateway(client=account_client.broker))
     raise ValueError(f"Unsupported order supervisor broker: {broker}")
+
+
+def _broker_account_metadata(snapshot, account_id: str | None) -> dict:
+    if not account_id:
+        return {}
+    try:
+        return dict(snapshot.config.broker_account(account_id).metadata)
+    except KeyError:
+        return {}
 
 
 def _default_market_from_runtime_snapshot(snapshot, sleeve_id: str | None) -> str:

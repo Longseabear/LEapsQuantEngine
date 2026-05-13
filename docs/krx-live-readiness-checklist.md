@@ -5,6 +5,9 @@ Last updated: 2026-05-11 01:00 KST
 This checklist is for running `LEaps` against the Korean market through
 `configs/runtime/leaps_workspace_smoke.json`.
 
+For the short morning operating procedure, see
+`docs/krx-market-open-runbook.md`.
+
 The live boundary is:
 
 ```text
@@ -308,4 +311,3 @@ Expected end state:
 - Unknown/manual broker fills are assigned or deliberately left for operator
   allocation.
 - Cycle journal has the final cycle and current config/code identity.
-

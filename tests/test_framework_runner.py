@@ -3,6 +3,7 @@ from datetime import datetime
 from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightDirection
 from leaps_quant_engine.framework import (
     EqualWeightPortfolioConstructionModel,
+    FileFrameworkRunnerStateStore,
     FrameworkRunner,
     PassThroughRiskManagementModel,
     PortfolioConstructionEngine,
@@ -166,7 +167,7 @@ def test_framework_runner_scopes_alpha_with_selection_symbols():
     assert result.order_intents[0].symbol == symbols[1]
 
 
-def test_framework_runner_expires_insight_and_flattens_managed_symbol():
+def test_framework_runner_expires_insight_and_keeps_current_holding_without_exit_signal():
     symbol = Symbol("NVDA", "US")
     first_time = datetime(2026, 5, 9, 9, 30)
     second_time = datetime(2026, 5, 9, 9, 36)
@@ -206,9 +207,8 @@ def test_framework_runner_expires_insight_and_flattens_managed_symbol():
 
     assert second.active_insight_count == 0
     assert second.insight_manager_update.expired_count == 1
-    assert second.portfolio_targets[0].quantity == 0
-    assert second.order_intents[0].side is OrderSide.SELL
-    assert second.order_intents[0].quantity == 10
+    assert second.portfolio_targets == ()
+    assert second.order_intents == ()
 
 
 def test_framework_runner_reuses_portfolio_targets_until_rebalance_cadence_due():
@@ -258,3 +258,126 @@ def test_framework_runner_reuses_portfolio_targets_until_rebalance_cadence_due()
     assert second.portfolio_target_batch.metadata["reused"] is True
     assert second.stage_decisions["portfolio"]["ran"] is False
     assert second.order_intents == ()
+
+
+def test_framework_runner_restores_rebalance_state_across_run_once_processes(tmp_path):
+    symbol = Symbol("NVDA", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 9, 31)
+    first_insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=first_time,
+        expires_at=datetime(2026, 5, 10, 9, 30),
+        source_snapshot_id="market-0930",
+        alpha_id="fast-alpha",
+        alpha_version="1.0",
+    )
+    second_insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=second_time,
+        expires_at=datetime(2026, 5, 10, 9, 30),
+        source_snapshot_id="market-0931",
+        alpha_id="fast-alpha",
+        alpha_version="1.0",
+    )
+    store = FileFrameworkRunnerStateStore(tmp_path / "framework-state.json")
+    portfolio = Portfolio(cash=1_000)
+    first_runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(first_insight),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="every_5m"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+
+    first = first_runner.run_once(
+        indicator_snapshot=_snapshot(first_time, symbol),
+        data=_slice(first_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    store.save(first_runner.export_state(as_of=first_time))
+
+    second_runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(second_insight),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="every_5m"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    second_runner.restore_state(store.load())
+
+    second = second_runner.run_once(
+        indicator_snapshot=_snapshot(second_time, symbol),
+        data=_slice(second_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert first.stage_decisions["portfolio"]["ran"] is True
+    assert second.new_insight_batch.insight_count == 1
+    assert second.active_insight_count == 1
+    assert second.portfolio_target_batch.batch_id == first.portfolio_target_batch.batch_id
+    assert second.portfolio_target_batch.metadata["reused"] is True
+    assert second.stage_decisions["portfolio"]["ran"] is False
+
+
+def test_framework_runner_runs_portfolio_after_minute_rebalance_cadence():
+    symbol = Symbol("NVDA", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    four_minutes_later = datetime(2026, 5, 9, 9, 34)
+    five_minutes_later = datetime(2026, 5, 9, 9, 35)
+    insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=first_time,
+        expires_at=datetime(2026, 5, 10, 9, 30),
+        source_snapshot_id="market-0930",
+        alpha_id="daily-alpha",
+        alpha_version="1.0",
+    )
+    alpha = OneShotAlpha(insight)
+    alpha.alpha_id = "daily-alpha"
+    alpha.evaluation_cadence = "once_per_day"
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(alpha,)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="every_5_minutes"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    portfolio = Portfolio(cash=1_000)
+
+    first = runner.run_once(
+        indicator_snapshot=_snapshot(first_time, symbol),
+        data=_slice(first_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    for order in first.order_intents:
+        portfolio.apply_fill(order)
+
+    reused = runner.run_once(
+        indicator_snapshot=_snapshot(four_minutes_later, symbol),
+        data=_slice(four_minutes_later, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    refreshed = runner.run_once(
+        indicator_snapshot=_snapshot(five_minutes_later, symbol),
+        data=_slice(five_minutes_later, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert reused.stage_decisions["portfolio"]["cadence"] == "every_5_minutes"
+    assert reused.stage_decisions["portfolio"]["ran"] is False
+    assert reused.portfolio_target_batch.metadata["reused"] is True
+    assert refreshed.stage_decisions["portfolio"]["ran"] is True
+    assert refreshed.portfolio_target_batch.metadata.get("reused") is None

@@ -9,15 +9,11 @@ from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from dotenv import load_dotenv
-import requests
 
+from leaps_quant_engine.telegram import TelegramClient, TelegramConfigError, normalize_agent_text
 
 DEFAULT_NOTIFICATION_ROOT = Path("data/notification-engine")
 DEFAULT_AUDIT_LOG_PATH = Path("logs/notification_engine_audit.jsonl")
-
-
-class TelegramConfigError(RuntimeError):
-    """Raised when Telegram delivery is requested without usable credentials."""
 
 
 class TelegramClientProtocol(Protocol):
@@ -29,6 +25,9 @@ class TelegramClientProtocol(Protocol):
         disable_notification: bool = False,
     ) -> dict[str, Any]:
         """Send one Telegram message and return the provider response."""
+
+    def get_updates(self, *, offset: int | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        """Fetch pending Telegram updates."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,44 +54,6 @@ class NotificationPaths:
     @property
     def state_root(self) -> Path:
         return self.root / "state"
-
-
-@dataclass(frozen=True, slots=True)
-class TelegramClient:
-    """Small Telegram Bot API client."""
-
-    bot_token: str
-    default_chat_id: str | None = None
-    timeout_seconds: float = 20.0
-
-    @property
-    def base_url(self) -> str:
-        return f"https://api.telegram.org/bot{self.bot_token}"
-
-    def send_message(
-        self,
-        *,
-        text: str,
-        chat_id: str | None = None,
-        disable_notification: bool = False,
-    ) -> dict[str, Any]:
-        target_chat_id = chat_id or self.default_chat_id
-        if not target_chat_id:
-            raise TelegramConfigError("Telegram chat id is not configured.")
-        response = requests.post(
-            f"{self.base_url}/sendMessage",
-            json={
-                "chat_id": target_chat_id,
-                "text": text,
-                "disable_notification": disable_notification,
-            },
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        body = response.json()
-        if not isinstance(body, dict):
-            raise RuntimeError("Telegram response must be a JSON object.")
-        return body
 
 
 @dataclass(slots=True)
@@ -157,8 +118,8 @@ class NotificationService:
         payload: dict[str, Any] = {
             "record_id": record_id,
             "category": _sanitize_line(category, limit=40) or "status",
-            "title": _sanitize_line(title, limit=120),
-            "message": _sanitize_message_body(message, limit=1500),
+            "title": _sanitize_line(normalize_agent_text(title), limit=120),
+            "message": _sanitize_message_body(normalize_agent_text(message), limit=1500),
             "created_at": _utc_timestamp(),
             "delivery_mode": self.delivery_mode,
             "delivery_status": "queued",
@@ -196,6 +157,39 @@ class NotificationService:
             },
         )
         return payload
+
+    def fetch_telegram_updates(self, *, offset: int | None = None, limit: int = 20) -> dict[str, Any]:
+        paths = _paths(self.paths)
+        if self.telegram_client is None:
+            return {
+                "status": "saved_only",
+                "delivery_mode": self.delivery_mode,
+                "fetched_count": 0,
+                "stored_count": 0,
+                "updates": [],
+                "root": str(paths.root),
+            }
+        updates = self.telegram_client.get_updates(offset=offset, limit=limit)
+        stored = []
+        for update in updates:
+            if not isinstance(update, Mapping):
+                continue
+            record = _normalize_telegram_update(update)
+            _write_json_file(paths.inbox_root / f"{record['record_id']}.json", record)
+            stored.append(record)
+        _append_audit_event(
+            paths.audit_log_path,
+            "telegram_updates_fetched",
+            {"fetched_count": len(updates), "stored_count": len(stored)},
+        )
+        return {
+            "status": "ok",
+            "delivery_mode": self.delivery_mode,
+            "fetched_count": len(updates),
+            "stored_count": len(stored),
+            "updates": stored,
+            "root": str(paths.root),
+        }
 
 
 def notify_order_submit_report(
@@ -310,6 +304,23 @@ def _telegram_message_id(response: Mapping[str, Any]) -> Any:
     if isinstance(result, Mapping):
         return result.get("message_id")
     return None
+
+
+def _normalize_telegram_update(update: Mapping[str, Any]) -> dict[str, Any]:
+    update_id = update.get("update_id")
+    message = update.get("message") if isinstance(update.get("message"), Mapping) else {}
+    text = normalize_agent_text(str(message.get("text") or "")) if isinstance(message, Mapping) else ""
+    chat = message.get("chat") if isinstance(message, Mapping) and isinstance(message.get("chat"), Mapping) else {}
+    record_id = f"telegram-update-{update_id}" if update_id is not None else _make_record_id("telegram-update")
+    return {
+        "record_id": record_id,
+        "source": "telegram",
+        "update_id": update_id,
+        "received_at": _utc_timestamp(),
+        "chat_id": str(chat.get("id") or "") if isinstance(chat, Mapping) else "",
+        "text": text,
+        "raw_update": dict(update),
+    }
 
 
 def _utc_timestamp() -> str:

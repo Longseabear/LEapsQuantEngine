@@ -4,15 +4,17 @@ LEAN-style dynamic quant engine v0.
 
 The new engine is being built from a clean root. The previous StockProgram stack is preserved under `reference/stockprogram_legacy` and should be treated as reference material only.
 
-See [docs/agent-artifact-runtime.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/agent-artifact-runtime.md) for the long-running engine, external agent artifacts, validation, safe reload, and isolated backtesting architecture.
+See [docs/agent-artifact-runtime.md](docs/agent-artifact-runtime.md) for the long-running engine, external agent artifacts, validation, safe reload, and isolated backtesting architecture.
 
-See [docs/current-status.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/current-status.md) for the latest implemented slices, benchmark results, logging events, and next development priorities.
+See [docs/current-status.md](docs/current-status.md) for the latest implemented slices, benchmark results, logging events, and next development priorities.
 
-See [docs/model-authoring-guide.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/model-authoring-guide.md) for writing universe selection, alpha, portfolio construction, risk, and execution models.
+See [docs/model-authoring-guide.md](docs/model-authoring-guide.md) for writing universe selection, alpha, portfolio construction, risk, and execution models.
 
-See [docs/runtime-cadence-resolution.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/runtime-cadence-resolution.md) for daily indicator resolution, alpha cadence, portfolio target persistence, and urgent exit rules.
+See [docs/runtime-cadence-resolution.md](docs/runtime-cadence-resolution.md) for daily indicator resolution, alpha cadence, portfolio target persistence, and urgent exit rules.
 
-See [docs/backtesting-guide.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/backtesting-guide.md) for sleeve-specific backtest usage, warmup rules, debug options, fundamentals artifacts, fee/slippage simulation, and multi-market research caveats.
+See [docs/backtesting-guide.md](docs/backtesting-guide.md) for sleeve-specific backtest usage, warmup rules, debug options, fundamentals artifacts, fee/slippage simulation, and multi-market research caveats.
+
+See [docs/krx-market-open-runbook.md](docs/krx-market-open-runbook.md) for the morning KRX live-start procedure, service checks, guarded live loop command, Telegram note, and emergency stop steps.
 
 ## Target Engine Structure
 
@@ -429,7 +431,7 @@ py -3 -m leaps_quant_engine.cli alpha-run-snapshot configs/universes/swing_kor_c
 
 Alpha Models are normal Python files. A module can expose `create_alpha_model()`, `ALPHA_MODEL`, or a module-level `generate(context)` function. Alpha reads `SnapshotContext`, emits `Insight` records, and never creates orders directly. Daily/swing modules may declare `EVALUATION_CADENCE = "once_per_day"` and `INPUT_RESOLUTION = "daily"` so minute-level framework cycles do not regenerate the same thesis every minute.
 
-For the full model contract, including selection-to-alpha input wiring, see [docs/model-authoring-guide.md](C:/Users/leap1/Documents/LEapsQuantEngine/docs/model-authoring-guide.md).
+For the full model contract, including selection-to-alpha input wiring, see [docs/model-authoring-guide.md](docs/model-authoring-guide.md).
 
 Example alpha modules:
 

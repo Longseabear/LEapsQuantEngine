@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
+from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.alpha import SnapshotContext
 from leaps_quant_engine.framework.risk import RiskManagementContext
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, PortfolioTarget, Symbol
@@ -55,6 +56,47 @@ def test_kospi_conviction_alpha_filters_uncompensated_high_volatility():
 
     assert [insight.symbol.key for insight in insights] == ["KRX:000660"]
     assert insights[0].metadata["volatility_filter"] == "passed"
+
+
+def test_kospi_pullback_reversion_alpha_emits_uptrend_pullbacks_only():
+    module = _load("sleeves/LEaps/alphas/kospi_pullback_reversion.py")
+    now = datetime(2026, 5, 12)
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:005930": _values(
+                close=100_000,
+                fast=103_000,
+                slow=92_000,
+                momentum=0.16,
+                momentum_5=-0.025,
+                vol=0.06,
+                rolling_high=106_000,
+                rolling_low=96_000,
+            ),
+            "KRX:000660": _values(
+                close=150_000,
+                fast=148_000,
+                slow=155_000,
+                momentum=-0.03,
+                momentum_5=-0.02,
+                vol=0.05,
+                rolling_high=165_000,
+                rolling_low=149_000,
+            ),
+        },
+    )
+
+    insights = module.generate(
+        SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930", "KRX:000660"))
+    )
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:005930"]
+    assert insights[0].alpha_id == "leaps-kospi-pullback-reversion"
+    assert insights[0].reason == "kospi_pullback_reversion_in_uptrend"
+    assert insights[0].metadata["role"] == "krw_pullback_reversion"
+    assert insights[0].metadata["pullback_depth"] > 0
+    assert insights[0].metadata["momentum"] > 0
 
 
 def test_us_stability_alpha_prefers_defensive_us_etfs():
@@ -172,6 +214,97 @@ def test_kospi_growth_us_hedge_risk_applies_currency_limits():
     assert approved == {"KRX:005930": 4, "US:USMV": 3}
 
 
+def test_kospi_growth_risk_raises_exposure_cap_in_strong_regime():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 8)
+    samsung = Symbol("005930", "KRX")
+    hynix = Symbol("000660", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={
+            samsung.key: Bar(samsung, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            hynix.key: Bar(hynix, now, 100_000, 100_000, 100_000, 100_000, 1000),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 0.50},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"strong_risk_on": 0.80}},
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+            targets=(PortfolioTarget(samsung, 5), PortfolioTarget(hynix, 5)),
+            active_insights=(
+                _regime_insight(samsung, now, breadth=0.60, momentum=0.20, volatility=0.10),
+                _regime_insight(hynix, now, breadth=0.60, momentum=0.22, volatility=0.09),
+            ),
+        )
+    )
+
+    approved = {target.symbol.key: target.quantity for target in batch.approved_targets}
+    assert approved == {"KRX:005930": 5, "KRX:000660": 3}
+    assert batch.decisions[0].metadata["market_regime"]["name"] == "strong_risk_on"
+    assert batch.decisions[0].metadata["max_total_exposure_pct"] == 0.80
+
+
+def test_kospi_growth_risk_explains_when_exposure_cap_has_no_room():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 13)
+    samsung = Symbol("005930", "KRX")
+    hyundai = Symbol("005380", "KRX")
+    existing = Symbol("000660", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={
+            samsung.key: Bar(samsung, now, 279_000, 279_000, 279_000, 279_000, 1000),
+            hyundai.key: Bar(hyundai, now, 646_000, 646_000, 646_000, 646_000, 1000),
+            existing.key: Bar(existing, now, 396_410, 396_410, 396_410, 396_410, 1000),
+        },
+    )
+    portfolio = Portfolio(
+        cash=4_561_806,
+        cash_by_currency={"KRW": 4_561_806},
+        holdings={
+            samsung.key: Holding(samsung, quantity=3, average_price=279_000),
+            hyundai.key: Holding(hyundai, quantity=3, average_price=646_000),
+            existing.key: Holding(existing, quantity=10, average_price=396_410),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 0.26},
+            "max_total_exposure_pct_by_currency": {"KRW": 0.68},
+            "cash_buffer_pct_by_currency": {"KRW": 0.10},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"neutral": 0.60}},
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(PortfolioTarget(samsung, 11), PortfolioTarget(hyundai, 5)),
+        )
+    )
+
+    assert [decision.reason for decision in batch.decisions] == [
+        "exposure_limit_no_room",
+        "exposure_limit_no_room",
+    ]
+    assert batch.decisions[0].metadata["exposure_limited_quantity"] == 3
+    assert batch.decisions[0].metadata["market_regime"]["name"] == "neutral"
+
+
 def test_leaps_execution_tags_orders_by_currency():
     module = _load("sleeves/LEaps/executions/leaps_immediate.py")
     now = datetime(2026, 5, 8)
@@ -263,7 +396,17 @@ def _snapshot(now: datetime, values: dict[str, dict[str, float]]) -> IndicatorSn
     )
 
 
-def _values(*, close: float, fast: float, slow: float, momentum: float, momentum_5: float, vol: float) -> dict[str, float]:
+def _values(
+    *,
+    close: float,
+    fast: float,
+    slow: float,
+    momentum: float,
+    momentum_5: float,
+    vol: float,
+    rolling_high: float | None = None,
+    rolling_low: float | None = None,
+) -> dict[str, float]:
     return {
         "close": close,
         "identity_close": close,
@@ -273,9 +416,28 @@ def _values(*, close: float, fast: float, slow: float, momentum: float, momentum
         "momentum_5_close": momentum_5,
         "stddev_20_close": close * vol,
         "atr_14": close * vol,
+        "rolling_max_20_close": rolling_high if rolling_high is not None else close * 1.1,
+        "rolling_min_20_close": rolling_low if rolling_low is not None else close * 0.9,
         "rolling_dollar_volume_20": 5_000_000_000,
         "volume": 1000,
     }
+
+
+def _regime_insight(symbol: Symbol, now: datetime, *, breadth: float, momentum: float, volatility: float) -> Insight:
+    return Insight(
+        sleeve_id="LEaps",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=now,
+        source_snapshot_id="test",
+        alpha_id="leaps-kospi-conviction",
+        alpha_version="0.1.0",
+        metadata={
+            "market_breadth": breadth,
+            "momentum": momentum,
+            "volatility": volatility,
+        },
+    )
 
 
 def _load(relative_path: str):

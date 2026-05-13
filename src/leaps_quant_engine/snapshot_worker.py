@@ -11,7 +11,7 @@ from typing import Any
 from leaps_quant_engine.alpha import AlphaRuntime, InsightBatch, SnapshotContext
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
-from leaps_quant_engine.market_data_snapshot import MarketDataSnapshotEngine
+from leaps_quant_engine.market_data_snapshot import MarketDataSnapshot, MarketDataSnapshotEngine
 from leaps_quant_engine.snapshots import (
     IndicatorSnapshotStore,
     SnapshotFreshnessPolicy,
@@ -134,6 +134,7 @@ class BackgroundSnapshotWorker:
     warmup_policy: WarmupPolicy = field(default_factory=WarmupPolicy)
     entry_block_reasons: tuple[str, ...] = ()
     snapshot_engine: MarketDataSnapshotEngine = field(init=False)
+    last_market_snapshot: MarketDataSnapshot | None = field(default=None, init=False)
     _stop_event: Event = field(default_factory=Event, init=False)
     _thread: Thread | None = field(default=None, init=False)
     _cycle_index: int = field(default=0, init=False)
@@ -213,6 +214,7 @@ class BackgroundSnapshotWorker:
             list(self.universe.symbols),
             min_success=self.min_success,
         )
+        self.last_market_snapshot = collection.snapshot
         quality_report = self.freshness_policy.evaluate(
             requested_symbol_count=collection.report.requested_symbol_count,
             collected_symbol_count=collection.report.collected_symbol_count,

@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import os
 
 import pytest
 
@@ -23,6 +24,28 @@ def test_virtual_sleeve_account_reads_default_current_portfolio(tmp_path):
 
     assert portfolio.cash == 1_000_000
     assert portfolio.holdings == {}
+
+
+def test_virtual_sleeve_account_retries_transient_windows_replace_lock(monkeypatch, tmp_path):
+    store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    real_replace = os.replace
+    calls = {"count": 0}
+
+    def flaky_replace(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise PermissionError("transient lock")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+
+    portfolio = store.current_portfolio("LEaps")
+
+    assert portfolio.cash == 1_000_000
+    assert calls["count"] == 2
 
 
 def test_virtual_sleeve_account_reads_multi_currency_default_current_portfolio(tmp_path):
@@ -106,6 +129,116 @@ def test_virtual_sleeve_account_routes_fill_by_order_ownership(tmp_path):
     reloaded = VirtualSleeveAccountStore(tmp_path / "accounts.json").current_portfolio("LEaps")
     assert reloaded.cash == 789_600
     assert reloaded.quantity(symbol) == 3
+
+
+def test_virtual_sleeve_account_tracks_position_state_from_fills_and_marks(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
+    symbol = Symbol("005930", "KRX")
+    first_fill_at = datetime(2026, 5, 9, 9, 1)
+    second_fill_at = datetime(2026, 5, 9, 9, 5)
+    mark_at = datetime(2026, 5, 9, 10, 0)
+    store.initialize_sleeve("LEaps", cash=1_000_000)
+
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="buy-fill-1",
+            order_id="buy-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=2,
+            fill_price=70_000,
+            filled_at=first_fill_at,
+        )
+    )
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="buy-fill-2",
+            order_id="buy-2",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=1,
+            fill_price=72_000,
+            filled_at=second_fill_at,
+        )
+    )
+    marked = store.update_position_mark(
+        sleeve_id="LEaps",
+        symbol=symbol,
+        price=75_000,
+        marked_at=mark_at,
+        stop_price=69_000,
+    )
+
+    assert marked is not None
+    assert marked.quantity == 3
+    assert marked.average_entry_price == (70_000 * 2 + 72_000) / 3
+    assert marked.entry_time == first_fill_at
+    assert marked.high_watermark_price == 75_000
+    assert marked.high_watermark_at == mark_at
+    assert marked.last_stop_price == 69_000
+    reloaded = VirtualSleeveAccountStore(tmp_path / "accounts.json").position_state("LEaps", symbol)
+    assert reloaded == marked
+
+
+def test_virtual_sleeve_account_keeps_position_state_on_partial_sell_and_clears_on_exit(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
+    symbol = Symbol("005930", "KRX")
+    entry_at = datetime(2026, 5, 9, 9, 1)
+    store.initialize_sleeve("LEaps", cash=1_000_000)
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="buy-fill",
+            order_id="buy-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=3,
+            fill_price=70_000,
+            filled_at=entry_at,
+        )
+    )
+    store.update_position_mark(
+        sleeve_id="LEaps",
+        symbol=symbol,
+        price=75_000,
+        marked_at=datetime(2026, 5, 9, 10, 0),
+    )
+
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="sell-fill-1",
+            order_id="sell-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.SELL,
+            quantity=1,
+            fill_price=73_000,
+            filled_at=datetime(2026, 5, 9, 10, 30),
+        )
+    )
+    partial = store.position_state("LEaps", symbol)
+
+    assert partial is not None
+    assert partial.quantity == 2
+    assert partial.entry_time == entry_at
+    assert partial.high_watermark_price == 75_000
+
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="sell-fill-2",
+            order_id="sell-2",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.SELL,
+            quantity=2,
+            fill_price=74_000,
+            filled_at=datetime(2026, 5, 9, 11, 0),
+        )
+    )
+
+    assert store.position_state("LEaps", symbol) is None
 
 
 def test_virtual_sleeve_account_sell_fill_reduces_known_sleeve_holding(tmp_path):

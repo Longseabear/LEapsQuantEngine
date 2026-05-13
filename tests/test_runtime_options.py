@@ -249,7 +249,7 @@ def test_us_etf_rotation_sample_config_is_usd_etf_only():
     assert snapshot.config.runtime_id == "us_etf_rotation"
     assert sleeve.workspace_path == Path("sleeves/us_etf_rotation")
     assert sleeve.broker_account_id == "kis-overseas"
-    assert dict(sleeve.cash_by_currency) == {"USD": 3434.25}
+    assert dict(sleeve.cash_by_currency) == {}
     assert sleeve.universe.coarse_path == Path("configs/universes/us_etf_rotation_core.json")
     assert [module.ref for module in sleeve.alpha.modules] == [
         "alphas/etf_rotation.py",

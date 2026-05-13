@@ -1,0 +1,225 @@
+{
+  "runtime_id": "leaps-workspace-pullback-ab",
+  "mode": "live",
+  "timezone": "Asia/Seoul",
+  "market_data": {
+    "provider": "market-data-engine",
+    "history_provider": "kis-cache",
+    "source": "market-data-engine",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 5
+  },
+  "broker_accounts": [
+    {
+      "account_id": "kis-overseas",
+      "market_scope": "overseas",
+      "currency": "USD",
+      "account_store_path": "../../data/virtual-accounts/kis_overseas.json",
+      "order_store_path": "../../data/order-runtime/kis_overseas.jsonl",
+      "broker_gateway": "broker-engine",
+      "metadata": {
+        "kis_account_id": "us-growth",
+        "note": "US/overseas virtual sleeve account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_US_GROWTH_* env values."
+      }
+    },
+    {
+      "account_id": "kis-domestic",
+      "market_scope": "domestic",
+      "currency": "KRW",
+      "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
+      "order_store_path": "../../data/order-runtime/kis_domestic.jsonl",
+      "broker_gateway": "broker-engine",
+      "metadata": {
+        "kis_account_id": "default",
+        "note": "Domestic account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_DEFAULT_* env values."
+      }
+    }
+  ],
+  "journal_path": "../../data/cycle-journal/leaps_workspace_pullback_ab.jsonl",
+  "sleeves": [
+    {
+      "sleeve_id": "LEaps",
+      "workspace_path": "sleeves/LEaps",
+      "broker_account_id": "kis-domestic",
+      "broker_account_routes": {
+        "domestic": "kis-domestic"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "KRW": 10000000
+      },
+      "universe": {
+        "coarse_path": "configs/universes/leaps_kr_research_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 24,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/stock_momentum.py:StockMomentumSelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ]
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 30,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/kospi_pullback_reversion.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/kospi_conviction.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/volatility_trailing_stop.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "leaps-kospi-pullback-reversion": "leaps-stock-momentum",
+          "leaps-kospi-conviction": "leaps-stock-momentum",
+          "leaps-volatility-trailing-stop": "leaps-operational-symbols"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/rl_ppo_constructor.py",
+        "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
+        "parameters": {
+            "policy_path": null,
+            "policy_paths": [
+              "data/rl/ab/kr_top8_pullback_reversion_s921/leaps_ppo_portfolio_allocator_seed923.zip",
+              "data/rl/ab/kr_top8_pullback_reversion_s921/leaps_ppo_portfolio_allocator_seed927.zip"
+            ],
+            "metadata_path": "data/rl/ab/kr_top8_pullback_reversion_s921/leaps_ppo_portfolio_allocator.json",
+          "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
+          "fallback_action": 3,
+          "top_k": 8,
+          "model_name": "attention_ppo",
+          "weight_temperature": 0.3,
+          "min_position_pct": 0.0,
+          "min_signal_action": 1,
+          "allocation_mode": "rl_weights",
+          "turnover_penalty": 0.16,
+          "downside_penalty": 1.15,
+          "volatility_penalty": 0.50,
+          "drawdown_penalty": 1.05,
+          "underwater_penalty": 0.40,
+          "missed_upside_penalty": 0.08,
+          "concentration_penalty": 0.40,
+          "fallback_gross_exposure": 0.78,
+          "max_portfolio_pct": 1.0,
+          "max_position_pct": 0.26,
+          "long_only": true
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.0,
+          "min_order_notional": 0.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true,
+          "cadence": "every_5_minutes"
+        }
+      },
+      "risk": {
+        "model": "risks/kospi_growth_us_hedge.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct_by_currency": {
+            "KRW": 0.26
+          },
+          "max_total_exposure_pct_by_currency": {
+            "KRW": 0.68
+          },
+          "cash_buffer_pct_by_currency": {
+            "KRW": 0.1
+          },
+          "regime_exposure_enabled": true,
+          "regime_total_exposure_pct_by_currency": {
+            "KRW": {
+              "risk_off": 0.35,
+              "neutral": 0.60,
+              "risk_on": 0.78,
+              "strong_risk_on": 0.95
+            }
+          },
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/leaps_immediate.py",
+        "parameters": {
+          "tag_prefix": "leaps",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "buy_limit_offset_bps": 8.0,
+          "sell_limit_offset_bps": 15.0,
+          "stop_sell_limit_offset_bps": 35.0,
+          "max_slice_notional": 10000000,
+          "max_slices": 1,
+          "max_daily_volume_participation_bps": 50.0,
+          "chase_guard_intraday_return_bps": 900.0,
+          "chase_guard_size_multiplier": 0.5
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 60,
+        "min_success": 1
+      }
+    },
+    {
+      "sleeve_id": "default sleeve",
+      "name": "default sleeve",
+      "workspace_path": "sleeves/default sleeve",
+      "broker_account_id": "kis-overseas",
+      "broker_account_routes": {
+        "domestic": "kis-domestic",
+        "overseas": "kis-overseas"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "USD": 0,
+        "KRW": 0
+      },
+      "universe": {
+        "coarse_path": "configs/universes/leaps_kr_research_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 0,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"
+        }
+      },
+      "indicators": {
+        "warmup_enabled": false,
+        "extra_bars": 0,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": []
+      },
+      "portfolio": {
+        "account_store_path": "../../data/virtual-accounts/kis_overseas.json"
+      },
+      "worker": {
+        "cycle_interval_seconds": 60
+      }
+    }
+  ],
+  "metadata": {
+    "description": "LEaps KR-only research runtime aligned to a KOSPI-upside thesis. ETF rotation and USD stability hedging are intentionally delegated to separate sleeves; this sleeve owns KRW 10,000,000 and emits domestic KRX stock targets only."
+  }
+}

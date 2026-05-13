@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
 
 from leaps_quant_engine.adapters.kis_direct import KISDirectClient
 from leaps_quant_engine.broker_routing import currency_for_market_scope
 from leaps_quant_engine.models import OrderSide, Symbol
-from leaps_quant_engine.settings import load_kis_settings
+from leaps_quant_engine.settings import load_kis_settings_for_account
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
 
@@ -18,16 +18,14 @@ class KISAccountClient:
     broker: Any
 
     @classmethod
-    def from_env(cls) -> "KISAccountClient":
-        return cls(KISDirectClient.from_settings(load_kis_settings()))
+    def from_env(cls, account_id: str | None = None, *, metadata: Mapping[str, Any] | None = None) -> "KISAccountClient":
+        return cls(KISDirectClient.from_settings(load_kis_settings_for_account(account_id, metadata=metadata)))
 
     def get_balance_summary(self, *, market: str = "domestic") -> dict[str, Any]:
-        _require_domestic_account_market(market)
-        return self.broker.call_operation("get_account_balance_summary", {})
+        return self.broker.call_operation("get_account_balance_summary", {"market": market})
 
     def get_holdings(self, *, market: str = "domestic") -> dict[str, Any]:
-        _require_domestic_account_market(market)
-        return self.broker.call_operation("get_account_holdings", {})
+        return self.broker.call_operation("get_account_holdings", {"market": market})
 
     def get_execution_history(
         self,
@@ -38,12 +36,12 @@ class KISAccountClient:
         side: str = "all",
         symbol: str = "",
     ) -> dict[str, Any]:
-        _require_domestic_account_market(market)
         return self.broker.call_operation(
             "get_account_execution_history",
             {
                 "start_date": start_date,
                 "end_date": end_date,
+                "market": market,
                 "side": side,
                 "symbol": symbol,
             },
@@ -93,8 +91,8 @@ class KISVirtualAccountSync:
     account_client: KISAccountClient
 
     @classmethod
-    def from_env(cls) -> "KISVirtualAccountSync":
-        return cls(KISAccountClient.from_env())
+    def from_env(cls, account_id: str | None = None, *, metadata: Mapping[str, Any] | None = None) -> "KISVirtualAccountSync":
+        return cls(KISAccountClient.from_env(account_id, metadata=metadata))
 
     def sync(
         self,
@@ -269,7 +267,12 @@ def _portfolio_report(portfolio) -> dict[str, Any]:
 def _symbol_market(market: str, execution: dict[str, Any]) -> str:
     if market == "domestic":
         return "KRX"
-    exchange = str(execution.get("exchange") or execution.get("market") or "").strip().upper()
+    normalized_market = str(execution.get("market") or "").strip().upper()
+    if normalized_market:
+        return normalized_market
+    exchange = str(execution.get("exchange") or "").strip().upper()
+    if exchange in {"NAS", "NASD", "NASDAQ", "NYS", "NYSE", "AMS", "AMEX"}:
+        return "US"
     return exchange or market.upper()
 
 

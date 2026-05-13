@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from dotenv import load_dotenv
 
@@ -63,6 +64,59 @@ def load_kis_settings(env_file: str | Path = ".env", *, override: bool = False) 
         default_overseas_symbol=os.getenv("DEFAULT_OVERSEAS_SYMBOL", "AAPL").strip() or "AAPL",
         default_overseas_exchange=os.getenv("DEFAULT_OVERSEAS_EXCHANGE", "NAS").strip() or "NAS",
     )
+
+
+def load_kis_settings_for_account(
+    account_id: str | None,
+    *,
+    metadata: Mapping[str, object] | None = None,
+    env_file: str | Path = ".env",
+    override: bool = False,
+) -> KISSettings:
+    """Load KIS settings with StockProgram-style account-scoped overrides."""
+    base = load_kis_settings(env_file, override=override)
+    data = dict(metadata or {})
+    account_scoped_id = str(data.get("kis_account_id") or account_id or "").strip()
+    credential_scoped_id = str(data.get("credential_account_id") or account_scoped_id).strip()
+    if not account_scoped_id and not credential_scoped_id:
+        return base
+    credential_prefix = kis_account_env_prefix(credential_scoped_id or account_scoped_id)
+    account_prefix = kis_account_env_prefix(account_scoped_id or credential_scoped_id)
+    app_key = _scoped_or_base(f"{credential_prefix}_APP_KEY", base.app_key)
+    app_secret = _scoped_or_base(f"{credential_prefix}_APP_SECRET", base.app_secret)
+    cano = str(data.get("kis_cano") or "").strip() or _scoped_or_base(f"{account_prefix}_CANO", base.cano or "")
+    account_product_code = (
+        str(data.get("kis_acnt_prdt_cd") or data.get("kis_account_product_code") or "").strip()
+        or _scoped_or_base(f"{account_prefix}_ACNT_PRDT_CD", base.account_product_code or "")
+    )
+    return KISSettings(
+        app_key=app_key,
+        app_secret=app_secret,
+        base_url=str(data.get("kis_base_url") or base.base_url).strip(),
+        hts_id=str(data.get("kis_hts_id") or base.hts_id or "").strip() or None,
+        cano=cano or None,
+        account_product_code=account_product_code or None,
+        mock=_parse_bool(str(data.get("kis_mock")), default=base.mock) if "kis_mock" in data else base.mock,
+        rate_limit_per_second=base.rate_limit_per_second,
+        market_data_engine_rate_limit_per_second=base.market_data_engine_rate_limit_per_second,
+        broker_engine_base_url=base.broker_engine_base_url,
+        market_data_engine_base_url=base.market_data_engine_base_url,
+        default_domestic_symbol=base.default_domestic_symbol,
+        default_overseas_symbol=base.default_overseas_symbol,
+        default_overseas_exchange=base.default_overseas_exchange,
+    )
+
+
+def kis_account_env_prefix(account_id: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in account_id.strip().upper())
+    compact = "_".join(part for part in normalized.split("_") if part)
+    if not compact:
+        raise ConfigurationError("account_id must contain at least one letter or number.")
+    return f"KIS_ACCOUNT_{compact}"
+
+
+def _scoped_or_base(name: str, base_value: str) -> str:
+    return os.getenv(name, "").strip() or base_value
 
 
 def _configured_env_file(default: str | Path) -> str:

@@ -171,6 +171,97 @@ def test_broker_engine_gateway_uses_limit_price_for_domestic_limit_order():
     assert client.enqueued[0]["arguments"]["price"] == 70_200
 
 
+def test_broker_engine_gateway_enqueues_overseas_etf_order_with_kis_exchange():
+    symbol = Symbol("SMH", "US")
+    batch = OrderIntentBatch(
+        sleeve_id="us_etf_rotation",
+        generated_at=datetime(2026, 5, 11, 22, 30),
+        order_intents=(
+            OrderIntent(
+                "us_etf_rotation",
+                symbol,
+                OrderSide.BUY,
+                1,
+                569.55,
+                order_type=OrderType.LIMIT,
+                limit_price=569.55,
+            ),
+        ),
+        batch_id="batch-us",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 11, 22, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 11, 22, 32))
+
+    command = client.enqueued[0]
+    assert command["operation"] == "place_overseas_stock_order"
+    assert command["arguments"] == {
+        "side": "buy",
+        "exchange": "NASD",
+        "symbol": "SMH",
+        "quantity": 1,
+        "price": 569.55,
+        "order_division": "00",
+        "use_hashkey": False,
+    }
+
+
+def test_broker_engine_gateway_rounds_us_buy_limit_price_up_to_kis_tick():
+    symbol = Symbol("SMH", "US")
+    batch = OrderIntentBatch(
+        sleeve_id="us_etf_rotation",
+        generated_at=datetime(2026, 5, 11, 22, 30),
+        order_intents=(
+            OrderIntent(
+                "us_etf_rotation",
+                symbol,
+                OrderSide.BUY,
+                1,
+                570.885,
+                order_type=OrderType.LIMIT,
+                limit_price=570.885,
+            ),
+        ),
+        batch_id="batch-us",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 11, 22, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 11, 22, 32))
+
+    assert client.enqueued[0]["arguments"]["price"] == 570.89
+
+
+def test_broker_engine_gateway_rounds_us_sell_limit_price_down_to_kis_tick():
+    symbol = Symbol("XLK", "US")
+    batch = OrderIntentBatch(
+        sleeve_id="us_etf_rotation",
+        generated_at=datetime(2026, 5, 11, 22, 30),
+        order_intents=(
+            OrderIntent(
+                "us_etf_rotation",
+                symbol,
+                OrderSide.SELL,
+                3,
+                176.795,
+                order_type=OrderType.LIMIT,
+                limit_price=176.795,
+            ),
+        ),
+        batch_id="batch-us",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 11, 22, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 11, 22, 32))
+
+    assert client.enqueued[0]["arguments"]["price"] == 176.79
+
+
 class _FakeBrokerEngineCallClient:
     def __init__(self):
         self.called = []

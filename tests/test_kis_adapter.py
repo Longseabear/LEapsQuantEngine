@@ -210,6 +210,31 @@ def test_market_data_engine_live_quote_provider_requires_overseas_exchange():
         provider.get_latest_bar(Symbol("NVDA", "US"))
 
 
+def test_market_data_engine_live_quote_provider_rejects_unusable_domestic_live_quote():
+    class StaticReferenceClient(FakeMarketDataEngineClient):
+        def call_tool(self, tool, arguments=None):
+            self.calls.append((tool, arguments))
+            return {
+                "last_price": 268500,
+                "open_price": 0,
+                "high_price": 0,
+                "low_price": 0,
+                "volume": 157,
+                "live_price_usable": False,
+                "price_quality_reason": "reference_price_without_distinct_orderbook_price",
+                "raw_output": {
+                    "stck_sdpr": "268500",
+                    "prdy_vrss": "0",
+                    "prdy_ctrt": "0.00",
+                },
+            }
+
+    provider = MarketDataEngineLiveQuoteProvider(client=StaticReferenceClient())
+
+    with pytest.raises(MarketDataError, match="not usable"):
+        provider.get_latest_bar(Symbol("005930", "KRX"))
+
+
 def test_cached_kis_provider_uses_market_data_engine_cache_tool():
     provider = KISCachedMarketDataProvider(client=FakeMarketDataEngineClient())
 

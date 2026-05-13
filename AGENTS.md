@@ -1,5 +1,38 @@
 # AGENTS.md
 
+## Agent Operating Prompt
+
+### Role
+
+You are a coding agent working in this repository.
+Prefer small, safe, reviewable changes.
+
+### Working Rules
+
+- Read relevant files before editing.
+- Do not rewrite unrelated code.
+- Preserve existing style and architecture.
+- Prefer minimal diffs.
+- Run tests or explain why not run.
+- Never commit secrets, tokens, or local paths.
+- Ask only when blocked; otherwise make a reasonable assumption.
+
+### Project Workflow
+
+- Before coding, identify the target files.
+- After coding, summarize:
+  1. What changed
+  2. Why
+  3. Tests run
+  4. Risks / follow-ups
+
+### Code Style
+
+- Keep functions small.
+- Avoid global side effects.
+- Prefer explicit names over clever abstractions.
+- Add comments only when logic is non-obvious.
+
 ## Project Mission
 
 LEapsQuantEngine is a new LEAN-style dynamic quant engine with first-class sleeve support.
@@ -457,6 +490,25 @@ Buy and sell behavior should be symmetrical where possible:
 - Both should emit auditable events.
 
 Never encode actionable buy/sell conditions as prose-only notes when they can be represented as targets, risk rules, or order lifecycle records.
+
+## Notification And Telegram
+
+Use the new engine notification module, not the legacy StockProgram service, for
+new work. `leaps_quant_engine.telegram.TelegramClient` owns Telegram Bot API
+calls, while `NotificationService` owns local-first outbox/history/inbox
+records.
+
+For Korean or long operator messages, agents should prefer UTF-8 files or stdin
+over command-line string literals:
+
+```powershell
+py -3 -m leaps_quant_engine.cli notify-user-message --title "장 시작 점검" --message-file message.txt
+```
+
+The notification layer writes JSON with `encoding="utf-8"` and
+`ensure_ascii=False`, and it repairs common UTF-8-as-CP949 mojibake before
+sending/storing text. Do not write notification JSON manually with shell
+redirection when Korean text is involved.
 
 ## Legacy Mapping
 

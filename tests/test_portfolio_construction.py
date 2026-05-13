@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -275,7 +275,7 @@ def test_rebalance_policy_preserves_small_exit_targets_by_default():
     assert sized.plans[0].is_exit is True
 
 
-def test_equal_weight_model_flattens_current_holding_without_active_insight():
+def test_equal_weight_model_keeps_current_holding_without_active_insight():
     held = Symbol("HELD", "US")
     portfolio = Portfolio(cash=100, holdings={held.key: Holding(held, quantity=3, average_price=25.0)})
     engine = PortfolioConstructionEngine(model=EqualWeightPortfolioConstructionModel())
@@ -290,11 +290,8 @@ def test_equal_weight_model_flattens_current_holding_without_active_insight():
         )
     )
 
-    assert batch.targets == (PortfolioAllocationTarget(symbol=held, target_percent=0.0, tag="framework:insight_inactive"),)
-    assert batch.plans[0].current_quantity == 3
-    assert batch.plans[0].current_price == 30.0
-    assert batch.plans[0].current_value == pytest.approx(90.0)
-    assert batch.plans[0].desired_value == pytest.approx(0.0)
+    assert batch.targets == ()
+    assert batch.plans == ()
     sized = OrderSizingEngine().size(
         OrderSizingContext(
             sleeve_id="test-sleeve",
@@ -303,7 +300,50 @@ def test_equal_weight_model_flattens_current_holding_without_active_insight():
             portfolio_targets=batch,
         )
     )
-    assert sized.targets == (PortfolioTarget(symbol=held, quantity=0, tag="framework:insight_inactive"),)
+    assert sized.targets == ()
+    assert sized.plans == ()
+
+
+def test_equal_weight_model_flattens_current_holding_with_explicit_flat_insight():
+    held = Symbol("HELD", "US")
+    now = datetime(2026, 5, 9, 9, 30)
+    portfolio = Portfolio(cash=100, holdings={held.key: Holding(held, quantity=3, average_price=25.0)})
+    engine = PortfolioConstructionEngine(model=EqualWeightPortfolioConstructionModel())
+
+    flat = Insight(
+        sleeve_id="test-sleeve",
+        symbol=held,
+        direction=InsightDirection.FLAT,
+        generated_at=now,
+        expires_at=now + timedelta(days=1),
+        source_snapshot_id="snapshot-1",
+        alpha_id="exit-alpha",
+        alpha_version="1.0",
+    )
+    batch = engine.create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(held, 30.0, as_of=now)),
+            portfolio=portfolio,
+            active_insights=(flat,),
+            managed_symbols=(),
+        )
+    )
+
+    assert batch.targets == (PortfolioAllocationTarget(symbol=held, target_percent=0.0, tag="framework:exit-alpha:flat"),)
+    assert batch.plans[0].current_quantity == 3
+    assert batch.plans[0].current_price == 30.0
+    assert batch.plans[0].current_value == pytest.approx(90.0)
+    assert batch.plans[0].desired_value == pytest.approx(0.0)
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(held, 30.0, as_of=now)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+    assert sized.targets == (PortfolioTarget(symbol=held, quantity=0, tag="framework:exit-alpha:flat"),)
     assert sized.plans[0].delta_quantity == -3
 
 

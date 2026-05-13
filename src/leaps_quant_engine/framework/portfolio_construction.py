@@ -263,15 +263,15 @@ class EqualWeightPortfolioConstructionModel:
                     tag=f"framework:{insight.alpha_id}:{insight.direction.value}",
                 )
 
-        for symbol in _symbols_by_key((*context.managed_symbols, *context.held_symbols)).values():
-            if symbol.key in target_qty_by_symbol:
+        for insight in _latest_exit_insights(context.active_insights).values():
+            if insight.symbol_key in target_qty_by_symbol:
                 continue
-            if context.portfolio.quantity(symbol) == 0:
+            if context.portfolio.quantity(insight.symbol) == 0:
                 continue
-            target_qty_by_symbol[symbol.key] = PortfolioAllocationTarget(
-                symbol=symbol,
+            target_qty_by_symbol[insight.symbol_key] = PortfolioAllocationTarget(
+                symbol=insight.symbol,
                 target_percent=0.0,
-                tag="framework:insight_inactive",
+                tag=f"framework:{insight.alpha_id}:{insight.direction.value}",
             )
         return tuple(target_qty_by_symbol.values())
 
@@ -279,6 +279,17 @@ class EqualWeightPortfolioConstructionModel:
 def _latest_insight_by_symbol(insights: tuple[Insight, ...]) -> dict[str, Insight]:
     latest: dict[str, Insight] = {}
     for insight in insights:
+        previous = latest.get(insight.symbol_key)
+        if previous is None or insight.generated_at > previous.generated_at:
+            latest[insight.symbol_key] = insight
+    return latest
+
+
+def _latest_exit_insights(insights: tuple[Insight, ...]) -> dict[str, Insight]:
+    latest: dict[str, Insight] = {}
+    for insight in insights:
+        if insight.direction not in {InsightDirection.FLAT, InsightDirection.DOWN}:
+            continue
         previous = latest.get(insight.symbol_key)
         if previous is None or insight.generated_at > previous.generated_at:
             latest[insight.symbol_key] = insight

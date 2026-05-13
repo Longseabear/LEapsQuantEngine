@@ -69,6 +69,7 @@ class RiskManagementContext:
     portfolio: Portfolio
     targets: tuple[PortfolioTarget, ...]
     snapshot_quality: SnapshotQualityReport | None = None
+    active_insights: tuple[Any, ...] = ()
 
 
 class RiskManagementModel(Protocol):

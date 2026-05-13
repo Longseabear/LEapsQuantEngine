@@ -115,11 +115,19 @@ class EngineGuard:
                     },
                 )
             )
-        if commit and broker == "broker-engine" and market_scope == "overseas":
-            decisions.append(_decision("rejected", "broker_engine_overseas_submit_not_supported", "", metadata={"account_id": account_id}))
-
         decisions.extend(_duplicate_submit_decisions(batches_tuple, order_state_store, commit=commit))
-        open_buy_notional, open_sell_quantities = _open_ticket_reservations(order_state_store)
+        open_buy_notional, open_buy_quantities, open_sell_quantities = _open_ticket_reservations(order_state_store)
+        unapplied_fill_deltas = _unapplied_fill_quantity_deltas(order_state_store, account_store)
+        decisions.extend(
+            _target_delta_decisions(
+                _orders(batches_tuple),
+                account_store=account_store,
+                open_buy_quantities=open_buy_quantities,
+                open_sell_quantities=open_sell_quantities,
+                unapplied_fill_deltas=unapplied_fill_deltas,
+                commit=commit,
+            )
+        )
         new_buy_notional: dict[str, float] = {}
         new_sell_quantities: dict[tuple[str, str], int] = {}
         for order in _orders(batches_tuple):
@@ -289,27 +297,172 @@ def _duplicate_submit_decisions(
 
 def _open_ticket_reservations(
     order_state_store: OrderRuntimeStateStore | None,
-) -> tuple[dict[str, float], dict[tuple[str, str], int]]:
+) -> tuple[dict[str, float], dict[tuple[str, str], int], dict[tuple[str, str], int]]:
     buy_notional: dict[str, float] = {}
+    buy_quantities: dict[tuple[str, str], int] = {}
     sell_quantities: dict[tuple[str, str], int] = {}
     if order_state_store is None:
-        return buy_notional, sell_quantities
+        return buy_notional, buy_quantities, sell_quantities
     try:
         tickets = order_state_store.snapshot().open_tickets
     except Exception:  # noqa: BLE001
-        return buy_notional, sell_quantities
+        return buy_notional, buy_quantities, sell_quantities
     for ticket in tickets:
         if ticket.status in {OrderTicketStatus.CANCELLED, OrderTicketStatus.FILLED, OrderTicketStatus.REJECTED}:
             continue
+        key = (ticket.sleeve_id, ticket.symbol.key)
         if ticket.side is OrderSide.BUY:
             buy_notional[ticket.sleeve_id] = (
                 buy_notional.get(ticket.sleeve_id, 0.0)
                 + ticket.remaining_quantity * _ticket_cash_price(ticket)
             )
+            buy_quantities[key] = buy_quantities.get(key, 0) + ticket.remaining_quantity
             continue
-        key = (ticket.sleeve_id, ticket.symbol.key)
         sell_quantities[key] = sell_quantities.get(key, 0) + ticket.remaining_quantity
-    return buy_notional, sell_quantities
+    return buy_notional, buy_quantities, sell_quantities
+
+
+def _unapplied_fill_quantity_deltas(
+    order_state_store: OrderRuntimeStateStore | None,
+    account_store: VirtualSleeveAccountStore,
+) -> dict[tuple[str, str], int]:
+    deltas: dict[tuple[str, str], int] = {}
+    if order_state_store is None:
+        return deltas
+    try:
+        fill_events = order_state_store.snapshot().fill_events
+    except Exception:  # noqa: BLE001
+        return deltas
+    for event in fill_events:
+        fill_ids = (f"order-event:{event.event_id}", str(event.metadata.get("fill_id") or "").strip())
+        try:
+            if any(fill_id and account_store.fill_exists(fill_id) for fill_id in fill_ids):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        signed_quantity = event.quantity if event.side is OrderSide.BUY else -event.quantity
+        key = (event.sleeve_id, event.symbol.key)
+        deltas[key] = deltas.get(key, 0) + signed_quantity
+    return deltas
+
+
+def _target_delta_decisions(
+    orders: tuple[OrderIntent, ...],
+    *,
+    account_store: VirtualSleeveAccountStore,
+    open_buy_quantities: dict[tuple[str, str], int],
+    open_sell_quantities: dict[tuple[str, str], int],
+    unapplied_fill_deltas: dict[tuple[str, str], int],
+    commit: bool,
+) -> tuple[EngineGuardDecision, ...]:
+    grouped: dict[tuple[str, str], list[OrderIntent]] = {}
+    for order in orders:
+        if _metadata_int(order.metadata.get("target_quantity")) is None:
+            continue
+        grouped.setdefault((order.sleeve_id, order.symbol.key), []).append(order)
+
+    decisions: list[EngineGuardDecision] = []
+    status = "rejected" if commit else "warning"
+    for (sleeve_id, symbol_key), symbol_orders in grouped.items():
+        target_quantities = tuple(
+            dict.fromkeys(
+                quantity
+                for quantity in (_metadata_int(order.metadata.get("target_quantity")) for order in symbol_orders)
+                if quantity is not None
+            )
+        )
+        first_order = symbol_orders[0]
+        if len(target_quantities) != 1:
+            decisions.append(
+                _decision(
+                    status,
+                    "multiple_target_quantities_for_symbol",
+                    sleeve_id,
+                    order=first_order,
+                    metadata={"target_quantities": list(target_quantities)},
+                )
+            )
+            continue
+
+        target_quantity = target_quantities[0]
+        portfolio = account_store.current_portfolio(sleeve_id)
+        held_quantity = portfolio.holdings.get(symbol_key).quantity if symbol_key in portfolio.holdings else 0
+        open_buy_quantity = open_buy_quantities.get((sleeve_id, symbol_key), 0)
+        open_sell_quantity = open_sell_quantities.get((sleeve_id, symbol_key), 0)
+        unapplied_fill_delta = unapplied_fill_deltas.get((sleeve_id, symbol_key), 0)
+        projected_quantity = held_quantity + open_buy_quantity - open_sell_quantity + unapplied_fill_delta
+        unreserved_delta = target_quantity - projected_quantity
+        requested_buy_quantity = sum(order.quantity for order in symbol_orders if order.side is OrderSide.BUY)
+        requested_sell_quantity = sum(order.quantity for order in symbol_orders if order.side is OrderSide.SELL)
+        requested_delta = requested_buy_quantity - requested_sell_quantity
+        metadata = {
+            "held_quantity": held_quantity,
+            "open_buy_quantity": open_buy_quantity,
+            "open_sell_quantity": open_sell_quantity,
+            "unapplied_fill_delta": unapplied_fill_delta,
+            "projected_quantity": projected_quantity,
+            "target_quantity": target_quantity,
+            "unreserved_delta": unreserved_delta,
+            "requested_buy_quantity": requested_buy_quantity,
+            "requested_sell_quantity": requested_sell_quantity,
+            "requested_delta": requested_delta,
+        }
+        if unreserved_delta == 0 and requested_delta != 0:
+            decisions.append(
+                _decision(
+                    status,
+                    "target_quantity_already_covered_by_pending_orders",
+                    sleeve_id,
+                    order=first_order,
+                    metadata=metadata,
+                )
+            )
+            continue
+        if unreserved_delta > 0:
+            if requested_delta <= 0 or requested_sell_quantity:
+                decisions.append(
+                    _decision(
+                        status,
+                        "order_side_conflicts_with_unreserved_target_delta",
+                        sleeve_id,
+                        order=first_order,
+                        metadata=metadata,
+                    )
+                )
+                continue
+            if requested_delta > unreserved_delta:
+                decisions.append(
+                    _decision(
+                        status,
+                        "order_quantity_exceeds_unreserved_target_delta",
+                        sleeve_id,
+                        order=first_order,
+                        metadata=metadata,
+                    )
+                )
+            continue
+        if requested_delta >= 0 or requested_buy_quantity:
+            decisions.append(
+                _decision(
+                    status,
+                    "order_side_conflicts_with_unreserved_target_delta",
+                    sleeve_id,
+                    order=first_order,
+                    metadata=metadata,
+                )
+            )
+            continue
+        if abs(requested_delta) > abs(unreserved_delta):
+            decisions.append(
+                _decision(
+                    status,
+                    "order_quantity_exceeds_unreserved_target_delta",
+                    sleeve_id,
+                    order=first_order,
+                    metadata=metadata,
+                )
+            )
+    return tuple(decisions)
 
 
 def _cash_notional(order: OrderIntent) -> float:
@@ -320,6 +473,18 @@ def _cash_notional(order: OrderIntent) -> float:
 def _ticket_cash_price(ticket: Any) -> float:
     price = ticket.limit_price if ticket.order_type is OrderType.LIMIT and ticket.limit_price is not None else ticket.reference_price
     return float(price)
+
+
+def _metadata_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
 
 
 def _coerce_market_session(value: MarketSession | Mapping[str, Any] | None) -> MarketSession | None:

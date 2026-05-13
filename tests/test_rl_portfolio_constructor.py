@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 
 import pytest
 
@@ -44,7 +45,7 @@ def test_rl_portfolio_constructor_falls_back_to_deterministic_exposure():
     assert all(target.tag.startswith("rl:ppo") for target in targets)
 
 
-def test_rl_portfolio_constructor_emits_exit_for_managed_inactive_holding():
+def test_rl_portfolio_constructor_keeps_managed_holding_without_active_insight():
     symbol = Symbol("AAPL", "US")
     now = datetime(2026, 1, 2)
     portfolio = Portfolio(cash=0, cash_by_currency={"USD": 0})
@@ -60,9 +61,29 @@ def test_rl_portfolio_constructor_emits_exit_for_managed_inactive_holding():
 
     targets = model.create_targets(context)
 
+    assert targets == ()
+
+
+def test_rl_portfolio_constructor_emits_exit_for_explicit_flat_insight():
+    symbol = Symbol("AAPL", "US")
+    now = datetime(2026, 1, 2)
+    portfolio = Portfolio(cash=0, cash_by_currency={"USD": 0})
+    portfolio.holdings[symbol.key] = type("HoldingLike", (), {"symbol": symbol, "quantity": 3, "average_price": 100})()
+    model = ReinforcementLearningPortfolioConstructionModel(fallback_action=0)
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100, 100, 100, 100, 1000)}),
+        portfolio=portfolio,
+        active_insights=(_flat_insight(symbol, now),),
+        managed_symbols=(symbol,),
+    )
+
+    targets = model.create_targets(context)
+
     assert len(targets) == 1
     assert targets[0].symbol == symbol
     assert targets[0].target_percent == 0.0
+    assert targets[0].tag == "rl:flat-alpha:flat"
 
 
 def test_rl_portfolio_constructor_flat_insight_overrides_same_cycle_up_for_held_symbol():
@@ -102,7 +123,7 @@ def test_rl_portfolio_constructor_flat_insight_overrides_same_cycle_up_for_held_
     assert len(targets) == 1
     assert targets[0].symbol == symbol
     assert targets[0].target_percent == 0.0
-    assert targets[0].tag == "rl:insight_inactive"
+    assert targets[0].tag == "rl:stop-alpha:flat"
 
 
 def test_rl_portfolio_constructor_uses_median_ensemble_action(monkeypatch, tmp_path):
@@ -294,6 +315,78 @@ def test_rl_portfolio_allocator_falls_back_to_score_weighted_targets():
     assert targets[0].target_percent > targets[1].target_percent
 
 
+def test_rl_portfolio_allocator_loads_policy_paths_from_metadata(monkeypatch, tmp_path):
+    symbol = Symbol("SMH", "US")
+    now = datetime(2026, 1, 2)
+    policy_path = tmp_path / "allocator.zip"
+    policy_path.write_text("stub", encoding="utf-8")
+    metadata_path = tmp_path / "allocator.json"
+    metadata_path.write_text(
+        json.dumps({"policy_paths": [str(policy_path)]}),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class WeightPolicy:
+        def predict(self, observation, deterministic=True):
+            captured["called"] = True
+            return [0.8, 0.2], None
+
+    monkeypatch.setattr("leaps_quant_engine.rl.portfolio_constructor._load_ppo_model", lambda path: WeightPolicy())
+    model = ReinforcementLearningPortfolioConstructionModel(
+        metadata_path=metadata_path,
+        allocation_mode="rl_weights",
+        top_k=1,
+        max_position_pct=1.0,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="us_etf_rotation",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 570, 570, 570, 570, 1000)}),
+        portfolio=Portfolio(cash=2500, cash_by_currency={"USD": 2500}),
+        active_insights=(_up_insight(symbol, now, momentum=0.2),),
+        managed_symbols=(),
+    )
+
+    targets = model.create_targets(context)
+
+    assert captured["called"] is True
+    assert len(targets) == 1
+    assert targets[0].target_percent == pytest.approx(0.8)
+
+
+def test_rl_portfolio_allocator_uses_signal_floor_when_policy_selects_cash(monkeypatch, tmp_path):
+    symbol = Symbol("SMH", "US")
+    now = datetime(2026, 1, 2)
+    path = tmp_path / "allocator.zip"
+    path.write_text("stub", encoding="utf-8")
+
+    class CashPolicy:
+        def predict(self, observation, deterministic=True):
+            return [0.0, 1.0], None
+
+    monkeypatch.setattr("leaps_quant_engine.rl.portfolio_constructor._load_ppo_model", lambda path: CashPolicy())
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_paths=(path,),
+        allocation_mode="rl_weights",
+        top_k=1,
+        fallback_gross_exposure=0.7,
+        min_signal_action=1,
+        max_position_pct=1.0,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="us_etf_rotation",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 570, 570, 570, 570, 1000)}),
+        portfolio=Portfolio(cash=2500, cash_by_currency={"USD": 2500}),
+        active_insights=(_up_insight(symbol, now, momentum=0.2),),
+        managed_symbols=(),
+    )
+
+    targets = model.create_targets(context)
+
+    assert len(targets) == 1
+    assert targets[0].target_percent == pytest.approx(0.7)
+
+
 def test_rl_training_lot_sizing_reflects_small_account_integer_shares():
     weights = _integer_lot_asset_weights(
         desired_asset_weights=[0.30, 0.30],
@@ -318,4 +411,18 @@ def _up_insight(symbol: Symbol, now: datetime, *, momentum: float) -> Insight:
         confidence=0.7,
         score=momentum,
         metadata={"momentum": momentum},
+    )
+
+
+def _flat_insight(symbol: Symbol, now: datetime) -> Insight:
+    return Insight(
+        sleeve_id="LEaps",
+        symbol=symbol,
+        direction=InsightDirection.FLAT,
+        generated_at=now,
+        expires_at=now + timedelta(days=1),
+        source_snapshot_id="test",
+        alpha_id="flat-alpha",
+        alpha_version="1",
+        confidence=0.8,
     )

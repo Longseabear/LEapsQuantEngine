@@ -4,6 +4,7 @@ from leaps_quant_engine.brokerage import BrokerExecutionService, PaperBrokerExec
 from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
 from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrator
+from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderEventType, OrderTicketStatus
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
@@ -114,3 +115,40 @@ def test_order_orchestrator_can_submit_without_polling_or_fill_application(tmp_p
     portfolio = store.current_portfolio("LEaps")
     assert portfolio.cash == 1_000.0
     assert portfolio.holdings == {}
+
+
+class _FailingBrokerGateway:
+    def submit(self, ticket, *, occurred_at=None):
+        raise RuntimeError("boom")
+
+    def cancel(self, ticket, *, reason="", occurred_at=None):
+        raise RuntimeError("boom")
+
+    def poll(self, ticket, *, occurred_at=None):
+        return ()
+
+
+def test_order_orchestrator_records_rejected_event_when_broker_submit_fails(tmp_path):
+    store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000.0},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    orchestrator = MultiSleeveOrderOrchestrator(
+        broker=BrokerExecutionService(_FailingBrokerGateway()),
+        account_store=store,
+        order_state_store=order_store,
+    )
+
+    result = orchestrator.run_batches(
+        (_batch("LEaps", side=OrderSide.BUY, quantity=3),),
+        generated_at=datetime(2026, 5, 9, 9, 31),
+    )
+
+    assert [event.event_type for event in result.submission.events] == [OrderEventType.REJECTED]
+    assert result.final_tickets[0].status is OrderTicketStatus.REJECTED
+    assert "broker_submit_failed" in result.submission.events[0].reason
+
+    snapshot = order_store.snapshot()
+    assert snapshot.open_tickets == ()
+    assert snapshot.ticket(result.final_tickets[0].ticket_id).status is OrderTicketStatus.REJECTED

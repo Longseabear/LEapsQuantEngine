@@ -59,6 +59,19 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
   downloader chunks 1-minute requests and writes
   `symbol,time,open,high,low,close,volume` for direct `runtime-backtest-minute`
   consumption.
+- `runtime-run-once` emits a compact `engine_status` object alongside the full
+  framework and portfolio payload. Agents should use it as the quick status line
+  for active config/version, snapshot quality, portfolio cash/equity, held
+  symbols, target/order counts, and risk/execution counts.
+- `VirtualSleeveAccountStore` maintains persisted per-sleeve `PositionState`
+  records from fills:
+  - quantity and average entry price
+  - original entry time
+  - high-watermark price/time
+  - latest marked price/time
+  - optional latest stop price
+  This gives trailing-stop and position lifecycle models a restart-safe state
+  source without putting strategy state inside alpha module globals.
 - Recent US ETF minute feed import:
   - runtime config: `configs/runtime/us_etf_rotation_sleeve.json`
   - sleeve: `us_etf_rotation`
@@ -930,7 +943,7 @@ Current v0 behavior:
 - `runtime-run-once --order-batch-output` writes the framework `execution_batch` as an `order_intent_batches.v1` JSON artifact. The file is intentionally the same shape consumed by `order-runtime-submit`, so the paper/live order path can be tested from a captured strategy output rather than hand-written order JSON.
 - `order-runtime-paper-smoke` runs the paper lifecycle from an artifact in one command. It commits through `order-runtime-submit` with paper broker submission but no immediate poll, then runs the supervisor's paper poll to produce fill events and final status. This proves the submit/supervise boundary instead of hiding fill application inside submit.
 - `order-runtime-submit` is the explicit boundary between strategy order intent and account-level order lifecycle. It reads `OrderIntentBatch` JSON, validates sleeve/symbol/notional guards, dry-runs `OrderCoordinator` by default, and commits only with `--commit`. Broker-engine submit is blocked unless `--confirm-live-submit` is also present.
-- `EngineGuard` now checks the order runtime store before commit and rejects duplicate `batch_id:index` order intent ids or ticket ids that were already recorded. Dry-run reports the same condition as a warning so an operator can see that a captured artifact was already submitted.
+- `EngineGuard` now checks the order runtime store before commit and rejects duplicate `batch_id:index` order intent ids or ticket ids that were already recorded. It also projects current virtual holdings with open tickets and unapplied fills, so a fresh batch with a new id is blocked when pending orders already cover the target quantity but allowed when the target quantity genuinely increases. Dry-run reports the same conditions as warnings so an operator can see that a captured artifact was already submitted or already covered.
 - `order-runtime-status` provides an explicit operator/agent read model for order operations. It combines the append-only order ticket/event store with the virtual sleeve account store and reports broker account route, market scope, open tickets, ticket/event counts, sleeve cash/holdings, pending buy notional, pending sell quantities, and unallocated broker fills. It does not submit, poll, or reconcile broker orders.
 - `order-runtime-supervise` is the first bounded order maintenance command. It can poll stored open tickets through paper or broker-engine gateways, import recent execution history through broker-engine account operations, run holdings reconciliation, and then attach the final `order-runtime-status` view. Setup, poll, and reconcile failures are returned as warnings so an agent loop can continue. Overseas broker-engine poll/reconcile is blocked explicitly until an overseas broker-engine adapter exists.
 - `EqualWeightPortfolioConstructionModel` remains the first model implementation. It emits equal target percentages for active insights instead of quantity targets.
@@ -981,6 +994,14 @@ Current v0 behavior:
   stale partial fills when policy allows it. This keeps cancel/replace-style
   maintenance out of alpha/portfolio/risk code.
 - `NotificationService` brings over the StockProgram local-first Telegram alert pattern. It writes outbox/history JSON records under `data/notification-engine`, sends Telegram only when `LEAPS_TELEGRAM_BOT_TOKEN` and chat id are available, accepts StockProgram env names as migration fallback, and never lets alert failure block order reflection.
+- `leaps_quant_engine.telegram.TelegramClient` is now the engine-owned Telegram
+  module. It supports outbound `sendMessage`, inbound `getUpdates`, and common
+  UTF-8-as-CP949 mojibake repair before text is stored or sent. Agents should
+  use `notify-user-message --message-file` or `--message-stdin` for Korean
+  messages instead of long command-line literals.
+- `notification-fetch-telegram-updates` fetches Telegram bot updates into the
+  local notification inbox so later orchestration can consume replies without
+  coupling strategy code to Telegram.
 - `order-runtime-submit --notify` and `order-runtime-supervise --notify` can emit compact mechanical order alerts. These alerts contain runtime, account, order/ticket/fill counts, and errors/warnings only; strategy reasoning remains in agent notes and journals.
 - Execution-history reconciliation also checks the order runtime store's existing fill events before applying broker history fills. This prevents a fill that was already reflected from a broker/order event from being applied a second time when the same execution later appears in KIS history.
 - KIS execution-history fill ids prefer explicit execution/fill ids when the broker payload provides them. If the broker-engine row is an order-level execution summary (`source_granularity=order_execution_summary`), the fill id is stable by order and timestamp instead of quantity/average price, preventing a revised summary row from double-applying as a new fill.
@@ -1578,3 +1599,7 @@ After that:
 2. Persist and replay portfolio/risk/order state snapshots across process restarts.
 3. Schedule `UniverseSelectionRuntime` and safely update worker target symbols.
 4. Simulate n-1 minute delayed indicator snapshots in backtests.
+5. Add sleeve cash policy with separated usable cash, protected reserve cash,
+   and temporary buffer cash. The buffer may be used only as an auditable
+   temporary draw and must create a restore obligation, so normal strategy
+   sizing cannot silently consume operator reserve funds.
