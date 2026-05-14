@@ -33,6 +33,7 @@
     {"name": "ema_8_close", "type": "ema", "period": 8, "field": "close", "resolution": "daily"},
     {"name": "momentum_5_close", "type": "momentum", "period": 5, "field": "close", "resolution": "daily"},
     {"name": "roc_20_close", "type": "roc", "period": 20, "field": "close", "resolution": "daily"},
+    {"name": "roc_60_close", "type": "roc", "period": 60, "field": "close", "resolution": "daily", "readiness": "optional"},
     {"name": "rolling_max_20_close", "type": "rolling_max", "period": 20, "field": "close", "resolution": "daily"},
     {"name": "rolling_min_20_close", "type": "rolling_min", "period": 20, "field": "close", "resolution": "daily"},
     {"name": "stddev_20_close", "type": "stddev", "period": 20, "field": "close", "resolution": "daily"},

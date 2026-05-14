@@ -6,17 +6,41 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-kospi-conviction"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 EVALUATION_CADENCE = "every_cycle"
 INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=10)
-MAX_SELECTED = 5
+MAX_SELECTED = 8
 MIN_SCORE = 0.025
 KOSPI_BIAS_BONUS = 0.04
 MAX_NORMALIZED_VOLATILITY = 0.16
 EXTREME_NORMALIZED_VOLATILITY = 0.22
 HIGH_VOL_MOMENTUM_EXCEPTION = 0.45
 HIGH_VOL_TREND_EXCEPTION = 0.18
+SECTOR_STRENGTH_WEIGHT = 0.18
+ENTRY_TIMING_WEIGHT = 0.12
+MAX_HEALTHY_PULLBACK = 0.14
+MIN_HEALTHY_PULLBACK = 0.012
+MAX_REBREAK_DISTANCE = 0.04
+MIN_REBREAK_MOMENTUM_5 = 0.015
+SECTOR_BY_SYMBOL_KEY = {
+    "KRX:005930": "technology",
+    "KRX:000660": "technology",
+    "KRX:006400": "technology",
+    "KRX:005380": "consumer_discretionary",
+    "KRX:000270": "consumer_discretionary",
+    "KRX:035420": "communication_services",
+    "KRX:035720": "communication_services",
+    "KRX:068270": "health_care",
+    "KRX:207940": "health_care",
+    "KRX:051910": "materials",
+    "KRX:105560": "financials",
+    "KRX:055550": "financials",
+    "KRX:086790": "financials",
+    "KRX:028260": "industrials",
+    "KRX:034020": "industrials",
+    "KRX:012450": "industrials",
+}
 
 
 def generate(context: SnapshotContext) -> list[Insight]:
@@ -36,6 +60,8 @@ def generate(context: SnapshotContext) -> list[Insight]:
         slow_average = _first_value(context, symbol_key, ("sma_20_close", "sma_5_close"))
         momentum_5 = _first_value(context, symbol_key, ("momentum_5_close",))
         momentum_20 = _first_value(context, symbol_key, ("roc_20_close", "momentum_20_close", "momentum_5_close"))
+        momentum_60 = _first_value(context, symbol_key, ("roc_60_close", "momentum_60_close"))
+        rolling_high = _first_value(context, symbol_key, ("rolling_max_20_close",))
         liquidity = _first_value(context, symbol_key, ("rolling_dollar_volume_20", "volume"))
         if close is None or fast_average is None or slow_average is None or momentum_20 is None:
             continue
@@ -54,17 +80,37 @@ def generate(context: SnapshotContext) -> list[Insight]:
         ):
             continue
         acceleration = momentum_5 or 0.0
+        intermediate_momentum = momentum_60 if momentum_60 is not None else momentum_20
+        recency_weighted_momentum = (
+            (momentum_20 * 0.50)
+            + (acceleration * 0.30)
+            + (intermediate_momentum * 0.20)
+        )
+        entry_timing = _entry_timing_score(
+            close=close,
+            fast_average=fast_average,
+            rolling_high=rolling_high,
+            momentum_5=acceleration,
+        )
         liquidity_bonus = 0.0 if liquidity is None else min(liquidity / 4_000_000_000_000.0, 0.04)
         raw_candidates.append(
             {
                 "symbol_key": symbol_key,
+                "sector": SECTOR_BY_SYMBOL_KEY.get(symbol_key, "unknown"),
                 "close": close,
                 "fast_average": fast_average,
                 "slow_average": slow_average,
                 "momentum": momentum_20,
                 "momentum_5": acceleration,
+                "momentum_60": intermediate_momentum,
+                "recency_weighted_momentum": recency_weighted_momentum,
                 "trend_strength": trend_strength,
                 "volatility": volatility,
+                "rolling_high": rolling_high or 0.0,
+                "entry_timing_score": entry_timing["score"],
+                "entry_timing_setup": entry_timing["setup"],
+                "pullback_from_high": entry_timing["pullback_from_high"],
+                "distance_to_fast": entry_timing["distance_to_fast"],
                 "liquidity": liquidity or 0.0,
                 "liquidity_bonus": liquidity_bonus,
             }
@@ -76,17 +122,19 @@ def generate(context: SnapshotContext) -> list[Insight]:
     market_conviction_bonus += min(max(average_positive_momentum, 0.0) * 0.15, 0.03)
 
     candidates: list[dict[str, float | str]] = []
+    sector_strength = _sector_relative_strength(raw_candidates)
     for item in raw_candidates:
-        momentum_20 = float(item["momentum"])
-        acceleration = float(item["momentum_5"])
+        recency_weighted_momentum = float(item["recency_weighted_momentum"])
         trend_strength = float(item["trend_strength"])
         volatility = float(item["volatility"])
+        sector_score = sector_strength.get(str(item["sector"]), 0.0)
         score = (
             KOSPI_BIAS_BONUS
             + market_conviction_bonus
-            + (momentum_20 * 0.55)
-            + (acceleration * 0.25)
-            + (trend_strength * 0.20)
+            + (recency_weighted_momentum * 0.65)
+            + (trend_strength * 0.22)
+            + (sector_score * SECTOR_STRENGTH_WEIGHT)
+            + (float(item["entry_timing_score"]) * ENTRY_TIMING_WEIGHT)
             + float(item["liquidity_bonus"])
             - min(volatility, 0.35) * 0.55
         )
@@ -94,6 +142,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
             continue
         candidate = dict(item)
         candidate["score"] = score
+        candidate["sector_relative_strength"] = sector_score
         candidate["market_breadth"] = market_breadth
         candidate["average_positive_momentum"] = average_positive_momentum
         candidate["market_conviction_bonus"] = market_conviction_bonus
@@ -126,16 +175,25 @@ def generate(context: SnapshotContext) -> list[Insight]:
                 metadata={
                     "role": "krw_growth_engine",
                     "close": item["close"],
+                    "sector": item["sector"],
                     "fast_average": item["fast_average"],
                     "slow_average": item["slow_average"],
                     "momentum": momentum,
                     "momentum_5": item["momentum_5"],
+                    "momentum_60": item["momentum_60"],
+                    "recency_weighted_momentum": item["recency_weighted_momentum"],
                     "trend_strength": item["trend_strength"],
                     "volatility": item["volatility"],
+                    "rolling_high": item["rolling_high"],
+                    "entry_timing_score": item["entry_timing_score"],
+                    "entry_timing_setup": item["entry_timing_setup"],
+                    "pullback_from_high": item["pullback_from_high"],
+                    "distance_to_fast": item["distance_to_fast"],
                     "liquidity": item["liquidity"],
                     "rank": rank,
                     "selected_count": len(selected),
                     "kospi_bias_bonus": KOSPI_BIAS_BONUS,
+                    "sector_relative_strength": item["sector_relative_strength"],
                     "market_breadth": item["market_breadth"],
                     "average_positive_momentum": item["average_positive_momentum"],
                     "market_conviction_bonus": item["market_conviction_bonus"],
@@ -165,6 +223,59 @@ def _volatility_blocks_entry(*, volatility: float, momentum: float, trend_streng
     if volatility <= MAX_NORMALIZED_VOLATILITY:
         return False
     return momentum < HIGH_VOL_MOMENTUM_EXCEPTION or trend_strength < HIGH_VOL_TREND_EXCEPTION
+
+
+def _entry_timing_score(
+    *,
+    close: float,
+    fast_average: float,
+    rolling_high: float | None,
+    momentum_5: float,
+) -> dict[str, float | str]:
+    pullback_from_high = 0.0
+    if rolling_high is not None and rolling_high > 0:
+        pullback_from_high = max((rolling_high - close) / rolling_high, 0.0)
+    distance_to_fast = 0.0 if close <= 0 else (fast_average / close) - 1.0
+    pullback_score = 0.0
+    if MIN_HEALTHY_PULLBACK <= pullback_from_high <= MAX_HEALTHY_PULLBACK:
+        pullback_score = min(pullback_from_high / MAX_HEALTHY_PULLBACK, 1.0)
+    rebreak_score = 0.0
+    if pullback_from_high <= MAX_REBREAK_DISTANCE and momentum_5 >= MIN_REBREAK_MOMENTUM_5:
+        rebreak_score = min((MAX_REBREAK_DISTANCE - pullback_from_high) / MAX_REBREAK_DISTANCE, 1.0)
+    if rebreak_score > pullback_score:
+        return {
+            "score": rebreak_score,
+            "setup": "rebreak",
+            "pullback_from_high": pullback_from_high,
+            "distance_to_fast": distance_to_fast,
+        }
+    if pullback_score > 0:
+        return {
+            "score": pullback_score,
+            "setup": "pullback",
+            "pullback_from_high": pullback_from_high,
+            "distance_to_fast": distance_to_fast,
+        }
+    return {
+        "score": 0.0,
+        "setup": "trend",
+        "pullback_from_high": pullback_from_high,
+        "distance_to_fast": distance_to_fast,
+    }
+
+
+def _sector_relative_strength(candidates: list[dict[str, float | str]]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for item in candidates:
+        sector = str(item["sector"])
+        totals[sector] = totals.get(sector, 0.0) + float(item["recency_weighted_momentum"])
+        counts[sector] = counts.get(sector, 0) + 1
+    return {
+        sector: totals[sector] / counts[sector]
+        for sector in totals
+        if counts.get(sector, 0) > 0
+    }
 
 
 def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ...]) -> float | None:

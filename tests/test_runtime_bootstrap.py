@@ -219,6 +219,7 @@ def _write_runtime_config(
     reused_target_churn_equity_bps=0.0,
     worker_min_success=2,
     account_store_path=None,
+    broker_account_store_path=None,
 ):
     path.write_text(
         json.dumps(
@@ -231,10 +232,29 @@ def _write_runtime_config(
                     "history_provider": "kis-cache",
                     "rate_limit_per_second": 20,
                 },
+                **(
+                    {
+                        "broker_accounts": [
+                            {
+                                "account_id": "kis-test",
+                                "market_scope": "overseas",
+                                "currency": "USD",
+                                "account_store_path": str(broker_account_store_path),
+                            }
+                        ]
+                    }
+                    if broker_account_store_path is not None
+                    else {}
+                ),
                 "sleeves": [
                     {
                         "sleeve_id": sleeve_id,
                         **({"workspace_path": str(workspace_path)} if workspace_path is not None else {}),
+                        **(
+                            {"broker_account_id": "kis-test", "broker_account_routes": {"overseas": "kis-test"}}
+                            if broker_account_store_path is not None
+                            else {}
+                        ),
                         "cash": cash,
                         "universe": {
                             "coarse_path": str(universe_path),
@@ -747,6 +767,61 @@ def test_runtime_uses_virtual_sleeve_account_store_from_config(tmp_path):
     assert runtime.portfolio.quantity(symbol) == 2
     assert report.portfolio_state is not None
     assert report.portfolio_state.current.cash == 300
+
+
+def test_runtime_uses_virtual_sleeve_account_store_from_broker_account_route(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    account_store_path = tmp_path / "runtime" / "broker_accounts.json"
+    _write_universe(universe_path)
+    _write_runtime_config(
+        config_path,
+        universe_path,
+        sleeve_id="LEaps",
+        cash=1_000,
+        min_order_notional=0,
+        worker_min_success=1,
+        broker_account_store_path=account_store_path,
+    )
+    symbol = Symbol("NVDA", "US")
+    store = VirtualSleeveAccountStore(account_store_path, default_cash_by_sleeve={"LEaps": 1_000})
+    store.initialize_sleeve("LEaps", cash=700)
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="fill-1",
+            order_id="order-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=1,
+            fill_price=100.0,
+            filled_at=datetime(2026, 5, 9, 9, 0),
+        )
+    )
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbols = [symbol, Symbol("MSFT", "US"), Symbol("IBM", "US")]
+    live_provider = FakeLiveProvider({item.key: _bar(item, 100 + index) for index, item in enumerate(symbols)})
+
+    runtime = bootstrap_sleeve_runtime(
+        snapshot,
+        "LEaps",
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
+            history_provider_factory=lambda: FakeHistoryProvider(),
+            alpha_loader=FakeAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+        ),
+        held_symbols=(symbol,),
+    )
+    report = runtime.run_once()
+
+    assert isinstance(runtime.portfolio_provider, VirtualSleeveAccountStore)
+    assert runtime.portfolio.cash == 600
+    assert runtime.portfolio.quantity(symbol) == 1
+    assert report.portfolio_state is not None
+    assert report.portfolio_state.current.cash == 600
 
 
 def test_runtime_logs_agent_readable_engine_status(tmp_path, caplog):

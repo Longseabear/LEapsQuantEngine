@@ -12,6 +12,8 @@ from leaps_quant_engine.universe.selection import (
 MAX_NORMALIZED_VOLATILITY = 0.18
 EXTREME_NORMALIZED_VOLATILITY = 0.24
 HIGH_VOL_MOMENTUM_EXCEPTION = 0.45
+SECTOR_RELATIVE_STRENGTH_WEIGHT = 0.20
+TREND_STRENGTH_WEIGHT = 0.08
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,9 @@ class StockMomentumSelectionModel:
                 continue
             close = _first_value(context, symbol.key, ("identity_close", "close"))
             momentum = _first_value(context, symbol.key, ("momentum_20_close", "roc_20_close", "momentum_5_close", "momentum_2_close"))
+            momentum_5 = _first_value(context, symbol.key, ("momentum_5_close", "momentum_2_close"))
+            momentum_60 = _first_value(context, symbol.key, ("roc_60_close", "momentum_60_close"))
+            slow_average = _first_value(context, symbol.key, ("sma_20_close",))
             liquidity = _first_value(context, symbol.key, ("rolling_dollar_volume_20", "dollar_volume_2", "dollar_volume_1"))
             volatility = _normalized_volatility(context, symbol.key, close)
             if close is None:
@@ -50,27 +55,68 @@ class StockMomentumSelectionModel:
                 rejected[symbol.key] = ("volatility_filter",)
                 continue
             momentum_score = momentum if momentum is not None else 0.0
+            recent_momentum = momentum_5 if momentum_5 is not None else 0.0
+            intermediate_momentum = momentum_60 if momentum_60 is not None else momentum_score
+            recency_weighted_momentum = (
+                (momentum_score * 0.50)
+                + (recent_momentum * 0.30)
+                + (intermediate_momentum * 0.20)
+            )
+            trend_strength = 0.0 if slow_average is None or slow_average <= 0 else (close / slow_average) - 1.0
             liquidity_score = 0.0 if liquidity is None else min(liquidity / 1_000_000_000.0, 1.0)
-            score = momentum_score + (liquidity_score * 0.05) - min(volatility, 0.35) * 0.20
-            scored.append((score, symbol, close, momentum, liquidity, volatility))
+            sector = _sector_for(context, symbol.key)
+            scored.append(
+                {
+                    "symbol": symbol,
+                    "close": close,
+                    "momentum": momentum_score,
+                    "momentum_5": recent_momentum,
+                    "momentum_60": intermediate_momentum,
+                    "recency_weighted_momentum": recency_weighted_momentum,
+                    "trend_strength": trend_strength,
+                    "liquidity": liquidity,
+                    "liquidity_score": liquidity_score,
+                    "volatility": volatility,
+                    "sector": sector,
+                }
+            )
+
+        sector_strength = _sector_relative_strength(scored)
+        for item in scored:
+            sector_score = sector_strength.get(str(item["sector"]), 0.0)
+            item["sector_relative_strength"] = sector_score
+            item["score"] = (
+                float(item["recency_weighted_momentum"])
+                + (sector_score * SECTOR_RELATIVE_STRENGTH_WEIGHT)
+                + (max(float(item["trend_strength"]), 0.0) * TREND_STRENGTH_WEIGHT)
+                + (float(item["liquidity_score"]) * 0.05)
+                - min(float(item["volatility"]), 0.35) * 0.20
+            )
 
         selected = tuple(
-            item[1]
-            for item in sorted(scored, key=lambda item: (item[0], item[1].key), reverse=True)[: self.max_active_symbols]
+            item["symbol"]
+            for item in sorted(scored, key=lambda item: (float(item["score"]), item["symbol"].key), reverse=True)[: self.max_active_symbols]
         )
         selected_keys = {symbol.key for symbol in selected}
-        for score, symbol, close, momentum, liquidity, volatility in scored:
+        for item in scored:
+            symbol = item["symbol"]
             candidates[symbol.key] = UniverseSelectionCandidate(
                 symbol=symbol,
-                score=score,
+                score=float(item["score"]),
                 selected=symbol.key in selected_keys,
                 forced=symbol.key in context.forced_symbol_keys,
                 reasons=("stock_momentum_candidate",),
                 metadata={
-                    "close": close,
-                    "momentum": momentum,
-                    "liquidity": liquidity,
-                    "volatility": volatility,
+                    "close": item["close"],
+                    "momentum": item["momentum"],
+                    "momentum_5": item["momentum_5"],
+                    "momentum_60": item["momentum_60"],
+                    "recency_weighted_momentum": item["recency_weighted_momentum"],
+                    "sector": item["sector"],
+                    "sector_relative_strength": item["sector_relative_strength"],
+                    "trend_strength": item["trend_strength"],
+                    "liquidity": item["liquidity"],
+                    "volatility": item["volatility"],
                     "volatility_filter": "passed",
                 },
             )
@@ -122,3 +168,23 @@ def _is_etf(context: UniverseSelectionContext, symbol_key: str) -> bool:
         return True
     value = properties.get("is_etf")
     return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _sector_for(context: UniverseSelectionContext, symbol_key: str) -> str:
+    properties = context.universe.properties_for(symbol_key)
+    sector = str(properties.get("sector") or properties.get("industry") or "unknown").strip().lower()
+    return sector or "unknown"
+
+
+def _sector_relative_strength(scored: list[dict[str, object]]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for item in scored:
+        sector = str(item["sector"])
+        totals[sector] = totals.get(sector, 0.0) + float(item["recency_weighted_momentum"])
+        counts[sector] = counts.get(sector, 0) + 1
+    return {
+        sector: totals[sector] / counts[sector]
+        for sector in totals
+        if counts.get(sector, 0) > 0
+    }

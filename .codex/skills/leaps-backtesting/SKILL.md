@@ -131,8 +131,29 @@ If insights are zero, check warmup, indicator readiness, active/forced universe,
 market calendar gating, and missing fundamentals.
 
 If insights exist but orders are zero, check portfolio cadence, persisted
-targets, current holdings, cash, whole-share rounding, risk/guard decisions, and
-execution constraints.
+targets, `portfolio_target_batch.metadata.portfolio_blend`, current holdings,
+cash, whole-share rounding, risk/guard decisions, and execution constraints.
+
+When Portfolio Blend is enabled, a raw target change can be intentionally
+converted into a smaller blended target until progress reaches 100%. Explicit
+flat/down, stop, urgent, manual, operator, force, or risk tags should appear in
+`bypassed_symbols` and should not be delayed.
+
+## Live-State Sandbox Probe
+
+When testing new engine/model code against real live runtime state during market
+hours, do not write to the live SQLite state DB. Fork it first:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-state-fork `
+  --source data/runtime/runtime-state/live_multi_sleeve.sqlite `
+  --target data/runtime/runtime-state/sandbox/probe.sqlite `
+  --overwrite
+```
+
+Point `runtime-run-once`, `runtime-run-multi-once`, or a diagnostic replay at
+the sandbox path. Omit `--runtime-state-read-only` only on the sandbox DB when
+the goal is to inspect model `StatePatch` writes.
 
 ## Fundamentals
 

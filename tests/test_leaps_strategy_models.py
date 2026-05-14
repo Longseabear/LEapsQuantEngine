@@ -11,6 +11,7 @@ from leaps_quant_engine.framework.risk import RiskManagementContext
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Holding, Portfolio
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, RuntimeModelStateView, StatePatch
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
 from leaps_quant_engine.universe.loader import parse_universe_definition
 from leaps_quant_engine.universe.selection import UniverseSelectionContext
@@ -37,6 +38,9 @@ def test_kospi_conviction_alpha_emits_krw_growth_only():
     assert insights[0].metadata["role"] == "krw_growth_engine"
     assert insights[0].metadata["market_breadth"] == 1.0
     assert insights[0].metadata["market_conviction_bonus"] > 0
+    assert insights[0].metadata["recency_weighted_momentum"] > 0
+    assert insights[0].metadata["sector_relative_strength"] > 0
+    assert insights[0].metadata["entry_timing_setup"] in {"trend", "pullback", "rebreak"}
     assert insights[0].reason == "kospi_conviction_breadth_trend_momentum"
 
 
@@ -57,6 +61,101 @@ def test_leaps_live_alphas_run_every_cycle():
         "sleeves/LEaps/alphas/kospi_pullback_reversion.py": "every_cycle",
         "sleeves/LEaps/alphas/volatility_trailing_stop.py": "every_cycle",
     }
+
+
+def test_volatility_trailing_stop_uses_model_state_high_watermark():
+    module = _load("sleeves/LEaps/alphas/volatility_trailing_stop.py")
+    now = datetime(2026, 5, 8)
+    symbol_key = "KRX:005930"
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-volatility-trailing-stop",
+                    namespace="trailing_stop",
+                    symbol_key=symbol_key,
+                ),
+                value={"high_watermark_price": 120_000},
+                reason="seed_high_watermark",
+            ),
+        )
+    )
+    snapshot = _snapshot(
+        now,
+        {
+            symbol_key: _values(
+                close=100_000,
+                fast=102_000,
+                slow=95_000,
+                momentum=0.15,
+                momentum_5=0.03,
+                vol=0.05,
+                rolling_high=105_000,
+            )
+        },
+    )
+    context = SnapshotContext.from_indicator_snapshot(
+        snapshot,
+        model_state=state_view,
+    ).with_input_symbols((symbol_key,))
+
+    insights = module.generate(context)
+    patches = module.state_patches(context=context, insights=tuple(insights))
+
+    assert [insight.symbol.key for insight in insights] == [symbol_key]
+    assert insights[0].reason == "volatility_trailing_stop_triggered"
+    assert insights[0].metadata["high_watermark_price"] == 120_000
+    assert insights[0].metadata["rolling_high"] == 105_000
+    assert patches[0].key.model_id == "leaps-volatility-trailing-stop"
+    assert patches[0].key.namespace == "trailing_stop"
+    assert patches[0].value["high_watermark_price"] == 120_000
+    assert patches[0].value["last_price"] == 100_000
+
+
+def test_volatility_trailing_stop_does_not_replace_seeded_high_watermark_with_rolling_high():
+    module = _load("sleeves/LEaps/alphas/volatility_trailing_stop.py")
+    symbol_key = "KRX:006400"
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-volatility-trailing-stop",
+                    namespace="trailing_stop",
+                    symbol_key=symbol_key,
+                ),
+                value={"high_watermark_price": 633_000},
+                reason="seed_high_watermark",
+            ),
+        )
+    )
+    snapshot = _snapshot(
+        datetime(2026, 5, 14, 16, 0),
+        {
+            symbol_key: _values(
+                close=636_000,
+                fast=630_000,
+                slow=620_000,
+                momentum=0.03,
+                momentum_5=0.01,
+                vol=0.08,
+                rolling_high=712_000,
+            )
+        },
+    )
+    context = SnapshotContext.from_indicator_snapshot(
+        snapshot,
+        model_state=state_view,
+    ).with_input_symbols((symbol_key,))
+
+    patches = module.state_patches(context=context, insights=())
+
+    assert patches[0].value["previous_high_watermark_price"] == 633_000
+    assert patches[0].value["rolling_high"] == 712_000
+    assert patches[0].value["high_watermark_price"] == 636_000
 
 
 def test_leaps_rl_constructor_can_be_configured_as_complete_target_portfolio():
@@ -124,7 +223,36 @@ def test_kospi_pullback_reversion_alpha_emits_uptrend_pullbacks_only():
     assert insights[0].reason == "kospi_pullback_reversion_in_uptrend"
     assert insights[0].metadata["role"] == "krw_pullback_reversion"
     assert insights[0].metadata["pullback_depth"] > 0
+    assert insights[0].metadata["entry_setup"] == "pullback"
     assert insights[0].metadata["momentum"] > 0
+
+
+def test_kospi_pullback_reversion_alpha_emits_rebreak_setups():
+    module = _load("sleeves/LEaps/alphas/kospi_pullback_reversion.py")
+    now = datetime(2026, 5, 12)
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:005930": _values(
+                close=100_000,
+                fast=99_500,
+                slow=92_000,
+                momentum=0.18,
+                momentum_5=0.035,
+                vol=0.06,
+                rolling_high=102_000,
+                rolling_low=94_000,
+            ),
+        },
+    )
+
+    insights = module.generate(
+        SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930",))
+    )
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:005930"]
+    assert insights[0].metadata["entry_setup"] == "rebreak"
+    assert insights[0].metadata["pullback_from_high"] < 0.05
 
 
 def test_us_stability_alpha_prefers_defensive_us_etfs():
@@ -206,6 +334,41 @@ def test_stock_momentum_selection_rejects_high_volatility_without_exception():
 
     assert [symbol.key for symbol in result.selected_symbols] == ["KRX:000660"]
     assert result.rejected["KRX:005930"] == ("volatility_filter",)
+
+
+def test_stock_momentum_selection_boosts_leading_sectors():
+    module = _load("sleeves/LEaps/selections/stock_momentum.py")
+    now = datetime(2026, 5, 8)
+    universe = parse_universe_definition(
+        {
+            "id": "kr-sector-test",
+            "market": "KRX",
+            "symbols": [
+                {"ticker": "005930", "market": "KRX", "asset_type": "stock", "sector": "technology"},
+                {"ticker": "000660", "market": "KRX", "asset_type": "stock", "sector": "technology"},
+                {"ticker": "068270", "market": "KRX", "asset_type": "stock", "sector": "health_care"},
+            ],
+        }
+    )
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:005930": _values(close=80_000, fast=82_000, slow=75_000, momentum=0.06, momentum_5=0.03, momentum_60=0.10, vol=0.03),
+            "KRX:000660": _values(close=150_000, fast=160_000, slow=120_000, momentum=0.50, momentum_5=0.12, momentum_60=0.40, vol=0.04),
+            "KRX:068270": _values(close=200_000, fast=205_000, slow=190_000, momentum=0.08, momentum_5=0.03, momentum_60=0.08, vol=0.03),
+        },
+    )
+
+    result = module.StockMomentumSelectionModel(max_active_symbols=2).select(
+        UniverseSelectionContext(sleeve_id="LEaps", universe=universe, indicator_snapshot=snapshot)
+    )
+
+    assert [symbol.key for symbol in result.selected_symbols] == ["KRX:000660", "KRX:005930"]
+    assert result.candidates["KRX:005930"].metadata["sector"] == "technology"
+    assert (
+        result.candidates["KRX:005930"].metadata["sector_relative_strength"]
+        > result.candidates["KRX:068270"].metadata["sector_relative_strength"]
+    )
 
 
 def test_kospi_growth_us_hedge_risk_applies_currency_limits():
@@ -593,6 +756,7 @@ def _values(
     momentum: float,
     momentum_5: float,
     vol: float,
+    momentum_60: float | None = None,
     rolling_high: float | None = None,
     rolling_low: float | None = None,
 ) -> dict[str, float]:
@@ -602,6 +766,7 @@ def _values(
         "ema_8_close": fast,
         "sma_20_close": slow,
         "roc_20_close": momentum,
+        "roc_60_close": momentum if momentum_60 is None else momentum_60,
         "momentum_5_close": momentum_5,
         "stddev_20_close": close * vol,
         "atr_14": close * vol,

@@ -39,7 +39,8 @@ flowchart LR
     Snapshot --> Alpha["AlphaRuntime<br/>per-alpha cadence"]
     Alpha --> InsightManager["InsightManager<br/>active until expiry"]
     InsightManager --> Portfolio["PortfolioConstruction<br/>rebalance cadence"]
-    Portfolio --> Sizing["OrderSizing"]
+    Portfolio --> Blend["PortfolioBlend<br/>optional target transition"]
+    Blend --> Sizing["OrderSizing"]
     Sizing --> Risk["Risk every cycle"]
     Risk --> Execution["Execution every cycle"]
 ```
@@ -77,6 +78,37 @@ Provider defaults:
 
 This means a live snapshot cannot accidentally advance a confirmed daily
 momentum or SMA window.
+
+## Indicator Readiness
+
+Universe indicator definitions may mark a feature as optional for warmup:
+
+```json
+{
+  "name": "roc_60_close",
+  "type": "roc",
+  "period": 60,
+  "field": "close",
+  "resolution": "daily",
+  "readiness": "optional"
+}
+```
+
+Working rules:
+
+- `readiness="required"` is the default and participates in
+  `required_warmup_bars`, symbol readiness, and `warmup_not_ready` entry
+  gating.
+- Legacy-style `required_for_warmup: false` is accepted as an alias for
+  `readiness="optional"` when loading universe JSON.
+- `readiness="optional"` indicators are still registered and updated when
+  history exists, but they do not block live entries or warmup readiness by
+  themselves.
+- Warmup reports include required and optional readiness counts separately, so
+  operators can distinguish a hard readiness failure from a missing research
+  feature.
+- Models should treat optional indicators as nullable context and fall back to
+  shorter-horizon signals when the value is absent.
 
 ## Alpha Cadence
 
@@ -161,6 +193,61 @@ targets. This gives the engine a stable target state instead of interpreting
 "no new daily alpha this minute" as "sell everything", while still responding
 to fills, cash changes, and price/equity changes.
 
+## Portfolio Blend
+
+Portfolio Blend is an optional operational transition layer after raw portfolio
+construction and before order sizing.
+
+It is meant for this situation:
+
+```text
+old committed target snapshot -> new raw target snapshot
+```
+
+It is not implemented as "run old Python model plus new Python model." The
+engine stores the previous committed target percentages, compares them to the
+current raw `PortfolioTargetBatch`, and linearly moves from the old weights to
+the new weights over `portfolio.blend.duration_minutes`.
+
+Runtime config:
+
+```json
+{
+  "portfolio": {
+    "blend": {
+      "enabled": true,
+      "duration_minutes": 300,
+      "target_drift_threshold_pct": 0.08,
+      "clock": "orderable_session",
+      "missing_target_behavior": "drop"
+    }
+  }
+}
+```
+
+Working rules:
+
+- `target_drift_threshold_pct` is an L1 target-weight drift threshold. A 4%
+  decrease in one symbol and 4% increase in another is `0.08`.
+- `clock="orderable_session"` advances only when the current market session is
+  orderable. `regular_session` requires regular market open, and `wall_time`
+  advances on elapsed cycle timestamps.
+- Active blend state is written through runtime state under
+  `engine-portfolio-blend / active_transition`.
+- `FrameworkRunner` can advance an active blend on non-due portfolio cadence
+  cycles without re-running the portfolio model.
+- Tags containing `:flat`, `:down`, `stop`, `urgent`, `manual`, `operator`,
+  `force`, or `risk` bypass the blend for that symbol. These exits should not
+  be slowed by an operational transition.
+- `missing_target_behavior="drop"` preserves the existing v0 meaning of an
+  omitted target: no new target is emitted. Models that want a smooth exit must
+  emit an explicit 0% target.
+- `missing_target_behavior="zero"` is available for complete-portfolio
+  allocators that want removed targets to fade toward 0%.
+
+Order sizing still recomputes quantities from the blended percentages, current
+virtual account, current cash/equity, and current prices every cycle.
+
 ## Process Boundary State
 
 The current live PowerShell order loop starts a fresh Python process for each
@@ -202,6 +289,10 @@ py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_mult
 Framework state answers "what target thesis is currently active?" Runtime
 model state answers "what stateful model memory should survive restart?" Keep
 them separate.
+
+Portfolio Blend uses runtime model state for active transition progress. The
+framework state still persists the latest target batch so reporting and
+cadence reuse stay readable across process boundaries.
 
 ## Market Session Gate
 
@@ -262,6 +353,9 @@ LEaps alpha:
 LEaps portfolio:
   rl_ppo_constructor.py
   rebalance.cadence = every_5_minutes
+  blend.enabled = true
+  blend.duration_minutes = 300
+  blend.clock = orderable_session
 
 LEaps indicators:
   configs/universes/leaps_kr_research_core.json

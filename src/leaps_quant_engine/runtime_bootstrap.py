@@ -21,6 +21,8 @@ from leaps_quant_engine.execution_model_loader import PythonExecutionModelLoader
 from leaps_quant_engine.framework import (
     FrameworkCycleResult,
     FrameworkRunner,
+    PortfolioBlendEngine,
+    PortfolioBlendPolicy,
     PortfolioConstructionEngine,
     PythonPortfolioConstructionModelLoader,
     PythonRiskManagementModelLoader,
@@ -452,6 +454,7 @@ def bootstrap_sleeve_runtime(
     history_provider = deps.history_provider_factory()
     alpha_runtime = _build_alpha_runtime(snapshot, sleeve_config, deps.alpha_loader)
     portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
+    portfolio_blend_engine = _build_portfolio_blend_engine(sleeve_config)
     risk_model = _build_risk_model(snapshot, sleeve_config, deps.risk_model_loader)
     execution_engine = _build_execution_engine(snapshot, sleeve_config, deps.execution_model_loader)
     selection_models = _build_selection_models(sleeve_config.universe.active, sleeve_config, snapshot)
@@ -476,6 +479,7 @@ def bootstrap_sleeve_runtime(
         sleeve_id=sleeve_config.sleeve_id,
         alpha_runtime=alpha_runtime,
         portfolio_engine=portfolio_engine,
+        portfolio_blend_engine=portfolio_blend_engine,
         risk_model=risk_model,
         execution_engine=execution_engine,
         runtime_state_store=deps.runtime_state_store,
@@ -617,6 +621,22 @@ def _build_portfolio_engine(
     )
 
 
+def _build_portfolio_blend_engine(sleeve_config: SleeveRuntimeConfig) -> PortfolioBlendEngine | None:
+    blend_config = sleeve_config.portfolio.blend
+    if not blend_config.enabled:
+        return None
+    return PortfolioBlendEngine(
+        policy=PortfolioBlendPolicy(
+            enabled=blend_config.enabled,
+            duration_minutes=blend_config.duration_minutes,
+            target_drift_threshold_pct=blend_config.target_drift_threshold_pct,
+            clock=blend_config.clock,
+            missing_target_behavior=blend_config.missing_target_behavior,
+            bypass_target_tag_tokens=blend_config.bypass_target_tag_tokens,
+        )
+    )
+
+
 def _build_risk_model(
     snapshot: RuntimeConfigSnapshot,
     sleeve_config: SleeveRuntimeConfig,
@@ -661,7 +681,8 @@ def _build_portfolio_provider(
     snapshot: RuntimeConfigSnapshot,
     sleeve_config: SleeveRuntimeConfig,
 ) -> PortfolioProvider:
-    if sleeve_config.portfolio.account_store_path is None:
+    account_store_path = _portfolio_account_store_path(snapshot, sleeve_config)
+    if account_store_path is None:
         default_cash_by_sleeve = {
             sleeve.sleeve_id: sleeve.cash
             for sleeve in snapshot.config.sleeves
@@ -685,11 +706,29 @@ def _build_portfolio_provider(
         for sleeve in snapshot.config.sleeves
     }
     return VirtualSleeveAccountStore(
-        resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+        resolve_runtime_path(snapshot, account_store_path),
         default_cash_by_sleeve=default_cash_by_sleeve,
         default_cash_by_currency_by_sleeve=default_cash_by_currency_by_sleeve,
         default_currency=default_currency,
     )
+
+
+def _portfolio_account_store_path(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_config: SleeveRuntimeConfig,
+) -> Path | None:
+    if sleeve_config.broker_account_id:
+        try:
+            return snapshot.config.broker_account(sleeve_config.broker_account_id).account_store_path
+        except KeyError:
+            return sleeve_config.portfolio.account_store_path
+    routes = dict(getattr(sleeve_config, "broker_account_routes", {}) or {})
+    if len(set(routes.values())) == 1:
+        try:
+            return snapshot.config.broker_account(next(iter(routes.values()))).account_store_path
+        except KeyError:
+            return sleeve_config.portfolio.account_store_path
+    return sleeve_config.portfolio.account_store_path
 
 
 def _build_selection_model(

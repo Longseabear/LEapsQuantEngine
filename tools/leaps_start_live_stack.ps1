@@ -4,7 +4,8 @@ param(
     [string]$IncludeLeapsLiveLoop = "false",
     [string]$IncludeUsLiveLoop = "false",
     [string]$IncludeReports = "true",
-    [string]$IncludeEodScheduler = "true"
+    [string]$IncludeEodScheduler = "true",
+    [string]$SeedRuntimeState = "true"
 )
 
 $ErrorActionPreference = "Continue"
@@ -70,8 +71,25 @@ $includeLeapsLiveLoopEnabled = Test-FlagEnabled $IncludeLeapsLiveLoop
 $includeUsLiveLoopEnabled = Test-FlagEnabled $IncludeUsLiveLoop
 $includeReportsEnabled = Test-FlagEnabled $IncludeReports
 $includeEodSchedulerEnabled = Test-FlagEnabled $IncludeEodScheduler
+$seedRuntimeStateEnabled = Test-FlagEnabled $SeedRuntimeState
 
-Write-StartupLog "startup begin include_live_loops=$includeLiveLoopsEnabled include_multi_live=$includeMultiSleeveLiveLoopEnabled include_leaps_live=$includeLeapsLiveLoopEnabled include_us_live=$includeUsLiveLoopEnabled include_reports=$includeReportsEnabled include_eod_scheduler=$includeEodSchedulerEnabled"
+Write-StartupLog "startup begin include_live_loops=$includeLiveLoopsEnabled include_multi_live=$includeMultiSleeveLiveLoopEnabled include_leaps_live=$includeLeapsLiveLoopEnabled include_us_live=$includeUsLiveLoopEnabled include_reports=$includeReportsEnabled include_eod_scheduler=$includeEodSchedulerEnabled seed_runtime_state=$seedRuntimeStateEnabled"
+
+if ($seedRuntimeStateEnabled) {
+    $env:PYTHONPATH = "src"
+    $seedArgs = @(
+        "-3", "-m", "leaps_quant_engine.cli", "runtime-state-seed-trailing-stop",
+        "configs/runtime/live_multi_sleeve.json",
+        "--sleeve-id", "LEaps",
+        "--account-store", (Join-Path $Root "data/virtual-accounts/kis_domestic.json"),
+        "--runtime-state", (Join-Path $Root "data/runtime/runtime-state/live_multi_sleeve.sqlite"),
+        "--summary-only"
+    )
+    $seedOutput = py @seedArgs 2>&1
+    $seedExit = $LASTEXITCODE
+    $seedOutput | Add-Content -Path $LogPath -Encoding UTF8
+    Write-StartupLog "runtime-state seed exit=$seedExit sleeve=LEaps"
+}
 
 if ($includeLiveLoopsEnabled -and $includeMultiSleeveLiveLoopEnabled) {
     Start-StackProcess `
@@ -89,6 +107,7 @@ if ($includeLiveLoopsEnabled -and $includeMultiSleeveLiveLoopEnabled) {
             "-Journal", "data/cycle-journal/live_multi_sleeve.jsonl",
             "-LogPath", "data/runtime/live-order-loop/multi_sleeve.log",
             "-FrameworkStateDir", "data/runtime/framework-state/multi-sleeve",
+            "-RuntimeStatePath", "data/runtime/runtime-state/live_multi_sleeve.sqlite",
             "-SubmitStatePath", "data/runtime/live-order-loop/multi_sleeve_submit_state.json",
             "-ControlQueue", "data/runtime/control/live.jsonl",
             "-ActiveSleevesPath", "data/runtime/live-order-loop/multi_sleeve_active_sleeves.json",
@@ -114,6 +133,7 @@ if ($includeLiveLoopsEnabled -and $includeLeapsLiveLoopEnabled) {
             "-Journal", "data/cycle-journal/live_multi_sleeve.jsonl",
             "-LogPath", "data/runtime/live-order-loop/LEaps.log",
             "-SubmitStatePath", "data/runtime/live-order-loop/LEaps_submit_state.json",
+            "-RuntimeStatePath", "data/runtime/runtime-state/live_multi_sleeve.sqlite",
             "-SubmitOncePerDay", "true",
             "-StaleAfterSeconds", "300",
             "-CancelStaleOpenTickets", "true",
@@ -137,6 +157,7 @@ if ($includeLiveLoopsEnabled -and $includeUsLiveLoopEnabled) {
             "-Journal", "data/cycle-journal/us_etf_rotation.jsonl",
             "-LogPath", "data/runtime/live-order-loop/us_etf_rotation.log",
             "-SubmitStatePath", "data/runtime/live-order-loop/us_etf_rotation_submit_state.json",
+            "-RuntimeStatePath", "data/runtime/runtime-state/live_multi_sleeve.sqlite",
             "-SubmitOncePerDay", "true",
             "-StaleAfterSeconds", "900",
             "-CancelStaleOpenTickets", "true",

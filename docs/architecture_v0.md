@@ -43,7 +43,8 @@ flowchart LR
     Alpha --> Insights["InsightBatch"]
     Insights --> Manager["InsightManager"]
     Manager --> PC["PortfolioConstructionModel"]
-    PC --> TargetPlan["PortfolioTargetPlan<br/>current -> target -> delta"]
+    PC --> Blend["PortfolioBlendEngine<br/>optional target transition"]
+    Blend --> TargetPlan["PortfolioTargetPlan<br/>current -> target -> delta"]
     TargetPlan --> Risk["RiskManagementModel"]
     Risk --> ExecModel["ExecutionModel"]
     ExecModel --> OrderIntent["OrderIntent"]
@@ -90,6 +91,10 @@ flowchart LR
 - Cash follows the same projection rule. KIS balance is stored as an account cash snapshot. Strategy sleeve cash is internal allocation state, and the residual broker cash is assigned to `default sleeve`. Explicit cash transfers move cash between virtual sleeves without touching broker state. A negative sleeve cash balance is allowed as an operational signal that positions were allocated before funding was moved.
 - Operationally, account sync should be incremental and projection-based. Old broker fills remain audit history, but runtime cycles should read the materialized sleeve portfolio, fill allocation status, and reconciliation report instead of replaying the entire execution history. If the raw ledger grows large, reconciled historical fills can be archived behind a position checkpoint while preserving open/unallocated fills and the current sleeve projections.
 - `EqualWeightPortfolioConstructionModel` converts active up insights plus the sleeve portfolio projection into quantity targets and can emit flatten targets when held or previously managed symbols lose active insight support.
+- `PortfolioBlendEngine` can optionally transition from the previous committed
+  allocation target snapshot to the current raw target snapshot before order
+  sizing. It stores only compact transition state and does not run old and new
+  portfolio models at the same time.
 - `PortfolioTargetPlan` records current quantity/value, target quantity/value, and delta so Risk can reason about entries, exits, and rebalances.
 - `PortfolioEngineState` is the v0 read model for the portfolio engine. It does not mutate holdings; it summarizes the current virtual sleeve portfolio, target state, risk state, and pending order intents from a deterministic framework cycle.
 - `PassThroughRiskManagementModel` proves the risk stage contract while leaving real risk gates for the next slice.

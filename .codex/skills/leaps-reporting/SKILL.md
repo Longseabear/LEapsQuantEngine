@@ -43,6 +43,8 @@ py -3 tools/leaps_portfolio_report.py --config configs/runtime/live_multi_sleeve
 
 This is read-only. It builds a current-vs-target quantity report for one sleeve
 and sends it through `notify-user-message` when `--notify` is present.
+The default message layout is mobile-first stacked text. Use `--layout table`
+only for temporary desktop diagnostics.
 
 The report must include:
 
@@ -51,7 +53,11 @@ The report must include:
 - order candidate count for this cycle
 - per-symbol current quantity, target quantity, and delta
 - risk status/reason for rejected or clamped targets
+- portfolio blend status/progress when
+  `portfolio_target_batch.metadata.portfolio_blend` is present
 - market price and average price for held positions
+- current holding unrealized PnL, cumulative FIFO realized PnL estimate, and
+  their combined estimate when both are present
 
 For the live Telegram process, use a phase schedule rather than hourly spam:
 
@@ -192,6 +198,9 @@ data/runtime/live-order-loop/multi_sleeve.log
 Report whether the event was:
 
 - strategy intended: alpha/portfolio/risk/execution agree
+- operational transition: Portfolio Blend is moving from a previous target
+  snapshot toward a new raw target; include progress, duration, and bypassed
+  symbols
 - risk/guard blocked: target exists but rejected or clamped
 - operational: stale snapshot, unsupported route, open-ticket issue
 - bug-like: state transition or target persistence produced unintended orders
@@ -201,6 +210,23 @@ Report whether the event was:
 Use Korean operator wording when reporting to the user or Telegram. Keep it
 compact and concrete. For live reports, prioritize quantities and order status
 over prose.
+
+Use the mobile-first layout by default. Avoid pipe tables in routine Telegram
+portfolio reports because they wrap poorly on phones. Prefer one short block per
+symbol:
+
+```text
+- 삼성전자 (005930)
+  수량 12주 -> 12주 (유지)
+  현재 296,000 / 평단 277,293 / 평가 3,552,000
+  미실현 +224,481 6.7%
+  누적실현 -115,750 / 보유+누적 +108,731
+```
+
+Call realized PnL `누적 실현 추정` or `누적실현`, not just `실현`, because
+the helper reconstructs it from the virtual account fill ledger using FIFO.
+This prevents old closed lots from being confused with the currently held
+position's PnL.
 
 Do not show a missing target for a held position as `target 0` unless there is
 an explicit sell/exit target or approved risk decision to zero. If a current

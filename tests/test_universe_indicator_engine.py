@@ -43,6 +43,28 @@ def test_parse_universe_definition_accepts_symbol_metadata_for_mixed_exchanges()
     assert universe.properties_for(universe.symbols[1])["exchange"] == "NYS"
 
 
+def test_parse_universe_definition_accepts_optional_indicator_readiness():
+    universe = parse_universe_definition(
+        {
+            "id": "test",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [
+                {"name": "sma_3_close", "type": "sma", "period": 3},
+                {"name": "roc_60_close", "type": "roc", "period": 60, "readiness": "optional"},
+                {"name": "roc_120_close", "type": "roc", "period": 120, "required_for_warmup": False},
+            ],
+        }
+    )
+
+    assert universe.indicators[0].readiness == "required"
+    assert universe.indicators[0].required_for_warmup is True
+    assert universe.indicators[1].readiness == "optional"
+    assert universe.indicators[1].required_for_warmup is False
+    assert universe.indicators[2].readiness == "optional"
+    assert universe.indicators[2].required_for_warmup is False
+
+
 def test_indicator_engine_registers_universe_and_updates_only_active_symbols():
     universe = parse_universe_definition(
         {

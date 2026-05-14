@@ -104,6 +104,7 @@ Use KIS for:
 
 - broker-truth live quotes when needed
 - orderbook/time-and-sales for symbols close to action
+- title-level domestic/overseas news snapshots for operator or agent context
 - account/holdings/orders/fills
 - historical KIS data when it is specifically required
 
@@ -150,6 +151,16 @@ Current new-engine adapters and snapshot path:
 - `leaps_quant_engine.backtesting.VirtualMarketDataProvider`
 - `leaps_quant_engine.market_data_snapshot.MarketDataSnapshotEngine`
 - `leaps_quant_engine.snapshots.IndicatorSnapshotStore`
+
+`KISDirectClient` also exposes read-only KIS news-title operations:
+
+- `get_domestic_news_titles`
+- `get_overseas_news_titles`
+- `get_overseas_breaking_news_titles`
+
+They normalize KIS title rows into provider-neutral dictionaries while keeping
+the original row in `raw_output`. These records are news context, not engine
+orders or alpha decisions.
 
 Live quote flow:
 

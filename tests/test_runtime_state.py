@@ -11,6 +11,7 @@ from leaps_quant_engine.runtime_state import (
     SQLiteRuntimeStateStore,
     StatePatch,
     StatePatchOperation,
+    fork_sqlite_runtime_state,
 )
 
 
@@ -151,6 +152,44 @@ def test_sqlite_runtime_state_store_namespaces_same_symbol_by_position(tmp_path)
     assert store.get(first).value["high_watermark_price"] == 280000
     assert store.get(second).value["high_watermark_price"] == 290000
     assert len(store.entries(symbol_key="KRX:005930")) == 2
+
+
+def test_fork_sqlite_runtime_state_uses_consistent_backup_snapshot(tmp_path):
+    source_path = tmp_path / "live.sqlite"
+    target_path = tmp_path / "sandbox" / "fork.sqlite"
+    source = SQLiteRuntimeStateStore(source_path)
+    key = ModelStateKey(
+        sleeve_id="LEaps",
+        model_id="trailing_stop",
+        namespace="trailing_stop",
+        symbol_key="KRX:005930",
+    )
+    source.apply_patches((StatePatch(key=key, value={"high_watermark_price": 85000}),))
+
+    report = fork_sqlite_runtime_state(source_path, target_path)
+
+    assert report.status == "forked"
+    assert report.record_count == 1
+    assert report.event_count == 1
+    assert report.source == source_path.resolve()
+    assert report.target == target_path.resolve()
+    forked = SQLiteRuntimeStateStore(target_path)
+    assert forked.get(key).value["high_watermark_price"] == 85000
+
+
+def test_fork_sqlite_runtime_state_refuses_to_overwrite_by_default(tmp_path):
+    source_path = tmp_path / "live.sqlite"
+    target_path = tmp_path / "sandbox.sqlite"
+    source = SQLiteRuntimeStateStore(source_path)
+    key = ModelStateKey(sleeve_id="LEaps", model_id="trailing_stop")
+    source.apply_patches((StatePatch(key=key, value={"last_price": 100}),))
+    fork_sqlite_runtime_state(source_path, target_path)
+
+    with pytest.raises(FileExistsError):
+        fork_sqlite_runtime_state(source_path, target_path)
+
+    report = fork_sqlite_runtime_state(source_path, target_path, overwrite=True)
+    assert report.target == target_path.resolve()
 
 
 def test_state_patch_requires_values_for_set_and_merge():

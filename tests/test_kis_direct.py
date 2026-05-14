@@ -111,6 +111,35 @@ class _FakeSession:
                 output[f"bidp{level}"] = str(289000 - level * 100)
                 output[f"bidp_rsqn{level}"] = str(level + 1)
             return _FakeResponse({"rt_cd": "0", "output1": output})
+        if url.endswith("/uapi/domestic-stock/v1/quotations/news-title"):
+            return _FakeResponse(
+                {
+                    "rt_cd": "0",
+                    "output": [
+                        {
+                            "cntt_usiq_srno": "123",
+                            "news_ofer_entp_code": "2",
+                            "data_dt": "20260514",
+                            "data_tm": "093001",
+                            "hts_pbnt_titl_cntt": "삼성전자 실적 발표",
+                            "news_lrdv_code": "01",
+                            "dorg": "KIS",
+                            "iscd1": "005930",
+                            "iscd2": "",
+                        },
+                        {
+                            "cntt_usiq_srno": "124",
+                            "news_ofer_entp_code": "2",
+                            "data_dt": "20260514",
+                            "data_tm": "093201",
+                            "hts_pbnt_titl_cntt": "시장 시황",
+                            "news_lrdv_code": "02",
+                            "dorg": "KIS",
+                            "iscd1": "",
+                        },
+                    ],
+                }
+            )
         if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
             return _FakeResponse(
                 {
@@ -174,6 +203,47 @@ class _FakeSession:
                             "ft_ccld_amt3": "570.44",
                             "ovrs_excg_cd": "NASD",
                             "tr_crcy_cd": "USD",
+                        }
+                    ],
+                }
+            )
+        if url.endswith("/uapi/overseas-price/v1/quotations/news-title"):
+            return _FakeResponse(
+                {
+                    "rt_cd": "0",
+                    "outblock1": [
+                        {
+                            "info_gb": "1",
+                            "news_key": "us-1",
+                            "data_dt": "20260514",
+                            "data_tm": "221604",
+                            "class_cd": "01",
+                            "class_name": "시장",
+                            "source": "KIS",
+                            "nation_cd": "US",
+                            "exchange_cd": "NAS",
+                            "symb": "NVDA",
+                            "symb_name": "NVIDIA",
+                            "title": "NVIDIA rises after earnings",
+                        }
+                    ],
+                }
+            )
+        if url.endswith("/uapi/overseas-price/v1/quotations/brknews-title"):
+            return _FakeResponse(
+                {
+                    "rt_cd": "0",
+                    "output": [
+                        {
+                            "cntt_usiq_srno": "brk-1",
+                            "news_ofer_entp_code": "0",
+                            "data_dt": "20260514",
+                            "data_tm": "222153",
+                            "hts_pbnt_titl_cntt": "해외 속보 제목",
+                            "news_lrdv_code": "03",
+                            "dorg": "KIS",
+                            "iscd1": "SMH",
+                            "kor_isnm1": "VanEck Semiconductor ETF",
                         }
                     ],
                 }
@@ -415,3 +485,66 @@ def test_direct_kis_domestic_quote_uses_orderbook_when_current_price_is_referenc
     assert result["live_price_usable"] is True
     assert result["orderbook"]["best_ask"] == 290100
     assert any("inquire-asking-price-exp-ccn" in call["url"] for call in session.get_calls)
+
+
+def test_direct_kis_domestic_news_titles_normalizes_rows(tmp_path):
+    _TOKEN_CACHE.clear()
+    session = _FakeSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation(
+        "get_domestic_news_titles",
+        {"symbol": "005930", "date": "2026-05-14", "time": "09:30", "max_results": 1},
+    )
+
+    call = session.get_calls[-1]
+    assert call["url"].endswith("/uapi/domestic-stock/v1/quotations/news-title")
+    assert call["headers"]["tr_id"] == "FHKST01011800"
+    assert call["params"]["FID_INPUT_ISCD"] == "005930"
+    assert call["params"]["FID_INPUT_DATE_1"] == "20260514"
+    assert call["params"]["FID_INPUT_HOUR_1"] == "093000"
+    assert result["market"] == "domestic"
+    assert result["count"] == 1
+    assert result["raw_count"] == 2
+    assert result["items"][0]["title"] == "삼성전자 실적 발표"
+    assert result["items"][0]["symbols"] == ["005930"]
+
+
+def test_direct_kis_overseas_news_titles_normalizes_rows(tmp_path):
+    _TOKEN_CACHE.clear()
+    session = _FakeSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation(
+        "get_overseas_news_titles",
+        {"nation_code": "US", "exchange": "NAS", "symbol": "nvda"},
+    )
+
+    call = session.get_calls[-1]
+    assert call["url"].endswith("/uapi/overseas-price/v1/quotations/news-title")
+    assert call["headers"]["tr_id"] == "HHPSTH60100C1"
+    assert call["params"]["NATION_CD"] == "US"
+    assert call["params"]["EXCHANGE_CD"] == "NAS"
+    assert call["params"]["SYMB"] == "NVDA"
+    assert result["market"] == "overseas"
+    assert result["items"][0]["id"] == "us-1"
+    assert result["items"][0]["symbol"] == "NVDA"
+    assert result["items"][0]["title"] == "NVIDIA rises after earnings"
+
+
+def test_direct_kis_overseas_breaking_news_titles_uses_defaults(tmp_path):
+    _TOKEN_CACHE.clear()
+    session = _FakeSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation("get_overseas_breaking_news_titles", {})
+
+    call = session.get_calls[-1]
+    assert call["url"].endswith("/uapi/overseas-price/v1/quotations/brknews-title")
+    assert call["headers"]["tr_id"] == "FHKST01011801"
+    assert call["params"]["FID_NEWS_OFER_ENTP_CODE"] == "0"
+    assert call["params"]["FID_COND_SCR_DIV_CODE"] == "11801"
+    assert result["market"] == "overseas"
+    assert result["items"][0]["id"] == "brk-1"
+    assert result["items"][0]["symbols"] == ["SMH"]
+    assert result["items"][0]["symbol_names"] == ["VanEck Semiconductor ETF"]

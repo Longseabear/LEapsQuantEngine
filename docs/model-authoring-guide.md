@@ -38,6 +38,9 @@ side effects outside that contract.
   - execution emits order intents
 - Prefer skipping a symbol when required indicator or fundamental data is
   missing. Missing PER/PBR for ETFs is normal.
+- Treat optional indicators as nullable research context. If a universe marks
+  an indicator with `readiness="optional"`, use it when present and fall back
+  when absent; do not make the model assume warmup blocked on that feature.
 - Keep model IDs stable. They are used in insight superseding, logs, journals,
   and runtime wiring.
 
@@ -361,6 +364,20 @@ patch/event counts in the framework result and cycle journal. Live loops must
 pass `--runtime-state` explicitly; without it, state reads return empty and
 patches are reported but not persisted.
 
+When testing a new stateful model against real live state during market hours,
+fork the SQLite runtime DB first:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-state-fork `
+  --source data/runtime/runtime-state/live_multi_sleeve.sqlite `
+  --target data/runtime/runtime-state/sandbox/model_probe.sqlite `
+  --overwrite
+```
+
+Run experiments against the forked DB. Do not replace the live DB with a sandbox
+DB; promote changes through model code, config reload, or an explicit seed
+command.
+
 ## Portfolio Construction Models
 
 Portfolio construction consumes active insights and produces desired allocation
@@ -417,8 +434,15 @@ Notes:
   `OrderSizingEngine` recomputes target share quantities from current virtual
   account state every cycle.
 - If target smoothing is strategic, implement the smoothing policy in the
-  portfolio model and store its anchors with `StatePatch`. The engine should not
-  invent smoothing weights.
+  portfolio model and store its anchors with `StatePatch`. Example: a model that
+  always wants to reduce turnover by partially following yesterday's model
+  weights owns that policy.
+- If target smoothing is operational, use `portfolio.blend`. Example: a model or
+  config changes substantially and the operator wants the sleeve to move from
+  the previous committed target snapshot to the new raw target snapshot over
+  five orderable hours. The model still emits raw desired percentages; the
+  engine-owned `PortfolioBlendEngine` handles the transition before
+  `OrderSizingEngine`.
 - Use `context.active_insights`, `context.portfolio`, and `context.data`.
 - Multi-currency sleeves are bucket-aware. Do not use mixed global equity for
   KRW and USD decisions unless an FX conversion layer is explicitly added later.
@@ -447,10 +471,31 @@ Example:
       "reused_target_churn_max_quantity_delta": 1,
       "reused_target_churn_lot_fraction": 0.5,
       "reused_target_churn_equity_bps": 5
+    },
+    "blend": {
+      "enabled": true,
+      "duration_minutes": 300,
+      "target_drift_threshold_pct": 0.08,
+      "clock": "orderable_session",
+      "missing_target_behavior": "drop"
     }
   }
 }
 ```
+
+Portfolio Blend notes:
+
+- Do not register an "old model" and "new model" together. The old side is the
+  stored target snapshot.
+- Emit explicit 0% targets when a complete-portfolio allocator wants a held
+  symbol to be reduced or closed. With `missing_target_behavior="drop"`, omitted
+  targets remain omitted.
+- Tags containing `:flat`, `:down`, `stop`, `urgent`, `manual`, `operator`,
+  `force`, or `risk` bypass the blend for that symbol, so trailing stops and
+  risk exits are not delayed.
+- Reports and cycle output expose `portfolio_target_batch.metadata.portfolio_blend`
+  with status, progress, transition id, elapsed minutes, duration, drift, and
+  bypassed symbols.
 
 ### Reinforcement Learning Constructors
 

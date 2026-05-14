@@ -7,6 +7,7 @@ This folder owns the LEAN-style framework pipeline after alpha and before concre
 ```text
 InsightManager
   -> PortfolioConstruction
+  -> PortfolioBlend
   -> OrderSizing
   -> RiskManagement
   -> ExecutionModel boundary
@@ -18,6 +19,14 @@ InsightManager
 - Emit `PortfolioAllocationTarget` percentages and desired-value plans.
 - Do not emit integer share quantities as the primary portfolio construction output.
 - Do not mutate holdings, cash, tickets, or virtual accounts.
+
+## Portfolio Blend
+
+- Treat blend as an engine-owned target-transition layer, not a second portfolio model.
+- The old side of a transition is the previous committed target snapshot, not a concurrently loaded old Python model.
+- Store only compact transition state in runtime state: last target weights and active transition progress.
+- Bypass explicit urgent exits such as flat/down/stop/manual/risk tags; do not slow safety exits.
+- Keep order sizing responsible for current quantity recomputation after blended percentages are produced.
 
 ## Order Sizing
 

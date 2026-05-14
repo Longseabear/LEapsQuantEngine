@@ -23,6 +23,18 @@ def _default_currency_for_market_scope(market_scope: str) -> str:
     return "KRW" if market_scope == "domestic" else "USD"
 
 
+DEFAULT_PORTFOLIO_BLEND_BYPASS_TAG_TOKENS = (
+    ":flat",
+    ":down",
+    "stop",
+    "urgent",
+    "manual",
+    "operator",
+    "force",
+    "risk",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ModuleReference:
     ref: str
@@ -242,12 +254,51 @@ class RebalancePolicyRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PortfolioBlendRuntimeConfig:
+    enabled: bool = False
+    duration_minutes: float = 0.0
+    target_drift_threshold_pct: float = 0.0
+    clock: str = "orderable_session"
+    missing_target_behavior: str = "drop"
+    bypass_target_tag_tokens: tuple[str, ...] = DEFAULT_PORTFOLIO_BLEND_BYPASS_TAG_TOKENS
+
+    def __post_init__(self) -> None:
+        _validate_non_negative("portfolio.blend.duration_minutes", self.duration_minutes)
+        _validate_non_negative("portfolio.blend.target_drift_threshold_pct", self.target_drift_threshold_pct)
+        clock = str(self.clock or "orderable_session").strip().lower()
+        if clock not in {"wall_time", "orderable_session", "regular_session"}:
+            raise ConfigurationValidationError(f"Unsupported portfolio.blend.clock: {self.clock}")
+        missing = str(self.missing_target_behavior or "drop").strip().lower()
+        if missing not in {"drop", "zero"}:
+            raise ConfigurationValidationError("portfolio.blend.missing_target_behavior must be 'drop' or 'zero'.")
+        tokens = tuple(
+            str(token).strip().lower()
+            for token in self.bypass_target_tag_tokens
+            if str(token).strip()
+        )
+        object.__setattr__(self, "clock", clock)
+        object.__setattr__(self, "missing_target_behavior", missing)
+        object.__setattr__(self, "bypass_target_tag_tokens", tokens)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "duration_minutes": self.duration_minutes,
+            "target_drift_threshold_pct": self.target_drift_threshold_pct,
+            "clock": self.clock,
+            "missing_target_behavior": self.missing_target_behavior,
+            "bypass_target_tag_tokens": list(self.bypass_target_tag_tokens),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PortfolioRuntimeConfig:
     model: ModuleReference = field(
         default_factory=lambda: ModuleReference("leaps_quant_engine.framework:EqualWeightPortfolioConstructionModel")
     )
     parameters: Mapping[str, Any] = field(default_factory=dict)
     rebalance: RebalancePolicyRuntimeConfig = field(default_factory=RebalancePolicyRuntimeConfig)
+    blend: PortfolioBlendRuntimeConfig = field(default_factory=PortfolioBlendRuntimeConfig)
     account_store_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -258,6 +309,7 @@ class PortfolioRuntimeConfig:
             "model": self.model.to_dict(),
             "parameters": dict(self.parameters),
             "rebalance": self.rebalance.to_dict(),
+            "blend": self.blend.to_dict(),
             "account_store_path": _path_to_config_str(self.account_store_path),
         }
 
@@ -613,6 +665,7 @@ def _parse_portfolio_runtime_config(payload: Mapping[str, Any]) -> PortfolioRunt
         model=_parse_module_reference(raw_model),
         parameters=dict(_object(payload.get("parameters", payload.get("params")), default={})),
         rebalance=_parse_rebalance_policy_runtime_config(_object(payload.get("rebalance"), default={})),
+        blend=_parse_portfolio_blend_runtime_config(_object(payload.get("blend"), default={})),
         account_store_path=_optional_path(payload.get("account_store_path", payload.get("virtual_account_path"))),
     )
 
@@ -644,6 +697,22 @@ def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> Rebala
         reused_target_churn_max_quantity_delta=int(payload.get("reused_target_churn_max_quantity_delta", 1)),
         reused_target_churn_lot_fraction=float(payload.get("reused_target_churn_lot_fraction", 0.5)),
         reused_target_churn_equity_bps=float(payload.get("reused_target_churn_equity_bps", 0.0)),
+    )
+
+
+def _parse_portfolio_blend_runtime_config(payload: Mapping[str, Any]) -> PortfolioBlendRuntimeConfig:
+    raw_tokens = payload.get("bypass_target_tag_tokens", payload.get("bypass_tag_tokens"))
+    if raw_tokens is None:
+        tokens: tuple[str, ...] = DEFAULT_PORTFOLIO_BLEND_BYPASS_TAG_TOKENS
+    else:
+        tokens = tuple(str(item) for item in _list(raw_tokens, default=[]))
+    return PortfolioBlendRuntimeConfig(
+        enabled=bool(payload.get("enabled", False)),
+        duration_minutes=float(payload.get("duration_minutes", payload.get("duration_min", 0.0))),
+        target_drift_threshold_pct=float(payload.get("target_drift_threshold_pct", 0.0)),
+        clock=str(payload.get("clock", "orderable_session")).strip(),
+        missing_target_behavior=str(payload.get("missing_target_behavior", "drop")).strip(),
+        bypass_target_tag_tokens=tokens,
     )
 
 

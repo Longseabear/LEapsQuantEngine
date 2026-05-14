@@ -16,6 +16,7 @@ from leaps_quant_engine.framework.portfolio_construction import (
     PortfolioConstructionModel,
     PortfolioTargetBatch,
 )
+from leaps_quant_engine.framework.portfolio_blend import PortfolioBlendEngine
 from leaps_quant_engine.framework.order_sizing import OrderSizingBatch, OrderSizingContext, OrderSizingEngine
 from leaps_quant_engine.framework.state import FrameworkRunnerState
 from leaps_quant_engine.framework.risk import (
@@ -189,6 +190,7 @@ class FrameworkRunner:
     insight_manager: InsightManager = None  # type: ignore[assignment]
     portfolio_model: PortfolioConstructionModel = None  # type: ignore[assignment]
     portfolio_engine: PortfolioConstructionEngine = None  # type: ignore[assignment]
+    portfolio_blend_engine: PortfolioBlendEngine | None = None
     risk_model: RiskManagementModel = None  # type: ignore[assignment]
     order_sizing_engine: OrderSizingEngine = None  # type: ignore[assignment]
     execution_model: ImmediateExecutionModel = None  # type: ignore[assignment]
@@ -284,21 +286,33 @@ class FrameworkRunner:
             data.time,
             self._last_portfolio_run_at,
         )
+        portfolio_context = PortfolioConstructionContext(
+            sleeve_id=self.sleeve_id,
+            data=data,
+            portfolio=portfolio,
+            active_insights=active_insights,
+            managed_symbols=self.insight_manager.tracked_symbols(self.sleeve_id),
+            model_state=self._model_state_view(),
+        )
         if portfolio_should_run:
-            portfolio_target_batch = self.portfolio_engine.create_targets(
-                PortfolioConstructionContext(
-                    sleeve_id=self.sleeve_id,
-                    data=data,
-                    portfolio=portfolio,
-                    active_insights=active_insights,
-                    managed_symbols=self.insight_manager.tracked_symbols(self.sleeve_id),
-                    model_state=self._model_state_view(),
-                )
+            raw_portfolio_target_batch = self.portfolio_engine.create_targets(portfolio_context)
+            portfolio_target_batch = self._apply_portfolio_blend(
+                portfolio_context,
+                raw_portfolio_target_batch,
+                previous_batch=self._last_portfolio_target_batch,
+                market_session=market_session,
             )
             self._last_portfolio_target_batch = portfolio_target_batch
             self._last_portfolio_run_at = data.time
         else:
-            portfolio_target_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
+            reused_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
+            portfolio_target_batch = self._advance_portfolio_blend(
+                portfolio_context,
+                reused_batch,
+                previous_batch=self._last_portfolio_target_batch,
+                market_session=market_session,
+            )
+            self._last_portfolio_target_batch = portfolio_target_batch
         portfolio_ms = _elapsed_ms(started)
         stage_decisions["portfolio"] = {
             "cadence": portfolio_cadence,
@@ -309,6 +323,7 @@ class FrameworkRunner:
                 if not portfolio_should_run
                 else None
             ),
+            "portfolio_blend": dict(portfolio_target_batch.metadata.get("portfolio_blend") or {}),
         }
 
         started = time.perf_counter()
@@ -400,6 +415,62 @@ class FrameworkRunner:
     def _model_state_view(self) -> RuntimeModelStateView:
         return RuntimeModelStateView(store=self.runtime_state_store, default_sleeve_id=self.sleeve_id)
 
+    def _apply_portfolio_blend(
+        self,
+        context: PortfolioConstructionContext,
+        raw_batch: PortfolioTargetBatch,
+        *,
+        previous_batch: PortfolioTargetBatch | None,
+        market_session: MarketSession | None,
+    ) -> PortfolioTargetBatch:
+        if self.portfolio_blend_engine is None:
+            return raw_batch
+        decision = self.portfolio_blend_engine.apply(
+            context,
+            raw_batch,
+            previous_batch=previous_batch,
+            market_session=market_session,
+        )
+        if decision.targets == raw_batch.targets and not decision.state_patches:
+            if not decision.metadata:
+                return raw_batch
+        return self.portfolio_engine.build_target_batch_from_targets(
+            context,
+            raw_batch,
+            decision.targets,
+            reason=decision.reason or raw_batch.reason,
+            state_patches=(*raw_batch.state_patches, *decision.state_patches),
+            metadata=decision.metadata,
+        )
+
+    def _advance_portfolio_blend(
+        self,
+        context: PortfolioConstructionContext,
+        reused_batch: PortfolioTargetBatch,
+        *,
+        previous_batch: PortfolioTargetBatch | None,
+        market_session: MarketSession | None,
+    ) -> PortfolioTargetBatch:
+        if self.portfolio_blend_engine is None:
+            return reused_batch
+        decision = self.portfolio_blend_engine.advance(
+            context,
+            reused_batch,
+            previous_batch=previous_batch,
+            market_session=market_session,
+        )
+        if decision.targets == reused_batch.targets and not decision.state_patches:
+            if not decision.metadata:
+                return reused_batch
+        return self.portfolio_engine.build_target_batch_from_targets(
+            context,
+            reused_batch,
+            decision.targets,
+            reason=decision.reason or reused_batch.reason,
+            state_patches=decision.state_patches,
+            metadata=decision.metadata,
+        )
+
     def _commit_state_patches(
         self,
         patches: tuple[StatePatch, ...],
@@ -429,4 +500,5 @@ def _reuse_portfolio_target_batch(batch: PortfolioTargetBatch, generated_at: dat
         generated_at=generated_at,
         reason=f"{batch.reason}:reused" if batch.reason else "portfolio_reused",
         metadata=metadata,
+        state_patches=(),
     )

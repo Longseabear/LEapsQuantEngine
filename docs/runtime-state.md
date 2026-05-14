@@ -54,6 +54,19 @@ Model-owned state:
 The engine stores model-owned state, but it does not interpret the strategy
 meaning of that state.
 
+Engine-owned transition state may also use the same storage contract when it is
+small, deterministic, and committed only at cycle boundaries. The current
+example is Portfolio Blend:
+
+- `model_id="engine-portfolio-blend"`
+- `namespace="last_target"` for the last committed raw target weights
+- `namespace="active_transition"` for the active blend id, from/to weights,
+  elapsed minutes, and progress clock
+
+This state is operational, not strategic. Portfolio models still emit raw
+targets; the engine uses the stored transition only to move from the previous
+target snapshot to the new one without a sudden order wave.
+
 ## Current Foundation
 
 The offline foundation lives in
@@ -152,6 +165,47 @@ py -3 -m leaps_quant_engine.cli runtime-run-multi-once `
   --runtime-state data/runtime/runtime-state/live_multi_sleeve.sqlite `
   --summary-only
 ```
+
+## Live And Sandbox Workflow
+
+Live runtime state and experiment runtime state must be separate.
+
+Use this rule:
+
+- live loop writes only the live runtime DB
+- read-only diagnostics may inspect the live runtime DB with
+  `--runtime-state-read-only`
+- strategy/runtime experiments use a forked sandbox DB
+- never copy a sandbox DB back over the live DB
+
+Create a sandbox fork with SQLite's backup API:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-state-fork `
+  --source data/runtime/runtime-state/live_multi_sleeve.sqlite `
+  --target data/runtime/runtime-state/sandbox/leaps_state_probe.sqlite `
+  --overwrite
+```
+
+Then run the probe against the fork:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-run-once `
+  configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --framework-state data/runtime/framework-state/sandbox/LEaps_probe.json `
+  --framework-state-read-only `
+  --runtime-state data/runtime/runtime-state/sandbox/leaps_state_probe.sqlite `
+  --summary-only
+```
+
+If the goal is to see what a new model would write, omit
+`--runtime-state-read-only` on the sandbox DB only. The live DB remains owned by
+the live runner.
+
+Promotion back to live should happen through code, config, reload control, or a
+purpose-built seed command such as `runtime-state-seed-trailing-stop`, not by
+replacing the live SQLite file.
 
 ## After-Close Checklist
 

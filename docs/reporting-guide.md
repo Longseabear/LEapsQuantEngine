@@ -43,15 +43,23 @@ The message is UTF-8 Korean text and includes:
 - sleeve equity, cash, stock exposure, active insight count, and order-intent count
 - current quantity vs target quantity for each held/targeted symbol
 - symbol names when the universe file or common mapping knows them
-- unrealized, estimated realized, and combined estimated PnL
+- current holding unrealized PnL, cumulative estimated realized PnL, and
+  combined estimated PnL
 - risk clamp/reject reasons such as `max_position_pct` or
   `insufficient_cash_or_position_too_small`
+- portfolio blend status/progress when
+  `portfolio_target_batch.metadata.portfolio_blend` is present
 - current cycle order candidates
 
 Telegram delivery uses legacy `Markdown` parse mode for this helper. The
-current-vs-target and order-candidate sections are rendered as fenced code-block
-tables instead of GitHub-style Markdown tables, because Telegram does not render
-pipe tables as native tables.
+default current-vs-target and order-candidate sections are mobile-first stacked
+text blocks. This avoids the horizontal wrapping that pipe/code-block tables
+cause on phones. Use `--layout table` only for temporary desktop diagnostics.
+
+Realized PnL in this report is labeled as `누적 실현 추정` because it is
+reconstructed from the virtual account fill ledger using FIFO. It should not be
+read as the current open position's PnL; use the per-symbol `미실현` line for
+the current holding and `보유+누적` when both numbers are shown together.
 
 `runtime-run-once` and `runtime-run-multi-once` emit compact engine status
 objects in JSON output. Agents should prefer those compact objects for quick

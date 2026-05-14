@@ -77,18 +77,22 @@
             "enabled": true
           },
           {
+            "ref": "alphas/kospi_pullback_reversion.py",
+            "enabled": true
+          },
+          {
             "ref": "alphas/volatility_trailing_stop.py",
             "enabled": true
           }
         ],
         "input_selections": {
+          "leaps-kospi-pullback-reversion": "leaps-stock-momentum",
           "leaps-kospi-conviction": "leaps-stock-momentum",
           "leaps-volatility-trailing-stop": "leaps-operational-symbols"
         }
       },
       "portfolio": {
         "model": "portfolios/rl_ppo_constructor.py",
-        "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
         "parameters": {
           "policy_path": null,
           "policy_paths": [
@@ -115,7 +119,9 @@
           "max_portfolio_pct": 1.0,
           "max_position_pct": 0.26,
           "long_only": true,
-          "emit_zero_for_missing_held_targets": true
+          "emit_zero_for_missing_held_targets": true,
+          "target_smoothing_alpha": 1.0,
+          "target_drift_threshold_pct": 0.035
         },
         "rebalance": {
           "cash_reserve_pct": 0.0,
@@ -127,6 +133,13 @@
           "reused_target_churn_max_quantity_delta": 1,
           "reused_target_churn_lot_fraction": 0.5,
           "reused_target_churn_equity_bps": 5.0
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 300,
+          "target_drift_threshold_pct": 0.08,
+          "clock": "orderable_session",
+          "missing_target_behavior": "drop"
         }
       },
       "risk": {
@@ -232,7 +245,6 @@
       },
       "portfolio": {
         "model": "portfolios/rl_ppo_constructor.py",
-        "account_store_path": "../../data/virtual-accounts/kis_overseas.json",
         "parameters": {
           "policy_path": null,
           "policy_paths": [
@@ -249,24 +261,35 @@
           "allocation_mode": "rl_weights",
           "fallback_gross_exposure": 0.9,
           "max_portfolio_pct": 1.0,
-          "max_position_pct": 0.3,
+          "max_position_pct": 0.35,
           "long_only": true
         },
         "rebalance": {
-          "cash_reserve_pct": 0.05,
-          "min_order_notional": 75.0,
-          "min_quantity_delta": 1,
+          "cash_reserve_pct": 0.02,
+          "min_order_notional": 200.0,
+          "min_quantity_delta": 2,
           "allow_exit_below_min_notional": true,
-          "cadence": "every_5_minutes"
+          "cadence": "every_5_minutes",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 10.0
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 300,
+          "target_drift_threshold_pct": 0.08,
+          "clock": "orderable_session",
+          "missing_target_behavior": "drop"
         }
       },
       "risk": {
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 0.3,
-          "max_total_exposure_pct": 0.95,
-          "cash_buffer_pct": 0.05,
+          "max_position_pct": 0.35,
+          "max_total_exposure_pct": 0.98,
+          "cash_buffer_pct": 0.02,
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }

@@ -191,21 +191,7 @@ class PortfolioConstructionEngine:
     reason: str = "portfolio_construction"
 
     def create_targets(self, context: PortfolioConstructionContext) -> PortfolioTargetBatch:
-        relevant_symbols = _relevant_symbols(context)
-        equity_by_currency = _portfolio_equity_by_currency(context.portfolio, context.data, relevant_symbols)
-        target_value_by_currency = {
-            currency: equity * (1.0 - self.rebalance_policy.cash_reserve_pct)
-            for currency, equity in equity_by_currency.items()
-        }
-        equity = _single_currency_value(equity_by_currency)
-        target_value = _single_currency_value(target_value_by_currency)
-        prepared_context = replace(
-            context,
-            portfolio_equity=equity,
-            target_portfolio_value=target_value,
-            portfolio_equity_by_currency=MappingProxyType(dict(equity_by_currency)),
-            target_portfolio_value_by_currency=MappingProxyType(dict(target_value_by_currency)),
-        )
+        prepared_context = self.prepare_context(context)
         raw_targets = tuple(
             _coerce_allocation_target(prepared_context, target)
             for target in self.model.create_targets(prepared_context)
@@ -221,25 +207,80 @@ class PortfolioConstructionEngine:
             model_name=type(self.model).__name__,
             reason=self.reason,
             state_patches=state_patches,
-            metadata={
-                "raw_target_count": len(raw_targets),
-                "filtered_target_count": len(raw_targets),
-                "raw_plan_count": len(plans),
-                "filtered_plan_count": len(plans),
-                "portfolio_equity": equity,
-                "target_portfolio_value": target_value,
-                "portfolio_equity_by_currency": dict(equity_by_currency),
-                "target_portfolio_value_by_currency": dict(target_value_by_currency),
-                "cash_reserve_pct": self.rebalance_policy.cash_reserve_pct,
-                "min_order_notional": self.rebalance_policy.min_order_notional,
-                "min_quantity_delta": self.rebalance_policy.min_quantity_delta,
-                "cadence": self.rebalance_policy.cadence,
-                "reused_target_churn_guard": self.rebalance_policy.reused_target_churn_guard,
-                "reused_target_churn_max_quantity_delta": self.rebalance_policy.reused_target_churn_max_quantity_delta,
-                "reused_target_churn_lot_fraction": self.rebalance_policy.reused_target_churn_lot_fraction,
-                "reused_target_churn_equity_bps": self.rebalance_policy.reused_target_churn_equity_bps,
-            },
+            metadata=self._metadata(prepared_context, raw_targets, plans),
         )
+
+    def prepare_context(self, context: PortfolioConstructionContext) -> PortfolioConstructionContext:
+        relevant_symbols = _relevant_symbols(context)
+        equity_by_currency = _portfolio_equity_by_currency(context.portfolio, context.data, relevant_symbols)
+        target_value_by_currency = {
+            currency: equity * (1.0 - self.rebalance_policy.cash_reserve_pct)
+            for currency, equity in equity_by_currency.items()
+        }
+        equity = _single_currency_value(equity_by_currency)
+        target_value = _single_currency_value(target_value_by_currency)
+        prepared_context = replace(
+            context,
+            portfolio_equity=equity,
+            target_portfolio_value=target_value,
+            portfolio_equity_by_currency=MappingProxyType(dict(equity_by_currency)),
+            target_portfolio_value_by_currency=MappingProxyType(dict(target_value_by_currency)),
+        )
+        return prepared_context
+
+    def build_target_batch_from_targets(
+        self,
+        context: PortfolioConstructionContext,
+        source_batch: PortfolioTargetBatch,
+        targets: tuple[PortfolioAllocationTarget, ...],
+        *,
+        reason: str | None = None,
+        state_patches: tuple[StatePatch, ...] = (),
+        metadata: Mapping[str, Any] | None = None,
+    ) -> PortfolioTargetBatch:
+        prepared_context = self.prepare_context(context)
+        plans = self._build_plans(prepared_context, targets)
+        batch_metadata = dict(source_batch.metadata)
+        batch_metadata.update(self._metadata(prepared_context, targets, plans))
+        batch_metadata.update(dict(metadata or {}))
+        batch_metadata["source_batch_id"] = source_batch.batch_id
+        batch_metadata["source_generated_at"] = source_batch.generated_at.isoformat()
+        return PortfolioTargetBatch(
+            sleeve_id=context.sleeve_id,
+            generated_at=context.data.time,
+            targets=targets,
+            plans=plans,
+            source_insight_ids=source_batch.source_insight_ids,
+            model_name=source_batch.model_name,
+            reason=reason or source_batch.reason,
+            state_patches=state_patches,
+            metadata=batch_metadata,
+        )
+
+    def _metadata(
+        self,
+        context: PortfolioConstructionContext,
+        targets: tuple[PortfolioAllocationTarget, ...],
+        plans: tuple[PortfolioTargetPlan, ...],
+    ) -> dict[str, Any]:
+        return {
+            "raw_target_count": len(targets),
+            "filtered_target_count": len(targets),
+            "raw_plan_count": len(plans),
+            "filtered_plan_count": len(plans),
+            "portfolio_equity": context.portfolio_equity,
+            "target_portfolio_value": context.target_portfolio_value,
+            "portfolio_equity_by_currency": dict(context.portfolio_equity_by_currency),
+            "target_portfolio_value_by_currency": dict(context.target_portfolio_value_by_currency),
+            "cash_reserve_pct": self.rebalance_policy.cash_reserve_pct,
+            "min_order_notional": self.rebalance_policy.min_order_notional,
+            "min_quantity_delta": self.rebalance_policy.min_quantity_delta,
+            "cadence": self.rebalance_policy.cadence,
+            "reused_target_churn_guard": self.rebalance_policy.reused_target_churn_guard,
+            "reused_target_churn_max_quantity_delta": self.rebalance_policy.reused_target_churn_max_quantity_delta,
+            "reused_target_churn_lot_fraction": self.rebalance_policy.reused_target_churn_lot_fraction,
+            "reused_target_churn_equity_bps": self.rebalance_policy.reused_target_churn_equity_bps,
+        }
 
     def _build_plans(
         self,

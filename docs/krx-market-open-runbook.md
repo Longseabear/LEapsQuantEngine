@@ -40,7 +40,8 @@ Morning failures usually come from one of these conditions:
 Use this timing on normal KRX trading days:
 
 - `08:35-08:45`: Start local services and check health.
-- `08:45-08:50`: Run LEaps runtime preflight and order-runtime status.
+- `08:45-08:50`: Run LEaps runtime preflight, order-runtime status, and
+  runtime model-state seed.
 - `08:50-08:55`: Start the live order loop with a submit state file.
 - `08:55-09:00`: Expect snapshot failures if KIS live prices are not usable yet.
 - `09:00+`: Confirm the first successful runtime cycle, order submit, and
@@ -109,7 +110,45 @@ Required readout:
 - `needs_attention` is `false`
 - LEaps virtual cash and holdings match the intended live sleeve ownership
 
-3. Start the guarded multi-sleeve live loop.
+3. Seed runtime model state from the virtual account.
+
+Stateful models such as trailing stop must not start from an empty in-memory
+state after restart. Seed the model state from the virtual account
+`position_states` before the live loop is started. This writes only
+`data/runtime/runtime-state/live_multi_sleeve.sqlite`; it does not submit orders
+and does not mutate framework active insights or portfolio cadence state.
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-state-seed-trailing-stop `
+  configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --account-store "$RepoRoot\data\virtual-accounts\kis_domestic.json" `
+  --runtime-state "$RepoRoot\data\runtime\runtime-state\live_multi_sleeve.sqlite" `
+  --summary-only
+```
+
+Required readout:
+
+- `status` is `seeded` or `no_positions`
+- when LEaps has holdings, `seeded_count` equals the number of open
+  `position_states`
+- `event_count` equals `seeded_count`
+
+`tools/leaps_start_live_stack.ps1` runs this seed step automatically by default
+before starting the multi-sleeve live loop. Pass `-SeedRuntimeState false` only
+for diagnostics where runtime state must remain untouched.
+
+For 장중 engine experiments, do not point test cycles at the live runtime state
+with write access. Fork the live DB first and run the probe against the fork:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-state-fork `
+  --source "$RepoRoot\data\runtime\runtime-state\live_multi_sleeve.sqlite" `
+  --target "$RepoRoot\data\runtime\runtime-state\sandbox\LEaps_probe.sqlite" `
+  --overwrite
+```
+
+4. Start the guarded multi-sleeve live loop.
 
 Default live operation now uses one multi-sleeve runner for `LEaps` and
 `us_etf_rotation`. It collects one union market snapshot, runs sleeve-specific
@@ -167,7 +206,7 @@ is not collected and its alpha/portfolio/risk/execution stack is not called
 outside its scheduled strategy window. `order-runtime-supervise` can still
 inspect active sleeves for open-ticket maintenance.
 
-4. Watch the first cycles.
+5. Watch the first cycles.
 
 ```powershell
 Get-Content data/runtime/live-order-loop/multi_sleeve.log -Tail 120 -Encoding UTF8
@@ -202,7 +241,7 @@ If `runtime-run-multi-once exit=1` continues after live KRX quotes should be
 usable, stop and debug the market-data snapshot path instead of forcing an old
 artifact.
 
-5. Confirm the submit latch.
+6. Confirm the submit latch.
 
 After a successful live submit:
 
@@ -231,7 +270,7 @@ If the target state changes intraday, the loop should call
 holdings, open tickets, and unapplied fills whether the new intent is still
 valid.
 
-6. Confirm framework cadence state.
+7. Confirm framework cadence state.
 
 ```powershell
 Get-Content data/runtime/framework-state/LEaps.json -Raw -Encoding UTF8
@@ -247,6 +286,30 @@ In normal operation, alpha runs every cycle. Portfolio construction rebuilds
 targets every five minutes and reuses the previous target batch between those
 cycles. Risk, execution, open-ticket polling, and bounded fill reconciliation
 continue on the live loop cadence.
+
+8. Confirm runtime model state.
+
+For trailing stop, the runtime state store should contain one record per open
+position after the seed step or the first successful live cycle:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-state-seed-trailing-stop `
+  configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --account-store "$RepoRoot\data\virtual-accounts\kis_domestic.json" `
+  --runtime-state "$RepoRoot\data\runtime\runtime-state\live_multi_sleeve.sqlite" `
+  --summary-only
+```
+
+This command is idempotent. It never lowers an existing high-watermark, so it is
+safe to repeat during startup recovery.
+
+Portfolio Blend also uses the same runtime state store when
+`portfolio.blend.enabled=true`. On the first cycle after enabling it, expect a
+`engine-portfolio-blend / last_target` record. During a target transition,
+expect an additional `engine-portfolio-blend / active_transition` record. Do not
+delete these records during market hours unless the operator intentionally wants
+to cancel the smooth transition and restart from the next raw target snapshot.
 
 ## Telegram Operator Note
 

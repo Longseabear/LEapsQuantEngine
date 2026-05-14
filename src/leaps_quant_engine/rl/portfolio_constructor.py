@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +14,7 @@ from leaps_quant_engine.framework import PortfolioAllocationTarget, PortfolioCon
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Symbol
 from leaps_quant_engine.portfolio import currency_for_symbol
+from leaps_quant_engine.runtime_state import StatePatch
 from leaps_quant_engine.universe.definition import UniverseDefinition
 
 
@@ -25,6 +26,8 @@ RL_MAX_NORMALIZED_VOLATILITY = 0.18
 RL_EXTREME_NORMALIZED_VOLATILITY = 0.24
 RL_HIGH_VOL_MOMENTUM_EXCEPTION = 0.45
 RL_VOLATILITY_SCORE_PENALTY = 0.75
+RL_MIN_TRAINING_HISTORY_BARS = 252
+RL_HISTORY_KEEP_RATIO = 0.80
 
 try:
     import torch
@@ -129,6 +132,16 @@ class ReinforcementLearningPortfolioConstructionModel:
     allocation_mode: str = "equal"
     fallback_gross_exposure: float = 0.75
     emit_zero_for_missing_held_targets: bool = False
+    target_smoothing_alpha: float = 1.0
+    target_drift_threshold_pct: float = 0.0
+    target_anchor_model_id: str = "rl-portfolio-constructor"
+    target_anchor_namespace: str = "target_anchor"
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.target_smoothing_alpha <= 1.0:
+            raise ValueError("target_smoothing_alpha must be greater than 0 and at most 1.")
+        if self.target_drift_threshold_pct < 0:
+            raise ValueError("target_drift_threshold_pct cannot be negative.")
 
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
         actionable_by_currency: dict[str, list] = {}
@@ -195,7 +208,32 @@ class ReinforcementLearningPortfolioConstructionModel:
                 targets,
                 actionable_currencies=set(actionable_by_currency),
             )
-        return tuple(targets.values())
+        return self._smooth_targets(context, tuple(targets.values()))
+
+    def state_patches(
+        self,
+        context: PortfolioConstructionContext,
+        targets: tuple[PortfolioAllocationTarget, ...],
+    ) -> tuple[StatePatch, ...]:
+        if not self._target_smoothing_enabled():
+            return ()
+        return tuple(
+            StatePatch(
+                key=context.model_state.key(
+                    model_id=self.target_anchor_model_id,
+                    namespace=self.target_anchor_namespace,
+                    symbol_key=target.symbol.key,
+                ),
+                value={
+                    "target_percent": target.target_percent,
+                    "tag": target.tag,
+                    "updated_at": context.data.time.isoformat(),
+                },
+                reason="portfolio_target_anchor",
+                generated_at=context.data.time,
+            )
+            for target in targets
+        )
 
     def _add_missing_held_zero_targets(
         self,
@@ -218,6 +256,66 @@ class ReinforcementLearningPortfolioConstructionModel:
                 target_percent=0.0,
                 tag=f"rl:{self.model_name}:no_longer_in_target_portfolio",
             )
+
+    def _smooth_targets(
+        self,
+        context: PortfolioConstructionContext,
+        targets: tuple[PortfolioAllocationTarget, ...],
+    ) -> tuple[PortfolioAllocationTarget, ...]:
+        if not self._target_smoothing_enabled():
+            return targets
+        smoothed_targets: list[PortfolioAllocationTarget] = []
+        for target in targets:
+            if _is_explicit_exit_target(target):
+                smoothed_targets.append(target)
+                continue
+            previous_target = self._previous_anchor_target(context, target.symbol.key)
+            if previous_target is None:
+                smoothed_targets.append(target)
+                continue
+            smoothed_percent = self._smoothed_target_percent(
+                raw_target=target.target_percent,
+                previous_target=previous_target,
+            )
+            if abs(smoothed_percent - target.target_percent) <= 1e-9:
+                smoothed_targets.append(target)
+                continue
+            smoothed_targets.append(
+                replace(
+                    target,
+                    target_percent=smoothed_percent,
+                    tag=f"{target.tag}:smoothed={smoothed_percent:.3f}",
+                )
+            )
+        return tuple(smoothed_targets)
+
+    def _smoothed_target_percent(self, *, raw_target: float, previous_target: float) -> float:
+        raw = _clamp_target_percent(raw_target, long_only=self.long_only)
+        previous = _clamp_target_percent(previous_target, long_only=self.long_only)
+        threshold = float(self.target_drift_threshold_pct)
+        if abs(raw) <= 1e-12:
+            if abs(previous) <= threshold:
+                return 0.0
+            return _clamp_target_percent(previous * (1.0 - self.target_smoothing_alpha), long_only=self.long_only)
+        if abs(raw - previous) < threshold:
+            return previous
+        return _clamp_target_percent(
+            previous + (self.target_smoothing_alpha * (raw - previous)),
+            long_only=self.long_only,
+        )
+
+    def _previous_anchor_target(self, context: PortfolioConstructionContext, symbol_key: str) -> float | None:
+        record = context.model_state.get(
+            model_id=self.target_anchor_model_id,
+            namespace=self.target_anchor_namespace,
+            symbol_key=symbol_key,
+        )
+        if record is None:
+            return None
+        return _safe_float(record.value.get("target_percent"))
+
+    def _target_smoothing_enabled(self) -> bool:
+        return self.target_smoothing_alpha < 1.0 or self.target_drift_threshold_pct > 0.0
 
     def _weights_for_observation(
         self,
@@ -377,6 +475,9 @@ def train_ppo_portfolio_constructor(
         "universe_id": universe.id,
         "market": universe.market,
         "symbols": [symbol.key for symbol in universe.symbols],
+        "training_symbol_count": int(getattr(env, "training_symbol_count", len(universe.symbols))),
+        "dropped_history_symbol_count": int(getattr(env, "dropped_history_symbol_count", 0)),
+        "training_history_min_bars": int(getattr(env, "training_history_min_bars", 0)),
         "start": start.isoformat() if start else None,
         "end": end.isoformat() if end else None,
         "timesteps": timesteps,
@@ -457,7 +558,12 @@ def _make_training_env(
     except ImportError as exc:
         raise RuntimeError("gymnasium is required to train the PPO portfolio constructor.") from exc
 
-    price_matrix = _price_matrix(universe, provider, start=start, end=end)
+    price_matrix, training_symbol_count, dropped_history_symbol_count = _price_matrix(
+        universe,
+        provider,
+        start=start,
+        end=end,
+    )
 
     class PortfolioConstructorEnv(gym.Env):
         metadata = {"render_modes": []}
@@ -571,6 +677,9 @@ def _make_training_env(
             return ranked[:top_k]
 
     env = PortfolioConstructorEnv()
+    env.training_symbol_count = training_symbol_count
+    env.dropped_history_symbol_count = dropped_history_symbol_count
+    env.training_history_min_bars = int(price_matrix.shape[0])
     if env.episode_length <= 10:
         raise RuntimeError("Not enough historical bars to train RL portfolio constructor.")
     return env
@@ -582,20 +691,25 @@ def _price_matrix(
     *,
     start: datetime | None,
     end: datetime | None,
-) -> np.ndarray:
-    histories = []
-    min_len = None
+) -> tuple[np.ndarray, int, int]:
+    raw_histories: list[list[float]] = []
     for symbol in universe.symbols:
         bars = provider.get_history(symbol, start=start, end=end)
         closes = [bar.close for bar in bars if bar.close > 0]
         if len(closes) < 30:
             continue
-        min_len = len(closes) if min_len is None else min(min_len, len(closes))
-        histories.append(closes)
+        raw_histories.append(closes)
+    if not raw_histories:
+        raise RuntimeError("No sufficient price histories available for RL portfolio constructor training.")
+    max_len = max(len(history) for history in raw_histories)
+    min_required = min(max_len, max(RL_MIN_TRAINING_HISTORY_BARS, int(max_len * RL_HISTORY_KEEP_RATIO)))
+    histories = [history for history in raw_histories if len(history) >= min_required]
+    dropped_history_symbol_count = len(raw_histories) - len(histories)
+    min_len = min((len(history) for history in histories), default=None)
     if not histories or min_len is None or min_len < 30:
         raise RuntimeError("No sufficient price histories available for RL portfolio constructor training.")
     aligned = [history[-min_len:] for history in histories]
-    return np.asarray(aligned, dtype=np.float64).T
+    return np.asarray(aligned, dtype=np.float64).T, len(histories), dropped_history_symbol_count
 
 
 def _latest_up_insights(context: PortfolioConstructionContext) -> tuple[Any, ...]:
@@ -885,6 +999,18 @@ def _has_candidate_tokens(observation: np.ndarray) -> bool:
     if array.ndim == 1:
         return bool(np.any(np.abs(array) > 1e-12))
     return bool(np.any(array[..., 0] > 0.0))
+
+
+def _is_explicit_exit_target(target: PortfolioAllocationTarget) -> bool:
+    if abs(target.target_percent) > 1e-12:
+        return False
+    tag = target.tag.lower()
+    return ":flat" in tag or ":down" in tag or "stop" in tag
+
+
+def _clamp_target_percent(value: float, *, long_only: bool) -> float:
+    lower = 0.0 if long_only else -1.0
+    return max(lower, min(float(value), 1.0))
 
 
 def _safe_float(value: Any) -> float | None:

@@ -93,7 +93,6 @@
       },
       "portfolio": {
         "model": "portfolios/rl_ppo_constructor.py",
-        "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
         "parameters": {
             "policy_path": null,
             "policy_paths": [
@@ -216,9 +215,7 @@
       "alpha": {
         "modules": []
       },
-      "portfolio": {
-        "account_store_path": "../../data/virtual-accounts/kis_overseas.json"
-      },
+      "portfolio": {},
       "worker": {
         "cycle_interval_seconds": 60
       }

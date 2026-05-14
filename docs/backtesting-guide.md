@@ -327,11 +327,20 @@ If insights exist but orders are zero:
 
 - Re-run with `--include-insights`.
 - Check portfolio rebalance cadence and persisted targets.
+- Check `portfolio_target_batch.metadata.portfolio_blend`: a transition may be
+  intentionally holding the sleeve between the previous target snapshot and the
+  new raw target.
 - Check current holdings, cash, target deltas, and minimum rebalance filters.
 - Check whole-share rounding loss, especially with small capital such as
   2,000,000 KRW.
 - Check risk decisions and engine guard blocks.
 - Check execution model minimum quantity/notional constraints.
+
+When Portfolio Blend is enabled, detailed framework output and cycle journals
+include `portfolio_blend.status`, `progress`, `transition_id`, `elapsed_minutes`,
+`duration_minutes`, `target_drift`, and `bypassed_symbols`. Explicit flat/down,
+stop, urgent, manual, operator, force, or risk tags should bypass the blend for
+that symbol.
 
 If performance changes after costs:
 

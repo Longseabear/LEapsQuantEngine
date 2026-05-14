@@ -168,6 +168,53 @@ def test_background_snapshot_worker_degrades_cycle_quality_when_warmup_is_not_re
     assert "warmup_not_ready" in active.quality_report.reasons
 
 
+def test_background_snapshot_worker_does_not_block_entries_for_optional_indicator_gap():
+    universe = parse_universe_definition(
+        {
+            "id": "worker-test",
+            "market": "KRX",
+            "symbols": ["005930", "000660"],
+            "indicators": [
+                {"name": "close", "type": "close", "period": 1, "resolution": "daily"},
+                {"name": "sma_2_close", "type": "sma", "period": 2, "field": "close", "resolution": "daily"},
+                {
+                    "name": "roc_60_close",
+                    "type": "roc",
+                    "period": 60,
+                    "field": "close",
+                    "resolution": "daily",
+                    "readiness": "optional",
+                },
+            ],
+        }
+    )
+    history = {
+        symbol.key: [_bar(symbol, 0), _bar(symbol, 1)]
+        for symbol in universe.symbols
+    }
+    worker = BackgroundSnapshotWorker(
+        universe=universe,
+        sleeve_id="swing-kor",
+        live_provider=SequentialLiveProvider(),
+        history_provider=FakeHistoryProvider(history),
+        interval_seconds=0.0,
+    )
+
+    report = worker.run(max_cycles=1, warmup=True)
+
+    assert report.warmup is not None
+    assert report.warmup.is_ready is True
+    assert report.warmup.required_warmup_bars == 2
+    assert report.warmup.required_indicator_count_per_symbol == 2
+    assert report.warmup.optional_indicator_count_per_symbol == 1
+    assert all(
+        symbol.missing_optional_indicators == ("roc_60_close",)
+        for symbol in report.warmup.symbols
+    )
+    assert report.cycles[0].snapshot_quality.status == SnapshotQualityStatus.FRESH
+    assert "warmup_not_ready" not in report.cycles[0].snapshot_quality.reasons
+
+
 def test_background_snapshot_worker_attaches_degraded_quality_to_partial_cycle():
     universe = _worker_universe()
     worker = BackgroundSnapshotWorker(

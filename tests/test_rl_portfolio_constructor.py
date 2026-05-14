@@ -8,7 +8,9 @@ from leaps_quant_engine.framework import PortfolioConstructionContext
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.rl import ReinforcementLearningPortfolioConstructionModel
-from leaps_quant_engine.rl.portfolio_constructor import _integer_lot_asset_weights
+from leaps_quant_engine.rl.portfolio_constructor import _integer_lot_asset_weights, _make_training_env
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, RuntimeModelStateView, StatePatch
+from leaps_quant_engine.universe.definition import UniverseDefinition
 
 
 def test_rl_portfolio_constructor_falls_back_to_deterministic_exposure():
@@ -420,6 +422,96 @@ def test_rl_portfolio_allocator_loads_policy_paths_from_metadata(monkeypatch, tm
     assert targets[0].target_percent == pytest.approx(0.8)
 
 
+def test_rl_portfolio_allocator_smooths_targets_from_runtime_anchor():
+    symbol = Symbol("005930", "KRX")
+    now = datetime(2026, 1, 2)
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store=store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="rl-portfolio-constructor",
+                    namespace="target_anchor",
+                    symbol_key=symbol.key,
+                ),
+                value={"target_percent": 0.2},
+                generated_at=now,
+            ),
+        ),
+        applied_at=now,
+    )
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_path="missing.zip",
+        allocation_mode="rl_weights",
+        fallback_gross_exposure=0.8,
+        top_k=1,
+        max_position_pct=1.0,
+        target_smoothing_alpha=0.5,
+        target_drift_threshold_pct=0.03,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100, 100, 100, 100, 1000)}),
+        portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+        active_insights=(_up_insight(symbol, now, momentum=0.2),),
+        managed_symbols=(),
+        model_state=state_view,
+    )
+
+    targets = model.create_targets(context)
+    patches = model.state_patches(context=context, targets=targets)
+
+    assert len(targets) == 1
+    assert targets[0].target_percent == pytest.approx(0.5)
+    assert ":smoothed=0.500" in targets[0].tag
+    assert len(patches) == 1
+    assert patches[0].key.symbol_key == symbol.key
+    assert patches[0].value["target_percent"] == pytest.approx(0.5)
+    assert patches[0].reason == "portfolio_target_anchor"
+
+
+def test_rl_portfolio_allocator_does_not_smooth_explicit_flat_exit():
+    symbol = Symbol("005930", "KRX")
+    now = datetime(2026, 1, 2)
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store=store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="rl-portfolio-constructor",
+                    namespace="target_anchor",
+                    symbol_key=symbol.key,
+                ),
+                value={"target_percent": 0.3},
+                generated_at=now,
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=0, cash_by_currency={"KRW": 0})
+    portfolio.holdings[symbol.key] = type("HoldingLike", (), {"symbol": symbol, "quantity": 3, "average_price": 100})()
+    model = ReinforcementLearningPortfolioConstructionModel(
+        target_smoothing_alpha=0.5,
+        target_drift_threshold_pct=0.03,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100, 100, 100, 100, 1000)}),
+        portfolio=portfolio,
+        active_insights=(_flat_insight(symbol, now),),
+        managed_symbols=(symbol,),
+        model_state=state_view,
+    )
+
+    targets = model.create_targets(context)
+
+    assert len(targets) == 1
+    assert targets[0].target_percent == 0.0
+    assert targets[0].tag == "rl:flat-alpha:flat"
+
+
 def test_rl_portfolio_allocator_uses_signal_floor_when_policy_selects_cash(monkeypatch, tmp_path):
     symbol = Symbol("SMH", "US")
     now = datetime(2026, 1, 2)
@@ -462,6 +554,69 @@ def test_rl_training_lot_sizing_reflects_small_account_integer_shares():
     )
 
     assert weights.tolist() == pytest.approx([0.32, 0.18])
+
+
+def test_rl_training_ignores_short_history_symbols_when_aligning_expanded_universe():
+    long_a = Symbol("005930", "KRX")
+    long_b = Symbol("000660", "KRX")
+    recent = Symbol("491000", "KRX")
+    universe = UniverseDefinition(
+        id="test-expanded",
+        market="KRX",
+        symbols=(long_a, long_b, recent),
+        indicators=(),
+    )
+    provider = _HistoryProvider(
+        {
+            long_a.key: 920,
+            long_b.key: 900,
+            recent.key: 63,
+        }
+    )
+
+    env = _make_training_env(
+        universe,
+        provider,
+        start=None,
+        end=None,
+        exposure_levels=(0.0, 0.5, 0.95),
+        turnover_penalty=0.12,
+        downside_penalty=1.1,
+        volatility_penalty=0.45,
+        drawdown_penalty=0.95,
+        underwater_penalty=0.35,
+        missed_upside_penalty=0.08,
+        top_k=2,
+        concentration_penalty=0.4,
+        allocation_mode="rl_weights",
+        initial_cash=17_329_806,
+        lot_optimizer_min_lot_fraction=0.25,
+    )
+
+    assert env.training_symbol_count == 2
+    assert env.dropped_history_symbol_count == 1
+    assert env.episode_length > 800
+
+
+class _HistoryProvider:
+    def __init__(self, lengths: dict[str, int]) -> None:
+        self.lengths = lengths
+
+    def get_history(self, symbol: Symbol, *, start=None, end=None):
+        length = self.lengths[symbol.key]
+        base = datetime(2021, 1, 1)
+        return tuple(
+            Bar(
+                symbol,
+                base + timedelta(days=index),
+                100 + index,
+                101 + index,
+                99 + index,
+                100 + index,
+                1000,
+            )
+            for index in range(length)
+        )
 
 
 def _up_insight(symbol: Symbol, now: datetime, *, momentum: float) -> Insight:

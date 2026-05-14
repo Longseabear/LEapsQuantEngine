@@ -52,6 +52,11 @@ from leaps_quant_engine.market_rules import synthetic_domestic_market_session, s
 from leaps_quant_engine.minute_feed import YFinanceMinuteBarProvider, download_us_minute_feed
 from leaps_quant_engine.models import OrderIntent
 from leaps_quant_engine.models import Symbol
+from leaps_quant_engine.model_state_seed import (
+    DEFAULT_TRAILING_STOP_MODEL_ID,
+    DEFAULT_TRAILING_STOP_NAMESPACE,
+    seed_trailing_stop_state_from_positions,
+)
 from leaps_quant_engine.notifications import (
     NotificationService,
     notify_order_submit_report,
@@ -80,7 +85,7 @@ from leaps_quant_engine.runtime_integrity import build_runtime_code_identity
 from leaps_quant_engine.runtime_multi import run_multi_sleeve_once
 from leaps_quant_engine.runtime_preflight import build_runtime_preflight_report
 from leaps_quant_engine.runtime_recovery import build_recovery_account_report, build_recovery_report
-from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, SQLiteRuntimeStateStore
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, SQLiteRuntimeStateStore, fork_sqlite_runtime_state
 from leaps_quant_engine.rl import train_ppo_portfolio_constructor
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
 from leaps_quant_engine.sleeve_workspace import (
@@ -150,6 +155,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_run_multi_once.add_argument("--runtime-state", type=Path)
     runtime_run_multi_once.add_argument("--runtime-state-read-only", action="store_true")
     runtime_run_multi_once.add_argument("--summary-only", action="store_true")
+
+    runtime_state_seed = subparsers.add_parser("runtime-state-seed-trailing-stop")
+    runtime_state_seed.add_argument("config", type=Path)
+    runtime_state_seed.add_argument("--sleeve-id", required=True)
+    runtime_state_seed.add_argument("--account-store", type=Path)
+    runtime_state_seed.add_argument("--runtime-state", type=Path, required=True)
+    runtime_state_seed.add_argument("--model-id", default=DEFAULT_TRAILING_STOP_MODEL_ID)
+    runtime_state_seed.add_argument("--namespace", default=DEFAULT_TRAILING_STOP_NAMESPACE)
+    runtime_state_seed.add_argument("--summary-only", action="store_true")
+
+    runtime_state_fork = subparsers.add_parser("runtime-state-fork")
+    runtime_state_fork.add_argument("--source", type=Path, required=True)
+    runtime_state_fork.add_argument("--target", type=Path, required=True)
+    runtime_state_fork.add_argument("--overwrite", action="store_true")
 
     runtime_control_submit = subparsers.add_parser("runtime-control-submit")
     runtime_control_submit.add_argument("--queue", type=Path, required=True)
@@ -868,6 +887,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_payload["runtime_state"] = runtime_state_summary
         print(json.dumps(print_payload, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "runtime-state-seed-trailing-stop":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_config = snapshot.config.sleeve(args.sleeve_id)
+        account_store_path = (
+            resolve_runtime_path(snapshot, args.account_store).resolve()
+            if args.account_store is not None
+            else _resolve_sleeve_account_store_path(snapshot, sleeve_config)
+        )
+        runtime_state_path = resolve_runtime_path(snapshot, args.runtime_state).resolve()
+        account_store = VirtualSleeveAccountStore(account_store_path)
+        runtime_state_store = SQLiteRuntimeStateStore(runtime_state_path)
+        report = seed_trailing_stop_state_from_positions(
+            account_store.position_states(args.sleeve_id),
+            runtime_state_store,
+            sleeve_id=args.sleeve_id,
+            model_id=args.model_id,
+            namespace=args.namespace,
+        )
+        payload = report.to_dict(include_rows=not args.summary_only)
+        payload["account_store_path"] = str(account_store_path)
+        payload["runtime_state_path"] = str(runtime_state_path)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "runtime-state-fork":
+        report = fork_sqlite_runtime_state(args.source, args.target, overwrite=args.overwrite)
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "runtime-control-submit":
         command = _build_runtime_control_command(args)
         FileRuntimeControlQueue(args.queue).submit(command)
@@ -988,15 +1034,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "kis-account-sync":
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_config = snapshot.config.sleeve(args.sleeve_id)
-        if sleeve_config.portfolio.account_store_path is None:
-            raise RuntimeError("portfolio.account_store_path is required for KIS account sync.")
-        default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, currency_for_market_scope(args.market))
-        store = VirtualSleeveAccountStore(
-            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
-            default_cash_by_sleeve=default_cash_by_sleeve,
-            default_currency=currency_for_market_scope(args.market),
+        account = _broker_account_for_sleeve_market(snapshot, sleeve_config, args.market)
+        currency = account.currency if account is not None else currency_for_market_scope(args.market)
+        default_cash_by_sleeve = _default_cash_by_sleeve(
+            snapshot,
+            currency,
+            account.account_id if account is not None else getattr(sleeve_config, "broker_account_id", None),
         )
-        report = KISVirtualAccountSync.from_env().sync(
+        store = VirtualSleeveAccountStore(
+            _resolve_sleeve_account_store_path(snapshot, sleeve_config, market_scope=args.market),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+            default_currency=currency,
+        )
+        account_metadata = dict(account.metadata) if account is not None else {}
+        try:
+            sync = KISVirtualAccountSync.from_env(
+                account.account_id if account is not None else None,
+                metadata=account_metadata,
+            )
+        except TypeError:
+            sync = KISVirtualAccountSync.from_env()
+        report = sync.sync(
             store,
             start_date=args.start_date,
             end_date=args.end_date,
@@ -1015,8 +1073,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "virtual-account-sync-cash":
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_config = snapshot.config.sleeve(args.sleeve_id)
-        if sleeve_config.portfolio.account_store_path is None:
-            raise RuntimeError("portfolio.account_store_path is required for virtual account cash sync.")
         account = _broker_account_for_order_runtime(snapshot, None, (args.sleeve_id,))
         account_id = account.account_id if account is not None else getattr(sleeve_config, "broker_account_id", None)
         market = account.market_scope if account is not None else "domestic"
@@ -1024,7 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         account_store_path = (
             resolve_runtime_path(snapshot, account.account_store_path).resolve()
             if account is not None
-            else resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path)
+            else _resolve_sleeve_account_store_path(snapshot, sleeve_config, market_scope=market)
         )
         account_metadata = dict(account.metadata) if account is not None else {}
         default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, currency, account_id)
@@ -1055,11 +1111,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "virtual-account-transfer-cash":
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_config = snapshot.config.sleeve(args.sleeve_id)
-        if sleeve_config.portfolio.account_store_path is None:
-            raise RuntimeError("portfolio.account_store_path is required for virtual account cash transfer.")
         default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, args.currency)
         store = VirtualSleeveAccountStore(
-            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            _resolve_sleeve_account_store_path(snapshot, sleeve_config),
             default_cash_by_sleeve=default_cash_by_sleeve,
             default_currency=args.currency,
         )
@@ -1526,11 +1580,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "virtual-account-allocate-fill":
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_config = snapshot.config.sleeve(args.sleeve_id)
-        if sleeve_config.portfolio.account_store_path is None:
-            raise RuntimeError("portfolio.account_store_path is required for virtual account allocation.")
         default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, _sleeve_default_currency(snapshot, sleeve_config))
         store = VirtualSleeveAccountStore(
-            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
+            _resolve_sleeve_account_store_path(snapshot, sleeve_config),
             default_cash_by_sleeve=default_cash_by_sleeve,
             default_currency=_sleeve_default_currency(snapshot, sleeve_config),
         )
@@ -1567,15 +1619,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "virtual-account-reconcile":
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_config = snapshot.config.sleeve(args.sleeve_id)
-        if sleeve_config.portfolio.account_store_path is None:
-            raise RuntimeError("portfolio.account_store_path is required for virtual account reconciliation.")
-        default_cash_by_sleeve = _default_cash_by_sleeve(snapshot, _sleeve_default_currency(snapshot, sleeve_config))
-        store = VirtualSleeveAccountStore(
-            resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path),
-            default_cash_by_sleeve=default_cash_by_sleeve,
-            default_currency=_sleeve_default_currency(snapshot, sleeve_config),
+        account = _broker_account_for_sleeve_market(snapshot, sleeve_config, args.market)
+        currency = account.currency if account is not None else _sleeve_default_currency(snapshot, sleeve_config)
+        default_cash_by_sleeve = _default_cash_by_sleeve(
+            snapshot,
+            currency,
+            account.account_id if account is not None else getattr(sleeve_config, "broker_account_id", None),
         )
-        holdings = KISVirtualAccountSync.from_env().account_client.get_holdings(market=args.market)
+        store = VirtualSleeveAccountStore(
+            _resolve_sleeve_account_store_path(snapshot, sleeve_config, market_scope=args.market),
+            default_cash_by_sleeve=default_cash_by_sleeve,
+            default_currency=currency,
+        )
+        account_metadata = dict(account.metadata) if account is not None else {}
+        try:
+            sync = KISVirtualAccountSync.from_env(
+                account.account_id if account is not None else None,
+                metadata=account_metadata,
+            )
+        except TypeError:
+            sync = KISVirtualAccountSync.from_env()
+        holdings = sync.account_client.get_holdings(market=args.market)
         report = store.reconciliation_report(holdings, include_fills=True)
         payload = report.to_dict(include_fills=not args.summary_only)
         payload["account_store_path"] = str(store.path)
@@ -2700,6 +2764,28 @@ def _sleeve_default_currency(snapshot, sleeve_config) -> str:
         except KeyError:
             return currency_for_market_scope(None)
     return currency_for_market_scope(None)
+
+
+def _broker_account_for_sleeve_market(snapshot, sleeve_config, market_scope: str | None = None):
+    routes = dict(getattr(sleeve_config, "broker_account_routes", {}) or {})
+    account_id = routes.get(str(market_scope or "").strip().lower()) or getattr(sleeve_config, "broker_account_id", None)
+    if account_id is None and len(set(routes.values())) == 1:
+        account_id = next(iter(routes.values()))
+    if account_id is None:
+        return None
+    try:
+        return snapshot.config.broker_account(account_id)
+    except KeyError as exc:
+        raise RuntimeError(f"Sleeve '{sleeve_config.sleeve_id}' references unknown broker_account_id: {account_id}") from exc
+
+
+def _resolve_sleeve_account_store_path(snapshot, sleeve_config, market_scope: str | None = None) -> Path:
+    account = _broker_account_for_sleeve_market(snapshot, sleeve_config, market_scope)
+    if account is not None:
+        return resolve_runtime_path(snapshot, account.account_store_path).resolve()
+    if sleeve_config.portfolio.account_store_path is not None:
+        return resolve_runtime_path(snapshot, sleeve_config.portfolio.account_store_path).resolve()
+    raise RuntimeError("broker_accounts.account_store_path or portfolio.account_store_path is required.")
 
 
 def _build_order_runtime_status_for_route(snapshot, route: _OrderRuntimeRoute, sleeve_ids: tuple[str, ...], *, recent_events: int):

@@ -14,6 +14,17 @@ class IndicatorDefinition:
     field: str = "close"
     parameters: dict[str, Any] | None = None
     resolution: str = "any"
+    readiness: str = "required"
+
+    def __post_init__(self) -> None:
+        readiness = str(self.readiness or "required").strip().lower()
+        if readiness not in {"required", "optional"}:
+            raise ValueError("Indicator readiness must be 'required' or 'optional'.")
+        object.__setattr__(self, "readiness", readiness)
+
+    @property
+    def required_for_warmup(self) -> bool:
+        return self.readiness == "required"
 
 
 @dataclass(frozen=True, slots=True)

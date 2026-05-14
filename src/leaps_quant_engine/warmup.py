@@ -10,7 +10,7 @@ from leaps_quant_engine.history import get_daily_history
 from leaps_quant_engine.indicators import IndicatorEngine, create_indicator
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, Symbol
-from leaps_quant_engine.universe.definition import UniverseDefinition
+from leaps_quant_engine.universe.definition import IndicatorDefinition, UniverseDefinition
 
 
 MEASUREMENT_SCOPE = "IndicatorEngine.warm_up"
@@ -31,8 +31,11 @@ class WarmupPolicy:
             raise ValueError("default_calendar_days must be positive.")
 
     def required_bars(self, universe: UniverseDefinition) -> int:
+        required_indicators = _required_indicators(universe)
+        if not required_indicators:
+            return 0
         warmup_period = max(
-            (create_indicator(definition).warmup_period for definition in universe.indicators),
+            (create_indicator(definition).warmup_period for definition in required_indicators),
             default=0,
         )
         return warmup_period + self.extra_bars
@@ -49,7 +52,13 @@ class WarmupSymbolReport:
     required_warmup_bars: int
     indicator_count: int
     ready_indicator_count: int
+    required_indicator_count: int
+    required_ready_indicator_count: int
+    optional_indicator_count: int
+    optional_ready_indicator_count: int
     is_ready: bool
+    missing_required_indicators: tuple[str, ...] = ()
+    missing_optional_indicators: tuple[str, ...] = ()
     failed: bool = False
     message: str | None = None
 
@@ -60,9 +69,17 @@ class WarmupSymbolReport:
             "required_warmup_bars": self.required_warmup_bars,
             "indicator_count": self.indicator_count,
             "ready_indicator_count": self.ready_indicator_count,
+            "required_indicator_count": self.required_indicator_count,
+            "required_ready_indicator_count": self.required_ready_indicator_count,
+            "optional_indicator_count": self.optional_indicator_count,
+            "optional_ready_indicator_count": self.optional_ready_indicator_count,
             "is_ready": self.is_ready,
             "failed": self.failed,
         }
+        if self.missing_required_indicators:
+            payload["missing_required_indicators"] = list(self.missing_required_indicators)
+        if self.missing_optional_indicators:
+            payload["missing_optional_indicators"] = list(self.missing_optional_indicators)
         if self.message:
             payload["message"] = self.message
         return payload
@@ -76,6 +93,8 @@ class WarmupReport:
     loaded_symbol_count: int
     failed_symbol_count: int
     indicator_count_per_symbol: int
+    required_indicator_count_per_symbol: int
+    optional_indicator_count_per_symbol: int
     required_warmup_bars: int
     ready_symbol_count: int
     ready_ratio: float
@@ -97,6 +116,8 @@ class WarmupReport:
             "loaded_symbol_count": self.loaded_symbol_count,
             "failed_symbol_count": self.failed_symbol_count,
             "indicator_count_per_symbol": self.indicator_count_per_symbol,
+            "required_indicator_count_per_symbol": self.required_indicator_count_per_symbol,
+            "optional_indicator_count_per_symbol": self.optional_indicator_count_per_symbol,
             "required_warmup_bars": self.required_warmup_bars,
             "ready_symbol_count": self.ready_symbol_count,
             "ready_ratio": self.ready_ratio,
@@ -140,6 +161,8 @@ def run_daily_indicator_warmup(
     symbols = list(universe.symbols)
     engine = indicator_engine or IndicatorEngine()
     engine.register_universe(sleeve_id, universe)
+    required_indicators = _required_indicators(universe)
+    optional_indicators = _optional_indicators(universe)
 
     total_start = clock()
     history_start = clock()
@@ -154,7 +177,7 @@ def run_daily_indicator_warmup(
                 end=resolved_end,
                 refresh_history=refresh_history,
             )
-            history_by_symbol[symbol.key] = _latest_bars(bars, required_bars)
+            history_by_symbol[symbol.key] = _latest_bars(bars, 0)
         except Exception as exc:  # noqa: BLE001 - warmup must report partial readiness.
             failures[symbol.key] = str(exc)
     history_load_ms = _elapsed_ms(history_start, clock())
@@ -171,7 +194,8 @@ def run_daily_indicator_warmup(
             symbol,
             loaded_bar_count=len(history_by_symbol.get(symbol.key, [])),
             required_bars=required_bars,
-            indicator_count=len(universe.indicators),
+            required_indicators=required_indicators,
+            optional_indicators=optional_indicators,
             failure_message=failures.get(symbol.key),
         )
         for symbol in symbols
@@ -189,6 +213,8 @@ def run_daily_indicator_warmup(
             loaded_symbol_count=requested_symbol_count - len(failures),
             failed_symbol_count=len(failures),
             indicator_count_per_symbol=len(universe.indicators),
+            required_indicator_count_per_symbol=len(required_indicators),
+            optional_indicator_count_per_symbol=len(optional_indicators),
             required_warmup_bars=required_bars,
             ready_symbol_count=ready_symbol_count,
             ready_ratio=ready_ratio,
@@ -220,6 +246,14 @@ def _flatten_history(symbols: list[Symbol], history_by_symbol: dict[str, list[Ba
     ]
 
 
+def _required_indicators(universe: UniverseDefinition) -> tuple[IndicatorDefinition, ...]:
+    return tuple(definition for definition in universe.indicators if definition.required_for_warmup)
+
+
+def _optional_indicators(universe: UniverseDefinition) -> tuple[IndicatorDefinition, ...]:
+    return tuple(definition for definition in universe.indicators if not definition.required_for_warmup)
+
+
 def _build_symbol_report(
     indicator_engine: IndicatorEngine,
     sleeve_id: str,
@@ -227,18 +261,33 @@ def _build_symbol_report(
     *,
     loaded_bar_count: int,
     required_bars: int,
-    indicator_count: int,
+    required_indicators: tuple[IndicatorDefinition, ...],
+    optional_indicators: tuple[IndicatorDefinition, ...],
     failure_message: str | None,
 ) -> WarmupSymbolReport:
     ready_indicator_count = len(indicator_engine.ready_values(sleeve_id, symbol))
+    required_names = tuple(definition.name for definition in required_indicators)
+    optional_names = tuple(definition.name for definition in optional_indicators)
+    missing_required_indicators = tuple(
+        name for name in required_names if not indicator_engine.is_ready(sleeve_id, symbol, name)
+    )
+    missing_optional_indicators = tuple(
+        name for name in optional_names if not indicator_engine.is_ready(sleeve_id, symbol, name)
+    )
     failed = failure_message is not None
     return WarmupSymbolReport(
         symbol_key=symbol.key,
         loaded_bar_count=loaded_bar_count,
         required_warmup_bars=required_bars,
-        indicator_count=indicator_count,
+        indicator_count=len(required_indicators) + len(optional_indicators),
         ready_indicator_count=ready_indicator_count,
-        is_ready=not failed and ready_indicator_count == indicator_count,
+        required_indicator_count=len(required_indicators),
+        required_ready_indicator_count=len(required_indicators) - len(missing_required_indicators),
+        optional_indicator_count=len(optional_indicators),
+        optional_ready_indicator_count=len(optional_indicators) - len(missing_optional_indicators),
+        is_ready=not failed and not missing_required_indicators,
+        missing_required_indicators=missing_required_indicators,
+        missing_optional_indicators=missing_optional_indicators,
         failed=failed,
         message=failure_message,
     )

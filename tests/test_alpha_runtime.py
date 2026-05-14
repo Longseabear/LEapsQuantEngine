@@ -226,6 +226,52 @@ def generate(context):
     assert batch.insights[0].reason == "loaded_from_python"
 
 
+def test_python_alpha_loader_preserves_function_state_patches(tmp_path):
+    alpha_file = tmp_path / "my_stateful_alpha.py"
+    alpha_file.write_text(
+        """
+from datetime import datetime
+from leaps_quant_engine.alpha import Insight, InsightDirection
+from leaps_quant_engine.runtime_state import StatePatch
+
+ALPHA_ID = "tmp-stateful-alpha"
+VERSION = "2026.05.08"
+
+def generate(context):
+    return [Insight(
+        sleeve_id=context.sleeve_id,
+        symbol=context.symbol("KRX:005930"),
+        direction=InsightDirection.UP,
+        generated_at=datetime(2026, 5, 8, 9, 0),
+        source_snapshot_id=context.source_snapshot_id,
+        alpha_id=ALPHA_ID,
+        alpha_version=VERSION,
+        reason="loaded_from_python",
+    )]
+
+def state_patches(context, insights):
+    return (StatePatch(
+        key=context.model_state.key(
+            sleeve_id=context.sleeve_id,
+            model_id=ALPHA_ID,
+            namespace="test",
+            symbol_key="KRX:005930",
+        ),
+        value={"insight_count": len(insights)},
+        reason="loaded_state_patch",
+    ),)
+""",
+        encoding="utf-8",
+    )
+
+    loaded = PythonAlphaLoader().load(alpha_file)
+    batch = AlphaRuntime(active_models=(loaded.model,)).run(SnapshotContext.from_indicator_snapshot(_snapshot()))
+
+    assert batch.metadata["state_patch_count"] == 1
+    assert batch.state_patches[0].key.model_id == "tmp-stateful-alpha"
+    assert batch.state_patches[0].value["insight_count"] == 1
+
+
 def test_alpha_runtime_rejects_model_without_metadata():
     class BadAlpha:
         def generate(self, context):

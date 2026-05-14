@@ -52,5 +52,24 @@ def _parse_indicator_definition(payload: dict[str, Any]) -> IndicatorDefinition:
         period=int(payload["period"]),
         field=str(payload.get("field", "close")).strip() or "close",
         resolution=str(payload.get("resolution", "any")).strip().lower() or "any",
+        readiness=_parse_indicator_readiness(payload),
         parameters=dict(payload.get("parameters") or {}),
     )
+
+
+def _parse_indicator_readiness(payload: dict[str, Any]) -> str:
+    if "required_for_warmup" in payload:
+        return "required" if _parse_bool(payload["required_for_warmup"]) else "optional"
+    return str(payload.get("readiness", "required")).strip().lower() or "required"
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"Expected a boolean required_for_warmup value, got {value!r}.")

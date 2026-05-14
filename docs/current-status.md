@@ -1,6 +1,6 @@
 # Current Status
 
-Last updated: 2026-05-14
+Last updated: 2026-05-15
 
 This document records what is currently implemented and what should come next. It is intentionally operational: keep it close to the code and update it whenever a public runtime contract changes.
 
@@ -70,15 +70,18 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
   framework and portfolio payload. Agents should use it as the quick status line
   for active config/version, snapshot quality, portfolio cash/equity, held
   symbols, target/order counts, and risk/execution counts.
-- `VirtualSleeveAccountStore` maintains persisted per-sleeve `PositionState`
-  records from fills:
-  - quantity and average entry price
-  - original entry time
-  - high-watermark price/time
-  - latest marked price/time
-  - optional latest stop price
-  This gives trailing-stop and position lifecycle models a restart-safe state
-  source without putting strategy state inside alpha module globals.
+- `RuntimeStateStore` is the restart-safe state surface for model-owned anchors
+  such as trailing-stop high watermarks. Alpha, portfolio, risk, and execution
+  models read `context.model_state` and request updates through `StatePatch`;
+  the framework commits those patches only after a successful cycle.
+  `VirtualSleeveAccountStore` remains the engine/account ledger for cash,
+  holdings, fills, and reconciliation, not a model-facing state API.
+- Portfolio Blend is implemented as an optional engine target-transition layer:
+  previous committed target snapshot -> current raw portfolio target snapshot
+  -> blended target percentages -> order sizing. It stores compact transition
+  state in `RuntimeStateStore` under `engine-portfolio-blend`, advances active
+  transitions between portfolio rebalance runs, and bypasses explicit
+  flat/down/stop/urgent/manual/operator/force/risk targets.
 - Recent US ETF minute feed import:
   - runtime config: `configs/runtime/us_etf_rotation_sleeve.json`
   - sleeve: `us_etf_rotation`
@@ -279,12 +282,17 @@ Those bars increment `warmup_data_slice_count` and do not run
 alpha/portfolio/risk/execution or affect performance metrics. This prevents
 short backtests such as a one-day `2026-05-08` check from starting with cold
 daily momentum indicators.
-The LEaps workspace config now uses `configs/universes/leaps_kr_us_research_core.json`,
-a KR/US mixed research universe with KRX stocks, US stocks, and defensive US
-ETFs. The active thesis is KRW/KOSPI upside with a USD stability hedge:
+Universe indicators now support LEAN-style readiness: `readiness="required"`
+is the default and participates in `required_warmup_bars`,
+`min_ready_ratio`, and `warmup_not_ready`; `readiness="optional"` indicators
+are still registered and updated when history exists, but missing optional
+values are reported separately and do not block fresh entries by themselves.
+The LEaps workspace config now uses `configs/universes/leaps_kr_research_core.json`,
+a KRX research universe. The active thesis is KRW/KOSPI upside:
 `leaps-kospi-conviction` emits concentrated KRX growth insights,
-`leaps-us-stability-hedge` emits defensive US ETF insights, and
-`leaps-volatility-trailing-stop` remains the exit/risk-reduction alpha. The
+`leaps-kospi-pullback-reversion` adds pullback/rebreak timing insights, and
+`leaps-volatility-trailing-stop` remains the exit/risk-reduction alpha. US ETF
+rotation/stability is handled by the separate `us_etf_rotation` sleeve. The
 default sleeve is still present in the same config with zero cash and no alpha
 modules, so order/target activity should be isolated to LEaps when
 `--sleeve-id LEaps` is used.
@@ -303,8 +311,8 @@ and use market-feedback rewards that prefer Sharpe/drawdown shape over raw CAGR.
 The current saved policy uses `AttentionPortfolioFeaturesExtractor`, so top-k
 candidate tokens are passed through a Transformer encoder before PPO chooses the
 direct top-k asset weights plus a cash weight. `risks/kospi_growth_us_hedge.py`
-then applies currency-specific clamps: higher KRW exposure for the KOSPI thesis
-and lower USD exposure for the hedge pocket.
+then applies the KRW position, cash, freshness, and regime exposure clamps for
+the KRX-only LEaps sleeve.
 The current chosen LEaps allocation profile is `allocation_mode=rl_weights`.
 The previous attention-PPO gross-exposure controller remains available as a
 comparison profile, but the active runtime now lets RL decide portfolio
@@ -315,7 +323,10 @@ changes rather than only token-position changes.
 The current LEaps RL constructor also treats same-symbol FLAT/DOWN insights as
 an override over same-or-older UP insights. This lets
 `leaps-volatility-trailing-stop` force an exit target for held symbols without
-alpha models creating orders directly.
+alpha models creating orders directly. The LEaps and US ETF trailing-stop alphas
+now persist high-watermark marks through `context.model_state` +
+`StatePatch(namespace="trailing_stop")`; they no longer rely only on the rolling
+high indicator when a prior runtime mark exists.
 LEaps config now enables `emit_zero_for_missing_held_targets` on the RL
 constructor. This means the RL target set is interpreted as the complete target
 portfolio for any currency bucket with actionable UP insights: held symbols that
@@ -323,6 +334,12 @@ drop out of that bucket's target set get explicit 0% targets tagged
 `no_longer_in_target_portfolio`. The model does not mass-flatten when a currency
 bucket has no actionable insights, so degraded/no-signal cycles do not become
 implicit all-sell cycles.
+LEaps config also enables a portfolio target anchor drift guard:
+`target_smoothing_alpha=1.0` and `target_drift_threshold_pct=0.035`. This keeps
+meaningful target changes immediate while suppressing sub-3.5 percentage-point
+target churn. The anchor is read through `context.model_state` and updated by
+portfolio `StatePatch(namespace="target_anchor")`; explicit FLAT/DOWN stop
+targets bypass the guard.
 LEaps alpha v0.2 upgrades the momentum and ETF rotation modules with
 risk-adjusted scoring. Momentum now uses fast/slow trend confirmation,
 20-session momentum, short acceleration, normalized volatility, and liquidity,
@@ -1566,7 +1583,7 @@ py -3 -m pytest -q
 Expected current result:
 
 ```text
-424 passed, 1 warning
+460 passed, 1 warning
 ```
 
 Run sample:
@@ -1677,6 +1694,12 @@ INPUT_RESOLUTION = "daily"
 `AlphaRuntime` tracks the last run per `alpha_id`. If a same-day cycle is skipped, it publishes an empty `InsightBatch` with `metadata.ran_alpha_ids` and `metadata.skipped_alpha_ids`, while `InsightManager` keeps existing active insights alive until their normal expiry.
 
 Portfolio construction now uses `portfolio.rebalance.cadence`. When cadence is not due, `FrameworkRunner` reuses the last allocation targets instead of rebuilding a new target set from a minute-level context. `OrderSizingEngine` still recomputes desired value, target quantity, and delta quantity from the current virtual portfolio, current price, and current cash/equity every cycle. If `portfolio.rebalance.reused_target_churn_guard` is enabled, reused batches can suppress tiny adjacent-lot non-exit flips caused by discretization, while fresh allocation batches and explicit exit/flat targets remain tradeable. Risk and execution then run against the resulting sized targets. Urgent exits should be modeled as always-on risk or explicitly quote-resolution exit models; daily portfolio cadence should not be the only safety path.
+
+`portfolio.blend` is now available for operational target transitions. The live
+LEaps and `us_etf_rotation` configs enable a 300-minute orderable-session blend
+for raw target drift of 0.08 or more. The old side is the stored target snapshot,
+not a concurrently running old model. Active blend progress is visible in
+`portfolio_target_batch.metadata.portfolio_blend`.
 
 ## Next Work
 

@@ -2,6 +2,9 @@
 
 This workspace owns sleeve-specific strategy code and settings for the `LEaps` sleeve.
 
+Operational notes and live/debugging heuristics live in
+[`OPERATIONS.md`](OPERATIONS.md).
+
 Initial layout:
 
 ```text
@@ -117,23 +120,38 @@ allocation_mode = rl_weights
 action_space = Box(top_k + 1)
 action = top-k asset scores + cash score
 selected search profile = identity_turnover_top8_compact
+target_smoothing_alpha = 1.0
+target_drift_threshold_pct = 0.035
 ```
 
 The earlier gross-exposure controller remains available for comparison and
 fallback, but it is no longer the active LEaps runtime mode.
 
+The target drift guard uses `context.model_state` and `StatePatch` anchors in
+the `target_anchor` namespace. It does not delay large target changes; it only
+reuses the previous target when the new target is within 3.5 percentage points,
+which suppresses small rank/noise churn while keeping explicit FLAT/DOWN stop
+exits immediate.
+
 Alpha v0.2 notes:
 
 - `leaps-kospi-conviction` is the active KRW growth alpha. It only emits KRX
   UP insights and reflects the working thesis that KOSPI upside should receive
-  the primary risk budget.
-- `leaps-us-stability-hedge` is the active USD stabilizer. It prefers
-  defensive/low-volatility/dividend/treasury/gold ETFs over high-beta US
-  growth exposure.
+  the primary risk budget. Its current score includes recency-weighted
+  momentum, sector relative strength, and entry-timing metadata.
+- `leaps-kospi-pullback-reversion` is active as the timing alpha for strong KRX
+  stocks. It looks for healthy pullbacks or shallow rebreaks inside an existing
+  uptrend.
+- `leaps-us-stability-hedge` is kept as a research module, but it is not active
+  in the current LEaps live profile. US ETF rotation/stability is handled by the
+  separate `us_etf_rotation` sleeve.
 - `leaps-volatility-trailing-stop` remains the exit/risk-reduction alpha for
-  operationally watched or held symbols.
-- `risks/kospi_growth_us_hedge.py` applies different risk budgets by currency:
-  KRW can carry the growth exposure, while USD is capped as a stability pocket.
+  operationally watched or held symbols. It reads prior high-watermark state
+  through `context.model_state` and requests updates with `StatePatch` records
+  in the `trailing_stop` namespace; it does not read or write virtual account
+  files directly.
+- `risks/kospi_growth_us_hedge.py` currently applies the KRW growth budget and
+  regime exposure cap for this KRX-only LEaps profile.
 
 Execution v0.2 notes:
 
@@ -192,23 +210,28 @@ For mixed KRW/USD runs, read `metrics_by_currency`. The aggregate `metrics`
 block is marked `valid_without_fx=false` because the engine does not yet convert
 USD to KRW or KRW to USD for total-equity reporting.
 
-The current RL allocator remains operationally valid but turnover-heavy. Treat
-turnover tuning as portfolio/risk policy work, not as a reason to put order or
-state side effects inside alpha or portfolio modules.
+The current RL allocator remains operationally valid but can be turnover-heavy
+without a target drift guard. Treat turnover tuning as portfolio/risk policy
+work, not as a reason to put order or state side effects inside alpha or
+portfolio modules.
 
 `configs/runtime/leaps_workspace_smoke.json` now points LEaps at
-`configs/universes/leaps_kr_us_research_core.json`, a KR/US mixed research
-universe with KRX stocks, US stocks, and US hedge/stability ETFs. The indicator
-plan includes the names used by the configured selectors and alphas:
+`configs/universes/leaps_kr_research_core.json`, a KRX research universe. US
+ETF rotation/stability runs in its own sleeve. The indicator plan includes the
+names used by the configured selectors and alphas:
 
 - KOSPI conviction: `identity_close`, `ema_8_close`, `sma_20_close`,
   `momentum_5_close`, `roc_20_close`, `stddev_20_close`, `atr_14`,
-  `rolling_dollar_volume_20`
-- US stability hedge: `identity_close`, `ema_8_close`, `sma_20_close`,
-  `roc_20_close`, `stddev_20_close`, `atr_14`,
+  `rolling_dollar_volume_20`. `roc_60_close` is registered in the live universe
+  with `readiness="optional"`, so models can use it when warmed while shorter
+  required indicators still control `warmup_not_ready` entry gating.
+- KOSPI pullback/rebreak: `identity_close`, `ema_8_close`, `sma_20_close`,
+  `momentum_5_close`, `roc_20_close`, `rolling_max_20_close`,
+  `rolling_min_20_close`, `stddev_20_close`, `atr_14`,
   `rolling_dollar_volume_20`
 - trailing stop: `identity_close`, `rolling_max_20_close`, `atr_14`,
-  `stddev_20_close`
+  `stddev_20_close`, plus optional runtime model state
+  `leaps-volatility-trailing-stop/trailing_stop/<symbol>`
 
 The default sleeve remains in the same runtime config with zero cash and no
 alpha modules, so research backtests should create targets and order intents

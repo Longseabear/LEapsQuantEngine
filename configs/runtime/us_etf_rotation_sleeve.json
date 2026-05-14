@@ -76,7 +76,6 @@
       },
         "portfolio": {
           "model": "portfolios/rl_ppo_constructor.py",
-          "account_store_path": "../../data/virtual-accounts/kis_overseas.json",
           "parameters": {
           "policy_path": null,
           "policy_paths": [
@@ -106,6 +105,13 @@
           "reused_target_churn_max_quantity_delta": 1,
           "reused_target_churn_lot_fraction": 0.5,
           "reused_target_churn_equity_bps": 10.0
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 300,
+          "target_drift_threshold_pct": 0.08,
+          "clock": "orderable_session",
+          "missing_target_behavior": "drop"
         }
       },
       "risk": {

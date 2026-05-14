@@ -561,6 +561,7 @@ def test_cli_leaps_runtime_backtest_uses_kr_research_universe_and_krw_cash(monke
     assert payload["portfolio"]["initial_cash_by_currency"] == {"KRW": 2000000.0}
     assert payload["alpha"]["input_selections"] == {
         "leaps-kospi-conviction": "leaps-stock-momentum",
+        "leaps-kospi-pullback-reversion": "leaps-stock-momentum",
         "leaps-volatility-trailing-stop": "leaps-operational-symbols",
     }
     assert set(payload["selection"]["selection_ids"]) == {

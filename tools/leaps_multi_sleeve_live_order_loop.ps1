@@ -598,7 +598,7 @@ function Invoke-OrderRuntimeSupervise {
 
 Initialize-ActiveSleeveState
 
-Write-LoopLog "multi-sleeve live order loop started config=$script:Config sleeves=$($script:SleeveIds -join ',') interval=${IntervalSeconds}s domestic_max=$DomesticMaxSubmitNotional overseas_max=$OverseasMaxSubmitNotional framework_state_dir=$FrameworkStateDir hot_reload=$hotReloadEnabled control_queue=$controlQueueFullPath active_sleeves=$activeSleevesFullPath schedules=$($SleeveSchedules -join ';')"
+Write-LoopLog "multi-sleeve live order loop started config=$script:Config sleeves=$($script:SleeveIds -join ',') interval=${IntervalSeconds}s domestic_max=$DomesticMaxSubmitNotional overseas_max=$OverseasMaxSubmitNotional framework_state_dir=$FrameworkStateDir runtime_state=$runtimeStateFullPath hot_reload=$hotReloadEnabled control_queue=$controlQueueFullPath active_sleeves=$activeSleevesFullPath schedules=$($SleeveSchedules -join ';')"
 Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath submit_state=$submitStateFullPath"
 $cycleIndex = 0
 

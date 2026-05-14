@@ -6,16 +6,18 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-kospi-pullback-reversion"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 EVALUATION_CADENCE = "every_cycle"
 INPUT_RESOLUTION = "daily"
-HORIZON = timedelta(days=3)
+HORIZON = timedelta(days=2)
 MAX_SELECTED = 4
-MIN_SCORE = 0.045
+MIN_SCORE = 0.07
 MIN_TREND_MOMENTUM = 0.08
 MAX_PULLBACK_DEPTH = 0.16
 MIN_PULLBACK_DEPTH = 0.015
 MAX_NORMALIZED_VOLATILITY = 0.17
+MAX_REBREAK_DISTANCE = 0.05
+MIN_REBREAK_MOMENTUM_5 = 0.015
 
 
 def generate(context: SnapshotContext) -> list[Insight]:
@@ -57,8 +59,15 @@ def generate(context: SnapshotContext) -> list[Insight]:
         pullback_from_high = max((rolling_high - close) / rolling_high, 0.0)
         distance_to_fast = (fast_average / close) - 1.0
         short_reversal_pressure = max(-(momentum_5 or 0.0), 0.0)
-        pullback_depth = max(pullback_from_high, distance_to_fast, short_reversal_pressure)
-        if pullback_depth < MIN_PULLBACK_DEPTH or pullback_depth > MAX_PULLBACK_DEPTH:
+        timing = _entry_timing(
+            close=close,
+            fast_average=fast_average,
+            momentum_5=momentum_5 or 0.0,
+            pullback_from_high=pullback_from_high,
+            distance_to_fast=distance_to_fast,
+            short_reversal_pressure=short_reversal_pressure,
+        )
+        if timing is None:
             continue
         if rolling_low is not None and rolling_low > 0 and close <= rolling_low * 1.01:
             continue
@@ -68,7 +77,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
             0.035
             + (trend_strength * 0.40)
             + (momentum_20 * 0.22)
-            + (pullback_depth * 0.85)
+            + (timing["score"] * 0.85)
             + liquidity_bonus
             - (volatility * 0.42)
         )
@@ -84,7 +93,8 @@ def generate(context: SnapshotContext) -> list[Insight]:
                 "momentum_5": momentum_5 or 0.0,
                 "trend_strength": trend_strength,
                 "volatility": volatility,
-                "pullback_depth": pullback_depth,
+                "pullback_depth": timing["score"],
+                "entry_setup": timing["setup"],
                 "pullback_from_high": pullback_from_high,
                 "distance_to_fast": distance_to_fast,
                 "short_reversal_pressure": short_reversal_pressure,
@@ -128,6 +138,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
                     "trend_strength": item["trend_strength"],
                     "volatility": item["volatility"],
                     "pullback_depth": item["pullback_depth"],
+                    "entry_setup": item["entry_setup"],
                     "pullback_from_high": item["pullback_from_high"],
                     "distance_to_fast": item["distance_to_fast"],
                     "short_reversal_pressure": item["short_reversal_pressure"],
@@ -153,6 +164,31 @@ def _normalized_volatility(context: SnapshotContext, symbol_key: str, close: flo
     if atr is not None:
         values.append(atr / close)
     return max(values) if values else 0.0
+
+
+def _entry_timing(
+    *,
+    close: float,
+    fast_average: float,
+    momentum_5: float,
+    pullback_from_high: float,
+    distance_to_fast: float,
+    short_reversal_pressure: float,
+) -> dict[str, float | str] | None:
+    pullback_depth = max(pullback_from_high, distance_to_fast, short_reversal_pressure)
+    if (
+        pullback_from_high <= MAX_REBREAK_DISTANCE
+        and momentum_5 >= MIN_REBREAK_MOMENTUM_5
+        and close >= fast_average * 0.995
+    ):
+        rebreak_score = max(
+            MIN_PULLBACK_DEPTH,
+            min(MAX_REBREAK_DISTANCE - pullback_from_high + momentum_5, MAX_PULLBACK_DEPTH),
+        )
+        return {"setup": "rebreak", "score": rebreak_score}
+    if MIN_PULLBACK_DEPTH <= pullback_depth <= MAX_PULLBACK_DEPTH:
+        return {"setup": "pullback", "score": pullback_depth}
+    return None
 
 
 def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ...]) -> float | None:

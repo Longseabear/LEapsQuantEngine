@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 import json
+import os
 from pathlib import Path
 import sqlite3
 from types import MappingProxyType
@@ -262,6 +264,28 @@ class RuntimeModelStateView:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeStateForkReport:
+    source: Path
+    target: Path
+    record_count: int
+    event_count: int
+    source_size_bytes: int
+    target_size_bytes: int
+    status: str = "forked"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "source": str(self.source),
+            "target": str(self.target),
+            "record_count": self.record_count,
+            "event_count": self.event_count,
+            "source_size_bytes": self.source_size_bytes,
+            "target_size_bytes": self.target_size_bytes,
+        }
+
+
 class InMemoryRuntimeStateStore:
     def __init__(self) -> None:
         self._records: dict[tuple[str, str, str, str, str], ModelStateRecord] = {}
@@ -465,6 +489,47 @@ class SQLiteRuntimeStateStore:
         return connection
 
 
+def fork_sqlite_runtime_state(source: Path, target: Path, *, overwrite: bool = False) -> RuntimeStateForkReport:
+    """Create a consistent SQLite runtime-state snapshot for sandbox runs."""
+
+    source_path = Path(source).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+    if source_path == target_path:
+        raise ValueError("source and target runtime-state paths must be different.")
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+    if target_path.exists() and not overwrite:
+        raise FileExistsError(target_path)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f"{target_path.name}.{os.getpid()}.tmp")
+    if temp_path.exists():
+        temp_path.unlink()
+
+    try:
+        with closing(sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)) as source_connection:
+            with closing(sqlite3.connect(temp_path)) as target_connection:
+                source_connection.backup(target_connection)
+                target_connection.commit()
+        os.replace(temp_path, target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    with closing(sqlite3.connect(target_path)) as connection:
+        record_count = _table_row_count(connection, "model_state")
+        event_count = _table_row_count(connection, "model_state_events")
+
+    return RuntimeStateForkReport(
+        source=source_path,
+        target=target_path,
+        record_count=record_count,
+        event_count=event_count,
+        source_size_bytes=source_path.stat().st_size,
+        target_size_bytes=target_path.stat().st_size,
+    )
+
+
 def _apply_patch_to_records(
     records: dict[tuple[str, str, str, str, str], ModelStateRecord],
     patch: StatePatch,
@@ -623,6 +688,16 @@ def _delete_record(connection: sqlite3.Connection, key: ModelStateKey) -> None:
         """,
         key.tuple_key,
     )
+
+
+def _table_row_count(connection: sqlite3.Connection, table_name: str) -> int:
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    if exists is None:
+        return 0
+    return int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
 
 
 def _where_clause(filters: Mapping[str, str | None]) -> tuple[str, tuple[str, ...]]:

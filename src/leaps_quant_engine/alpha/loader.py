@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from leaps_quant_engine.alpha.domain import AlphaModel, Insight, SnapshotContext
 
@@ -27,9 +28,15 @@ class FunctionAlphaModel:
     generate_fn: Callable[[SnapshotContext], list[Insight] | tuple[Insight, ...]]
     evaluation_cadence: str = "every_cycle"
     input_resolution: str = "any"
+    state_patches_fn: Callable[..., Any] | None = None
 
     def generate(self, context: SnapshotContext) -> list[Insight] | tuple[Insight, ...]:
         return self.generate_fn(context)
+
+    def state_patches(self, *args: Any, **kwargs: Any) -> Any:
+        if self.state_patches_fn is None:
+            return ()
+        return self.state_patches_fn(*args, **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,12 +79,14 @@ def _model_from_module(module: ModuleType) -> AlphaModel:
         version = str(getattr(module, "VERSION", "0.1.0"))
         evaluation_cadence = str(getattr(module, "EVALUATION_CADENCE", "every_cycle"))
         input_resolution = str(getattr(module, "INPUT_RESOLUTION", "any"))
+        state_patches = getattr(module, "state_patches", None)
         return FunctionAlphaModel(
             alpha_id=alpha_id,
             version=version,
             generate_fn=generate,
             evaluation_cadence=evaluation_cadence,
             input_resolution=input_resolution,
+            state_patches_fn=state_patches if callable(state_patches) else None,
         )
     raise ValueError("Python alpha module must expose create_alpha_model(), ALPHA_MODEL, or generate(context).")
 

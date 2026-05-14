@@ -34,12 +34,17 @@ Required sections:
    - delta quantity
    - status: hold, approved, clamped, rejected, or not_run
    - non-approved reason if present
-   - Telegram output should render this section as a Markdown code-block table
-     so columns stay aligned across clients.
+   - Telegram output should default to mobile-first stacked symbol blocks.
+     Markdown code-block tables are allowed only for explicit desktop/table
+     diagnostics.
 
 4. Price context
    - market price for held symbols
    - average price for held symbols
+   - current holding unrealized PnL
+   - cumulative FIFO realized PnL estimate when available
+   - combined current holding plus cumulative realized estimate when both are
+     present
 
 5. Diagnostics
    - snapshot degraded/stale status
@@ -58,6 +63,8 @@ Rules:
   quantity and status `hold`.
 - If a target is rejected, show the requested target quantity and the reason,
   but do not describe it as a pending order.
+- Label fill-ledger realized PnL as cumulative/estimated. Do not present an old
+  closed-lot realized loss as the current open position's loss.
 
 ## Backtest Report
 

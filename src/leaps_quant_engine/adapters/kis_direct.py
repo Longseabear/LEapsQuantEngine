@@ -73,6 +73,12 @@ class KISDirectClient:
             return self._get_or_cache_domestic_minute_bars(args)
         if operation == "get_intraday_bars":
             return self._get_domestic_intraday_bars(args)
+        if operation == "get_domestic_news_titles":
+            return self._get_domestic_news_titles(args)
+        if operation == "get_overseas_news_titles":
+            return self._get_overseas_news_titles(args)
+        if operation == "get_overseas_breaking_news_titles":
+            return self._get_overseas_breaking_news_titles(args)
         if operation == "get_account_balance_summary":
             return self._get_account_balance_summary(args)
         if operation == "get_account_holdings":
@@ -300,6 +306,94 @@ class KISDirectClient:
             "total_bid_size": _to_int(output.get("total_bidp_rsqn"), "total_bidp_rsqn"),
             "levels": levels,
             "raw_output": output,
+        }
+
+    def _get_domestic_news_titles(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Return KIS domestic market/news/disclosure title rows as normalized records."""
+        payload = self._get_json(
+            "/uapi/domestic-stock/v1/quotations/news-title",
+            tr_id="FHKST01011800",
+            params={
+                "FID_NEWS_OFER_ENTP_CODE": _optional_text(args.get("provider_code")),
+                "FID_COND_MRKT_CLS_CODE": _optional_text(args.get("market_class_code")),
+                "FID_INPUT_ISCD": _optional_text(args.get("symbol")),
+                "FID_TITL_CNTT": _optional_text(args.get("title")),
+                "FID_INPUT_DATE_1": _optional_date(args.get("date")) or "",
+                "FID_INPUT_HOUR_1": _optional_time(args.get("time")) or "",
+                "FID_RANK_SORT_CLS_CODE": _optional_text(args.get("rank_sort_code")),
+                "FID_INPUT_SRNO": _optional_text(args.get("serial_no")),
+            },
+            label="domestic news titles",
+        )
+        rows = _required_sequence(payload, "output")
+        items = [_normalize_domestic_news_title_row(row) for row in rows]
+        items = _limit_items(items, args.get("max_results"))
+        return {
+            "source": "kis",
+            "market": "domestic",
+            "operation": "get_domestic_news_titles",
+            "count": len(items),
+            "items": items,
+            "raw_count": len(rows),
+        }
+
+    def _get_overseas_news_titles(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Return KIS overseas aggregate news title rows as normalized records."""
+        payload = self._get_json(
+            "/uapi/overseas-price/v1/quotations/news-title",
+            tr_id="HHPSTH60100C1",
+            params={
+                "INFO_GB": _optional_text(args.get("info_gb")),
+                "CLASS_CD": _optional_text(args.get("class_cd")),
+                "NATION_CD": _optional_text(args.get("nation_code")),
+                "EXCHANGE_CD": _optional_text(args.get("exchange")),
+                "SYMB": _optional_text(args.get("symbol")).upper(),
+                "DATA_DT": _optional_date(args.get("date")) or "",
+                "DATA_TM": _optional_time(args.get("time")) or "",
+                "CTS": _optional_text(args.get("cts")),
+            },
+            label="overseas news titles",
+        )
+        rows = _required_sequence(payload, "outblock1")
+        items = [_normalize_overseas_news_title_row(row) for row in rows]
+        items = _limit_items(items, args.get("max_results"))
+        return {
+            "source": "kis",
+            "market": "overseas",
+            "operation": "get_overseas_news_titles",
+            "count": len(items),
+            "items": items,
+            "raw_count": len(rows),
+        }
+
+    def _get_overseas_breaking_news_titles(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Return KIS overseas breaking-news title rows as normalized records."""
+        payload = self._get_json(
+            "/uapi/overseas-price/v1/quotations/brknews-title",
+            tr_id="FHKST01011801",
+            params={
+                "FID_NEWS_OFER_ENTP_CODE": _optional_text(args.get("provider_code")) or "0",
+                "FID_COND_SCR_DIV_CODE": _optional_text(args.get("screen_div_code")) or "11801",
+                "FID_COND_MRKT_CLS_CODE": _optional_text(args.get("market_class_code")),
+                "FID_INPUT_ISCD": _optional_text(args.get("symbol")).upper(),
+                "FID_TITL_CNTT": _optional_text(args.get("title")),
+                "FID_INPUT_DATE_1": _optional_date(args.get("date")) or "",
+                "FID_INPUT_HOUR_1": _optional_time(args.get("time")) or "",
+                "FID_RANK_SORT_CLS_CODE": _optional_text(args.get("rank_sort_code")),
+                "FID_INPUT_SRNO": _optional_text(args.get("serial_no")),
+            },
+            label="overseas breaking news titles",
+        )
+        rows = _required_sequence(payload, "output")
+        items = [_normalize_domestic_news_title_row(row) for row in rows]
+        items = _limit_items(items, args.get("max_results"))
+        return {
+            "source": "kis",
+            "market": "overseas",
+            "operation": "get_overseas_breaking_news_titles",
+            "count": len(items),
+            "items": items,
+            "raw_count": len(rows),
         }
 
     def _get_overseas_price(self, symbol: str, exchange: str) -> dict[str, Any]:
@@ -1144,6 +1238,9 @@ _SUPPORTED_OPERATIONS = {
     "get_or_cache_daily_ohlcv",
     "get_or_cache_domestic_minute_bars",
     "get_intraday_bars",
+    "get_domestic_news_titles",
+    "get_overseas_news_titles",
+    "get_overseas_breaking_news_titles",
     "get_account_balance_summary",
     "get_account_holdings",
     "get_account_execution_history",
@@ -1192,6 +1289,77 @@ _OVERSEAS_REVISE_CANCEL_TR_IDS = {
 }
 _MARKET_PRICE_ORDER_DIVISIONS = {"01", "13", "14"}
 _LIMIT_PRICE_ORDER_DIVISIONS = {"00", "05", "06", "07", "11", "12"}
+
+
+def _optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _limit_items(items: list[dict[str, Any]], max_results: Any) -> list[dict[str, Any]]:
+    if max_results in (None, ""):
+        return items
+    return items[: _non_negative_int(max_results, "max_results")]
+
+
+def _normalize_domestic_news_title_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    date = _optional_text(row.get("data_dt"))
+    news_time = _optional_text(row.get("data_tm"))
+    return {
+        "id": _optional_text(row.get("cntt_usiq_srno")),
+        "date": date,
+        "time": news_time,
+        "timestamp": _join_kis_timestamp(date, news_time),
+        "title": _optional_text(row.get("hts_pbnt_titl_cntt")),
+        "provider_code": _optional_text(row.get("news_ofer_entp_code")),
+        "category_code": _optional_text(row.get("news_lrdv_code")),
+        "source": _optional_text(row.get("dorg")),
+        "symbols": _news_row_symbols(row),
+        "symbol_names": _news_row_symbol_names(row),
+        "raw_output": dict(row),
+    }
+
+
+def _normalize_overseas_news_title_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    date = _optional_text(row.get("data_dt"))
+    news_time = _optional_text(row.get("data_tm"))
+    symbol = _optional_text(row.get("symb")).upper()
+    return {
+        "id": _optional_text(row.get("news_key")),
+        "date": date,
+        "time": news_time,
+        "timestamp": _join_kis_timestamp(date, news_time),
+        "title": _optional_text(row.get("title")),
+        "info_gb": _optional_text(row.get("info_gb")),
+        "class_code": _optional_text(row.get("class_cd")),
+        "class_name": _optional_text(row.get("class_name")),
+        "source": _optional_text(row.get("source")),
+        "nation_code": _optional_text(row.get("nation_cd")),
+        "exchange": _optional_text(row.get("exchange_cd")),
+        "symbol": symbol,
+        "symbol_name": _optional_text(row.get("symb_name")),
+        "symbols": [symbol] if symbol else [],
+        "raw_output": dict(row),
+    }
+
+
+def _news_row_symbols(row: Mapping[str, Any]) -> list[str]:
+    symbols: list[str] = []
+    for index in range(1, 11):
+        symbol = _optional_text(row.get(f"iscd{index}")).upper()
+        if symbol:
+            symbols.append(symbol)
+    return symbols
+
+
+def _news_row_symbol_names(row: Mapping[str, Any]) -> list[str]:
+    names: list[str] = []
+    for index in range(1, 11):
+        name = _optional_text(row.get(f"kor_isnm{index}"))
+        if name:
+            names.append(name)
+    return names
 
 
 def _required_text(payload: Mapping[str, Any], key: str) -> str:

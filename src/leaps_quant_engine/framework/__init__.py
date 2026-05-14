@@ -8,6 +8,13 @@ from leaps_quant_engine.framework.portfolio_construction import (
     PortfolioTargetPlan,
     RebalancePolicy,
 )
+from leaps_quant_engine.framework.portfolio_blend import (
+    DEFAULT_PORTFOLIO_BLEND_MODEL_ID,
+    PortfolioBlendDecision,
+    PortfolioBlendEngine,
+    PortfolioBlendPolicy,
+    PortfolioBlendTransition,
+)
 from leaps_quant_engine.framework.order_sizing import (
     OrderSizingBatch,
     OrderSizingContext,
@@ -45,6 +52,11 @@ __all__ = [
     "FrameworkRunnerState",
     "FrameworkRunner",
     "PassThroughRiskManagementModel",
+    "DEFAULT_PORTFOLIO_BLEND_MODEL_ID",
+    "PortfolioBlendDecision",
+    "PortfolioBlendEngine",
+    "PortfolioBlendPolicy",
+    "PortfolioBlendTransition",
     "PortfolioAllocationTarget",
     "PortfolioConstructionEngine",
     "PortfolioConstructionModelLoadError",

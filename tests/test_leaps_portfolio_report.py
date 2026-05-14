@@ -73,13 +73,18 @@ def test_leaps_portfolio_report_formats_korean_status_and_risk_reason():
     message = _format_report(payload, sleeve_id="LEaps", realized_pnl=5_000)
 
     assert "[LEaps] 운용 현황" in message
-    assert "KRX:005930 삼성전자" in message
-    assert "```" in message
-    assert "| 종목" in message
-    assert "| KRX:005930 삼성전자 | 10주 | 11주 | +1 매수" in message
-    assert "| KRX:005930 삼성전자 | 매수 |  1주 | 100,000 |" in message
-    assert "risk clamped:max_position_pct" in message
+    assert "삼성전자 (005930)" in message
+    assert "```" not in message
+    assert "수량 10주 -> 11주 (+1 매수)" in message
+    assert "- 삼성전자 (005930) 매수 1주 @ 100,000" in message
+    assert "리스크 clamped:max_position_pct" in message
     assert "Risk 조정/차단 1건" in message
+    assert "누적 실현 추정: +5,000 KRW" in message
+
+    table_message = _format_report(payload, sleeve_id="LEaps", realized_pnl=5_000, layout="table")
+    assert "```" in table_message
+    assert "| 종목" in table_message
+    assert "| KRX:005930 삼성전자 | 10주 | 11주 | +1 매수" in table_message
 
 
 def test_leaps_portfolio_report_explains_too_small_risk_reason():

@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEaps GitHub Issues"
+  short_description: "Handle GitHub issues safely"
+  default_prompt: "Use this when inspecting, updating, creating, or closing LEapsQuantEngine GitHub issues. Ask for an issue number or title when the target issue is unclear."

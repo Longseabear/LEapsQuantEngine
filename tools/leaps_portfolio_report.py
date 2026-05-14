@@ -28,6 +28,7 @@ def main() -> int:
     parser.add_argument("--framework-state")
     parser.add_argument("--notify", action="store_true")
     parser.add_argument("--title", default="LEaps Portfolio Report")
+    parser.add_argument("--layout", choices=("mobile", "table"), default="mobile")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -54,6 +55,7 @@ def main() -> int:
         symbol_names=symbol_names,
         realized_pnl=realized["total"],
         realized_pnl_by_symbol=realized["by_symbol"],
+        layout=args.layout,
     )
     message_path.write_text(message, encoding="utf-8")
     print(message)
@@ -134,8 +136,6 @@ def _send_notification(*, title: str, message_path: Path) -> None:
         str(message_path),
         "--root",
         str(ROOT / "data" / "notification-engine"),
-        "--parse-mode",
-        "Markdown",
         "--summary-only",
     ]
     completed = subprocess.run(
@@ -150,6 +150,14 @@ def _send_notification(*, title: str, message_path: Path) -> None:
     )
     if completed.returncode != 0:
         raise RuntimeError(f"notify-user-message failed: {completed.stderr.strip() or completed.stdout.strip()}")
+    try:
+        result = json.loads(completed.stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"notify-user-message returned invalid JSON: {completed.stdout.strip()}") from exc
+    delivery_mode = str(result.get("delivery_mode") or "").lower()
+    delivery_status = str(result.get("delivery_status") or "").lower()
+    if delivery_status == "failed" or (delivery_mode == "telegram" and delivery_status != "sent"):
+        raise RuntimeError(f"notify-user-message delivery failed: {completed.stdout.strip()}")
 
 
 def _format_report(
@@ -159,6 +167,7 @@ def _format_report(
     symbol_names: Mapping[str, str] | None = None,
     realized_pnl: float | None = None,
     realized_pnl_by_symbol: Mapping[str, float] | None = None,
+    layout: str = "mobile",
 ) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     current = payload.get("portfolio_state", {}).get("current", {}) or {}
@@ -203,8 +212,9 @@ def _format_report(
         "",
         "손익",
         f"- 미실현: {_signed_money(unrealized, currency)} {currency} ({_pct(_total_unrealized_pnl_pct(current))})",
-        f"- 실현 추정: {_signed_money(realized_pnl, currency)} {currency}",
+        f"- 누적 실현 추정: {_signed_money(realized_pnl, currency)} {currency}",
         f"- 합산 추정: {_signed_money(total_pnl, currency)} {currency} ({_pct(total_pnl_pct)})",
+        "- 참고: 실현손익은 체결 원장 FIFO 기반 누적 추정입니다.",
         "",
         "보유/목표",
     ]
@@ -216,7 +226,7 @@ def _format_report(
     )
     if not symbols:
         lines.append("- 보유/목표 없음")
-    else:
+    elif layout == "table":
         table_lines, detail_lines = _holding_table_lines(
             symbols,
             current_by_symbol=current_by_symbol,
@@ -229,17 +239,80 @@ def _format_report(
         if detail_lines:
             lines.extend(["", "메모"])
             lines.extend(f"- {line}" for line in detail_lines)
+    else:
+        lines.extend(
+            _holding_mobile_lines(
+                symbols,
+                current_by_symbol=current_by_symbol,
+                target_by_symbol=target_by_symbol,
+                symbol_names=symbol_names,
+                realized_pnl_by_symbol=realized_pnl_by_symbol,
+                currency=currency,
+            )
+        )
 
-    order_lines = _order_lines(framework, symbol_names, currency)
+    order_lines = _order_lines(framework, symbol_names, currency, layout=layout)
     if order_lines:
         lines.extend(["", "주문 후보"])
-        lines.extend(_markdown_code_block(order_lines))
+        if layout == "table":
+            lines.extend(_markdown_code_block(order_lines))
+        else:
+            lines.extend(order_lines)
+
+    blend_lines = _portfolio_blend_lines(framework)
+    if blend_lines:
+        lines.extend(["", "Portfolio Blend"])
+        lines.extend(f"- {line}" for line in blend_lines)
 
     attention = _attention_lines(snapshot_quality, execution, risk, warnings)
     if attention:
         lines.extend(["", "확인 필요"])
         lines.extend(f"- {line}" for line in attention)
     return "\n".join(lines).strip() + "\n"
+
+
+def _holding_mobile_lines(
+    symbols: list[str],
+    *,
+    current_by_symbol: Mapping[str, Mapping[str, Any]],
+    target_by_symbol: Mapping[str, Mapping[str, Any]],
+    symbol_names: Mapping[str, str],
+    realized_pnl_by_symbol: Mapping[str, float],
+    currency: str,
+) -> list[str]:
+    lines: list[str] = []
+    for symbol in symbols:
+        current_item = current_by_symbol.get(symbol, {})
+        target_item = target_by_symbol.get(symbol, {})
+        current_qty = int(current_item.get("quantity", 0) or 0)
+        target_qty = int(target_item.get("target_quantity", current_qty) or 0)
+        delta = target_qty - current_qty
+        pnl = float(current_item.get("unrealized_pnl") or 0.0)
+        realized_symbol = float(realized_pnl_by_symbol.get(symbol) or 0.0)
+
+        lines.append(f"- {_mobile_symbol_label(symbol, symbol_names)}")
+        lines.append(f"  수량 {current_qty}주 -> {target_qty}주 ({_delta_cell(delta)})")
+        if current_qty:
+            lines.append(
+                "  "
+                f"현재 {_money(current_item.get('market_price'), currency)} / "
+                f"평단 {_money(current_item.get('average_price'), currency)} / "
+                f"평가 {_money(current_item.get('market_value'), currency)}"
+            )
+            lines.append(f"  미실현 {_pnl_cell(pnl, current_item.get('unrealized_pnl_pct'), currency)}")
+        elif target_qty:
+            lines.append("  현재 미보유")
+
+        if abs(realized_symbol) >= 0.5:
+            realized_line = f"  누적실현 {_signed_money(realized_symbol, currency)}"
+            if current_qty:
+                realized_line += f" / 보유+누적 {_signed_money(pnl + realized_symbol, currency)}"
+            lines.append(realized_line)
+
+        risk_note = _risk_note(target_item)
+        if risk_note:
+            lines.append(f"  {risk_note}")
+    return lines
 
 
 def _snapshot_quality(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -252,6 +325,44 @@ def _snapshot_quality(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         "collected_symbol_count": status_snapshot.get("updated_symbol_count"),
         "requested_symbol_count": status_snapshot.get("updated_symbol_count"),
     }
+
+
+def _portfolio_blend_lines(framework: Mapping[str, Any]) -> list[str]:
+    blend = _portfolio_blend_payload(framework)
+    if not blend or str(blend.get("status") or "disabled") == "disabled":
+        return []
+    status = str(blend.get("status") or "unknown")
+    progress = blend.get("progress")
+    elapsed = _float_or_none(blend.get("elapsed_minutes"))
+    duration = _float_or_none(blend.get("duration_minutes"))
+    drift = _float_or_none(blend.get("target_drift"))
+    transition_id = str(blend.get("transition_id") or "")
+    bypassed = [str(item) for item in blend.get("bypassed_symbols", []) or []]
+
+    lines = [f"status {status}"]
+    if progress is not None:
+        lines[0] += f" / progress {_pct(progress)}"
+    if elapsed is not None and duration is not None and duration > 0:
+        lines.append(f"elapsed {elapsed:.0f}/{duration:.0f} minutes")
+    if drift is not None:
+        lines.append(f"target drift {_pct(drift)}")
+    if transition_id:
+        lines.append(f"id {transition_id}")
+    if bypassed:
+        lines.append("bypassed " + ", ".join(bypassed))
+    return lines
+
+
+def _portfolio_blend_payload(framework: Mapping[str, Any]) -> Mapping[str, Any]:
+    batch = framework.get("portfolio_target_batch", {}) or {}
+    metadata = batch.get("metadata", {}) if isinstance(batch, Mapping) else {}
+    blend = metadata.get("portfolio_blend") if isinstance(metadata, Mapping) else None
+    if isinstance(blend, Mapping):
+        return blend
+    stage_decisions = framework.get("stage_decisions", {}) or {}
+    portfolio_stage = stage_decisions.get("portfolio", {}) if isinstance(stage_decisions, Mapping) else {}
+    blend = portfolio_stage.get("portfolio_blend") if isinstance(portfolio_stage, Mapping) else None
+    return blend if isinstance(blend, Mapping) else {}
 
 
 def _portfolio_currency(current: Mapping[str, Any]) -> str:
@@ -331,7 +442,7 @@ def _holding_table_lines(
         )
         realized_symbol = float(realized_pnl_by_symbol.get(symbol) or 0.0)
         if abs(realized_symbol) >= 0.5:
-            detail_lines.append(f"{_format_symbol(symbol, symbol_names)} 실현 {_signed_money(realized_symbol, currency)}")
+            detail_lines.append(f"{_format_symbol(symbol, symbol_names)} 누적실현 {_signed_money(realized_symbol, currency)}")
         risk_note = _risk_note(target_item)
         if risk_note:
             detail_lines.append(f"{_format_symbol(symbol, symbol_names)} {risk_note}")
@@ -343,14 +454,26 @@ def _holding_table_lines(
     ), detail_lines
 
 
-def _order_lines(framework: Mapping[str, Any], symbol_names: Mapping[str, str], currency: str) -> list[str]:
+def _order_lines(
+    framework: Mapping[str, Any],
+    symbol_names: Mapping[str, str],
+    currency: str,
+    *,
+    layout: str = "mobile",
+) -> list[str]:
     rows: list[list[str]] = []
+    mobile_lines: list[str] = []
     for order in framework.get("order_intents", []) or []:
         symbol = str(order.get("symbol") or "")
         side = _side_label(order.get("side"))
         quantity = int(order.get("quantity") or 0)
         price = order.get("reference_price")
-        rows.append([_format_symbol(symbol, symbol_names), side, f"{quantity}주", _money(price, currency)])
+        if layout == "table":
+            rows.append([_format_symbol(symbol, symbol_names), side, f"{quantity}주", _money(price, currency)])
+        else:
+            mobile_lines.append(f"- {_mobile_symbol_label(symbol, symbol_names)} {side} {quantity}주 @ {_money(price, currency)}")
+    if layout != "table":
+        return mobile_lines
     if not rows:
         return []
     return _format_table(
@@ -359,6 +482,14 @@ def _order_lines(framework: Mapping[str, Any], symbol_names: Mapping[str, str], 
         max_widths=[22, 4, 5, 10],
         right_align={2, 3},
     )
+
+
+def _mobile_symbol_label(symbol: str, symbol_names: Mapping[str, str]) -> str:
+    name = symbol_names.get(symbol) or _COMMON_SYMBOL_NAMES.get(symbol)
+    if not name:
+        return symbol
+    ticker = symbol.split(":", 1)[1] if ":" in symbol else symbol
+    return f"{name} ({ticker})"
 
 
 def _markdown_code_block(lines: list[str]) -> list[str]:
@@ -493,7 +624,7 @@ def _risk_note(target_item: Mapping[str, Any]) -> str:
     reason = str(target_item.get("risk_reason") or "")
     if status in {"", "hold", "approved"} and reason in {"", "no_delta"}:
         return ""
-    return f"risk {status}:{_friendly_risk_reason(reason, target_item.get('risk_metadata') or {})}"
+    return f"리스크 {status}:{_friendly_risk_reason(reason, target_item.get('risk_metadata') or {})}"
 
 
 def _friendly_risk_reason(reason: Any, metadata: Mapping[str, Any] | None = None) -> str:
