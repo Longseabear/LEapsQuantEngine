@@ -222,7 +222,10 @@ class BackgroundSnapshotWorker:
             completed_at=collection.report.completed_at,
             elapsed_ms=collection.report.elapsed_ms,
         )
-        quality_report = _quality_with_entry_blocks(quality_report, self.entry_block_reasons)
+        quality_report = _quality_with_entry_blocks(
+            quality_report,
+            (*self.entry_block_reasons, *_market_data_entry_block_reasons(collection.snapshot)),
+        )
         update_started = time.perf_counter()
         indicator_snapshots = self.snapshot_engine.update_indicators(
             collection.snapshot,
@@ -388,3 +391,15 @@ def _quality_with_entry_blocks(
         failed_symbol_count=quality.failed_symbol_count,
         reasons=tuple(dict.fromkeys((*quality.reasons, *entry_block_reasons))),
     )
+
+
+def _market_data_entry_block_reasons(snapshot: MarketDataSnapshot) -> tuple[str, ...]:
+    reasons: list[str] = []
+    for bar in snapshot.bars.values():
+        metadata = dict(getattr(bar, "metadata", {}) or {})
+        if metadata.get("live_price_usable") is False:
+            reasons.append("live_price_unusable")
+            price_quality_reason = str(metadata.get("price_quality_reason") or "").strip()
+            if price_quality_reason:
+                reasons.append(f"price_quality:{price_quality_reason}")
+    return tuple(dict.fromkeys(reasons))

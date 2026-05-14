@@ -74,7 +74,10 @@ def test_leaps_portfolio_report_formats_korean_status_and_risk_reason():
 
     assert "[LEaps] 운용 현황" in message
     assert "KRX:005930 삼성전자" in message
-    assert "10주 -> 11주" in message
+    assert "```" in message
+    assert "| 종목" in message
+    assert "| KRX:005930 삼성전자 | 10주 | 11주 | +1 매수" in message
+    assert "| KRX:005930 삼성전자 | 매수 |  1주 | 100,000 |" in message
     assert "risk clamped:max_position_pct" in message
     assert "Risk 조정/차단 1건" in message
 

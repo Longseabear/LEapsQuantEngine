@@ -1,7 +1,7 @@
 param(
     [string[]]$Schedules = @(
-        "18:05|krx-after-hours|configs/runtime/leaps_workspace_smoke.json|LEaps|domestic",
-        "06:10|us-after-hours|configs/runtime/us_etf_rotation_sleeve.json|us_etf_rotation|overseas"
+        "18:05|krx-after-hours|configs/runtime/live_multi_sleeve.json|LEaps|domestic",
+        "06:10|us-after-hours|configs/runtime/live_multi_sleeve.json|us_etf_rotation|overseas"
     ),
     [string]$SnapshotRoot = "data/eod-snapshots",
     [string]$StateDir = "data/runtime/eod-snapshots",

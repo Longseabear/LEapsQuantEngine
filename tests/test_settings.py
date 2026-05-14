@@ -17,6 +17,23 @@ def test_market_data_engine_rate_limit_is_configurable_from_env(monkeypatch, tmp
     assert client.rate_limit_per_second == 18
 
 
+def test_load_kis_settings_falls_back_to_default_scoped_credentials(monkeypatch, tmp_path):
+    monkeypatch.delenv("KIS_APP_KEY", raising=False)
+    monkeypatch.delenv("KIS_CANO", raising=False)
+    monkeypatch.setenv("KIS_APP_SECRET", "base-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_APP_KEY", "default-key")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_APP_SECRET", "default-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_CANO", "default-cano")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_ACNT_PRDT_CD", "01")
+
+    settings = load_kis_settings(tmp_path / "missing.env")
+
+    assert settings.app_key == "default-key"
+    assert settings.app_secret == "default-secret"
+    assert settings.cano == "default-cano"
+    assert settings.account_product_code == "01"
+
+
 def test_market_data_live_provider_clamps_override_to_kis_limit(monkeypatch, tmp_path):
     monkeypatch.delenv("STOCKPROGRAM_ENV_FILE", raising=False)
     monkeypatch.delenv("MARKET_DATA_ENGINE_ENV_FILE", raising=False)
@@ -54,6 +71,27 @@ def test_load_kis_settings_for_account_uses_scoped_credentials_and_account(monke
     assert settings.app_secret == "us-secret"
     assert settings.cano == "us-cano"
     assert settings.account_product_code == "22"
+
+
+def test_load_kis_settings_for_account_allows_scoped_credentials_without_base_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("KIS_APP_KEY", raising=False)
+    monkeypatch.delenv("KIS_CANO", raising=False)
+    monkeypatch.setenv("KIS_APP_SECRET", "base-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_APP_KEY", "default-key")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_APP_SECRET", "default-secret")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_CANO", "default-cano")
+    monkeypatch.setenv("KIS_ACCOUNT_DEFAULT_ACNT_PRDT_CD", "01")
+
+    settings = load_kis_settings_for_account(
+        "kis-domestic",
+        metadata={"kis_account_id": "default"},
+        env_file=tmp_path / "missing.env",
+    )
+
+    assert settings.app_key == "default-key"
+    assert settings.app_secret == "default-secret"
+    assert settings.cano == "default-cano"
+    assert settings.account_product_code == "01"
 
 
 def test_load_kis_settings_for_account_can_split_credentials_from_account_number(monkeypatch, tmp_path):

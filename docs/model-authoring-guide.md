@@ -107,6 +107,22 @@ call an alpha model, and alpha code must not call selection code. Custom
 selection IDs such as `etf-rotation-top-20` or `operational-symbols` require
 matching `UniverseSelectionModel` implementations with the same `selection_id`.
 
+Workspace model wiring is managed with the same sleeve boundary for every
+pipeline stage:
+
+```powershell
+py -3 -m leaps_quant_engine.cli sleeve-alpha-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-alpha-enable configs/runtime/leaps_workspace_smoke.json momentum --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-portfolio-set configs/runtime/leaps_workspace_smoke.json equal_weight --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-risk-set configs/runtime/leaps_workspace_smoke.json basic --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-execution-set configs/runtime/leaps_workspace_smoke.json immediate --sleeve-id LEaps
+```
+
+Each command prints a `reload_sleeve` control command. For a long-running
+runtime, enqueue that command and apply it at a cycle boundary; for the current
+bounded live loop, run preflight or restart the affected loop after live edits
+when you need deterministic reload timing.
+
 ## Universe Selection Models
 
 Selection chooses which symbols a sleeve should monitor and feed into one or
@@ -655,7 +671,9 @@ Before enabling a model in runtime:
   without FX conversion should be treated as informational only when
   `valid_without_fx=false`.
 - Run `runtime-config-validate` for the config file.
-- Run `runtime-run-once --summary-only` before any submit path.
+- Run `runtime-run-once --summary-only` for a single-sleeve model diagnostic.
+- Run `runtime-run-multi-once --summary-only` before the live multi-sleeve
+  submit path.
 - Inspect the journal/status output for selected symbols, insight counts,
   target counts, risk decisions, and order intent counts.
 
@@ -668,6 +686,8 @@ py -3 -m pytest -q
 py -3 -m leaps_quant_engine.cli runtime-config-validate configs/runtime/leaps_workspace_smoke.json
 
 py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --skip-warmup --summary-only
+
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only
 
 py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --start 2023-05-10 --end 2026-05-08 --cash 2000000 --source finance-datareader --summary-only
 

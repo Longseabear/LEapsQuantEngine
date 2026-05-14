@@ -804,6 +804,85 @@ def test_cli_runtime_run_once_can_write_order_batch_artifact(monkeypatch, tmp_pa
     assert artifact["batches"][0]["orders"][0]["symbol"] == "KRX:005930"
 
 
+def test_cli_runtime_run_multi_once_requires_explicit_sleeves(capsys):
+    exit_code = main(["runtime-run-multi-once", "configs/runtime/live_multi_sleeve.json"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert json.loads(captured.err)["error"] == "runtime-run-multi-once requires at least one --sleeve-id."
+
+
+def test_cli_route_specific_submit_notional_override(tmp_path):
+    route = cli._OrderRuntimeRoute(
+        account_id="kis-domestic",
+        market_scope="domestic",
+        currency="KRW",
+        account_store_path=tmp_path / "account.json",
+        order_store_path=tmp_path / "orders.jsonl",
+    )
+    args = SimpleNamespace(
+        max_submit_notional=1000.0,
+        max_submit_notional_by_account=["kis-domestic=7000000", "overseas=2500"],
+    )
+
+    assert cli._max_submit_notional_for_route(args, route) == 7_000_000.0
+
+
+def test_cli_resolves_multi_sleeve_order_routes_without_requiring_every_sleeve_on_each_account(tmp_path):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "multi-route",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "broker_accounts": [
+                    {
+                        "account_id": "kis-domestic",
+                        "market_scope": "domestic",
+                        "currency": "KRW",
+                        "account_store_path": "domestic.json",
+                    },
+                    {
+                        "account_id": "kis-overseas",
+                        "market_scope": "overseas",
+                        "currency": "USD",
+                        "account_store_path": "overseas.json",
+                    },
+                ],
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "broker_account_id": "kis-domestic",
+                        "broker_account_routes": {"domestic": "kis-domestic"},
+                        "universe": {"coarse_path": "kr.json"},
+                    },
+                    {
+                        "sleeve_id": "us_etf_rotation",
+                        "broker_account_id": "kis-overseas",
+                        "broker_account_routes": {"overseas": "kis-overseas"},
+                        "universe": {"coarse_path": "us.json"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = cli.load_runtime_config_snapshot(config_path)
+
+    routes = cli._resolve_order_runtime_routes(
+        snapshot,
+        None,
+        None,
+        None,
+        ("LEaps", "us_etf_rotation"),
+    )
+
+    assert [route.account_id for route in routes] == ["kis-domestic", "kis-overseas"]
+    with pytest.raises(RuntimeError, match="us_etf_rotation"):
+        cli._resolve_order_runtime_route(snapshot, "kis-domestic", None, None, ("LEaps", "us_etf_rotation"))
+
+
 def test_cli_manages_sleeve_alpha_modules(tmp_path, capsys):
     workspace = tmp_path / "sleeves" / "LEaps"
     alpha_dir = workspace / "alphas"
@@ -887,6 +966,173 @@ def test_cli_manages_sleeve_portfolio_model(tmp_path, capsys):
     updated = json.loads(capsys.readouterr().out)
     assert updated["active_portfolio_model"] == "portfolios/confidence_weight.py"
     assert updated["inactive_portfolio_models"] == ["portfolios/equal_weight.py"]
+
+
+def test_cli_manages_sleeve_risk_and_execution_models(tmp_path, capsys):
+    workspace = tmp_path / "sleeves" / "LEaps"
+    risk_dir = workspace / "risks"
+    execution_dir = workspace / "executions"
+    risk_dir.mkdir(parents=True)
+    execution_dir.mkdir(parents=True)
+    (risk_dir / "basic.py").write_text("# risk\n", encoding="utf-8")
+    (risk_dir / "strict.py").write_text("# risk\n", encoding="utf-8")
+    (execution_dir / "immediate.py").write_text("# execution\n", encoding="utf-8")
+    (execution_dir / "sliced.py").write_text("# execution\n", encoding="utf-8")
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "test",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "workspace_path": str(workspace),
+                        "cash": 1000,
+                        "universe": {"coarse_path": "universe.json"},
+                        "risk": {"model": "risks/basic.py", "parameters": {"long_only": True}},
+                        "execution": {"model": "executions/immediate.py", "parameters": {"order_type": "limit"}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["sleeve-risk-list", str(config_path), "--sleeve-id", "LEaps"]) == 0
+    listed_risk = json.loads(capsys.readouterr().out)
+    assert listed_risk["available_risk_models"] == ["risks/basic.py", "risks/strict.py"]
+    assert listed_risk["active_risk_model"] == "risks/basic.py"
+    assert listed_risk["reload_command"]["command_type"] == "reload_sleeve"
+
+    assert main(["sleeve-risk-set", str(config_path), "strict", "--sleeve-id", "LEaps"]) == 0
+    updated_risk = json.loads(capsys.readouterr().out)
+    assert updated_risk["active_risk_model"] == "risks/strict.py"
+
+    assert main(["sleeve-execution-list", str(config_path), "--sleeve-id", "LEaps"]) == 0
+    listed_execution = json.loads(capsys.readouterr().out)
+    assert listed_execution["available_execution_models"] == [
+        "executions/immediate.py",
+        "executions/sliced.py",
+    ]
+    assert listed_execution["active_execution_model"] == "executions/immediate.py"
+    assert listed_execution["reload_command"]["payload"]["sleeve_id"] == "LEaps"
+
+    assert main(["sleeve-execution-set", str(config_path), "sliced", "--sleeve-id", "LEaps"]) == 0
+    updated_execution = json.loads(capsys.readouterr().out)
+    assert updated_execution["active_execution_model"] == "executions/sliced.py"
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    sleeve = payload["sleeves"][0]
+    assert sleeve["risk"]["model"] == "risks/strict.py"
+    assert sleeve["risk"]["parameters"] == {"long_only": True}
+    assert sleeve["execution"]["model"] == "executions/sliced.py"
+    assert sleeve["execution"]["parameters"] == {"order_type": "limit"}
+
+
+def test_cli_keeps_import_model_references_readable(tmp_path, capsys):
+    workspace = tmp_path / "sleeves" / "LEaps"
+    workspace.mkdir(parents=True)
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "test",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "workspace_path": str(workspace),
+                        "cash": 1000,
+                        "universe": {"coarse_path": "universe.json"},
+                        "risk": {"model": "leaps_quant_engine.framework:BasicRiskManagementModel"},
+                        "execution": {"model": "leaps_quant_engine.execution:ImmediateExecutionModel"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["sleeve-risk-list", str(config_path), "--sleeve-id", "LEaps"]) == 0
+    risk = json.loads(capsys.readouterr().out)
+    assert risk["active_risk_model"] == "leaps_quant_engine.framework:BasicRiskManagementModel"
+
+    assert main(["sleeve-execution-list", str(config_path), "--sleeve-id", "LEaps"]) == 0
+    execution = json.loads(capsys.readouterr().out)
+    assert execution["active_execution_model"] == "leaps_quant_engine.execution:ImmediateExecutionModel"
+
+
+def test_cli_persists_runtime_control_commands(tmp_path, capsys):
+    queue_path = tmp_path / "runtime-control.jsonl"
+
+    assert main(
+        [
+            "runtime-control-submit",
+            "--queue",
+            str(queue_path),
+            "--command",
+            "reload-sleeve",
+            "--config",
+            "configs/runtime/leaps_workspace_smoke.json",
+            "--sleeve-id",
+            "LEaps",
+            "--reason",
+            "test reload",
+        ]
+    ) == 0
+    submitted = json.loads(capsys.readouterr().out)
+    assert submitted["command_type"] == "reload_sleeve"
+
+    assert main(["runtime-control-drain", "--queue", str(queue_path)]) == 0
+    drained = json.loads(capsys.readouterr().out)
+    assert drained["command_count"] == 1
+    assert drained["commands"][0]["payload"]["sleeve_id"] == "LEaps"
+
+
+def test_cli_persists_activate_and_deactivate_sleeve_control_commands(tmp_path, capsys):
+    queue_path = tmp_path / "runtime-control.jsonl"
+
+    assert main(
+        [
+            "runtime-control-submit",
+            "--queue",
+            str(queue_path),
+            "--command",
+            "activate-sleeve",
+            "--config",
+            "configs/runtime/live_multi_sleeve.json",
+            "--sleeve-id",
+            "us_etf_rotation",
+        ]
+    ) == 0
+    activated = json.loads(capsys.readouterr().out)
+    assert activated["command_type"] == "activate_sleeve"
+
+    assert main(
+        [
+            "runtime-control-submit",
+            "--queue",
+            str(queue_path),
+            "--command",
+            "deactivate-sleeve",
+            "--config",
+            "configs/runtime/live_multi_sleeve.json",
+            "--sleeve-id",
+            "us_etf_rotation",
+        ]
+    ) == 0
+    deactivated = json.loads(capsys.readouterr().out)
+    assert deactivated["command_type"] == "deactivate_sleeve"
+
+    assert main(["runtime-control-drain", "--queue", str(queue_path)]) == 0
+    drained = json.loads(capsys.readouterr().out)
+    assert [command["command_type"] for command in drained["commands"]] == [
+        "activate_sleeve",
+        "deactivate_sleeve",
+    ]
 
 
 def test_cli_kis_account_sync_uses_configured_virtual_account_store(monkeypatch, tmp_path, capsys):

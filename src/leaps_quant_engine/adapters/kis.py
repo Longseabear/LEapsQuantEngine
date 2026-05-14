@@ -518,7 +518,7 @@ class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
             "get_stock_price",
             _latest_quote_arguments(symbol, exchange_by_symbol=self.exchange_by_symbol),
         )
-        return _quote_to_bar(symbol, result, require_live_price=True)
+        return _quote_to_bar(symbol, result, require_live_price=True, allow_reference_price=True)
 
     def get_history(
         self,
@@ -686,18 +686,46 @@ def _row_to_bar(symbol: Symbol, row: dict[str, Any], *, default_date: datetime |
     )
 
 
-def _quote_to_bar(symbol: Symbol, payload: dict[str, Any], *, require_live_price: bool = False) -> Bar:
+def _quote_to_bar(
+    symbol: Symbol,
+    payload: dict[str, Any],
+    *,
+    require_live_price: bool = False,
+    allow_reference_price: bool = False,
+) -> Bar:
     price = _extract_price(payload)
-    open_price = _float_first_present(payload, ("open", "open_price", "day_open"), default=price)
-    high_price = _float_first_present(payload, ("high", "high_price", "day_high"), default=max(open_price, price))
-    low_price = _float_first_present(payload, ("low", "low_price", "day_low"), default=min(open_price, price))
+    raw_open_price = _float_first_present(payload, ("open", "open_price", "day_open"), default=price)
+    raw_high_price = _float_first_present(payload, ("high", "high_price", "day_high"), default=max(raw_open_price, price))
+    raw_low_price = _float_first_present(payload, ("low", "low_price", "day_low"), default=min(raw_open_price, price))
     volume = int(_first_present(payload, ("volume", "acml_vol", "accumulated_volume"), default=0))
+    live_price_usable = payload.get("live_price_usable")
+    price_quality_reason = str(payload.get("price_quality_reason") or "").strip()
+    looks_like_reference_price = _looks_like_zero_ohlc_reference_price(
+        payload,
+        price,
+        raw_open_price,
+        raw_high_price,
+        raw_low_price,
+    )
     if require_live_price and _kis_market(symbol.market) == "domestic":
-        if payload.get("live_price_usable") is False:
-            reason = payload.get("price_quality_reason") or "domestic live quote is not usable"
+        if live_price_usable is False and not allow_reference_price:
+            reason = price_quality_reason or "domestic live quote is not usable"
             raise MarketDataError(f"Domestic live quote for {symbol.key} is not usable: {reason}")
-        if _looks_like_zero_ohlc_reference_price(payload, price, open_price, high_price, low_price):
+        if looks_like_reference_price:
+            live_price_usable = False
+            price_quality_reason = price_quality_reason or "reference_price_without_distinct_orderbook_price"
+        if looks_like_reference_price and not allow_reference_price:
             raise MarketDataError(f"Domestic live quote for {symbol.key} looks like a reference price.")
+    open_price = raw_open_price if raw_open_price > 0 else price
+    high_price = raw_high_price if raw_high_price > 0 else max(open_price, price)
+    low_price = raw_low_price if raw_low_price > 0 else min(open_price, price)
+    metadata: dict[str, Any] = {}
+    if live_price_usable is not None:
+        metadata["live_price_usable"] = bool(live_price_usable)
+    if price_quality_reason:
+        metadata["price_quality_reason"] = price_quality_reason
+    if payload.get("price_source"):
+        metadata["price_source"] = str(payload.get("price_source"))
     return Bar(
         symbol=symbol,
         time=datetime.now(),
@@ -706,6 +734,7 @@ def _quote_to_bar(symbol: Symbol, payload: dict[str, Any], *, require_live_price
         low=low_price,
         close=price,
         volume=volume,
+        metadata=metadata,
     )
 
 

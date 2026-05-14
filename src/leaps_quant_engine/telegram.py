@@ -28,20 +28,24 @@ class TelegramClient:
         text: str,
         chat_id: str | None = None,
         disable_notification: bool = False,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         target_chat_id = chat_id or self.default_chat_id
         if not target_chat_id:
             raise TelegramConfigError("Telegram chat id is not configured.")
+        payload: dict[str, Any] = {
+            "chat_id": target_chat_id,
+            "text": normalize_agent_text(text),
+            "disable_notification": disable_notification,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         response = requests.post(
             f"{self.base_url}/sendMessage",
-            json={
-                "chat_id": target_chat_id,
-                "text": normalize_agent_text(text),
-                "disable_notification": disable_notification,
-            },
+            json=payload,
             timeout=self.timeout_seconds,
         )
-        response.raise_for_status()
+        _raise_for_telegram_error(response, method="sendMessage")
         body = response.json()
         if not isinstance(body, dict):
             raise RuntimeError("Telegram response must be a JSON object.")
@@ -52,12 +56,29 @@ class TelegramClient:
         if offset is not None:
             payload["offset"] = int(offset)
         response = requests.get(f"{self.base_url}/getUpdates", params=payload, timeout=self.timeout_seconds)
-        response.raise_for_status()
+        _raise_for_telegram_error(response, method="getUpdates")
         body = response.json()
         if not isinstance(body, dict):
             raise RuntimeError("Telegram response must be a JSON object.")
         result = body.get("result", [])
         return result if isinstance(result, list) else []
+
+
+def _raise_for_telegram_error(response: requests.Response, *, method: str) -> None:
+    """Raise a sanitized Telegram error without echoing the bot token URL."""
+
+    if response.status_code < 400:
+        return
+    description = ""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        description = str(body.get("description") or "")
+    if not description:
+        description = response.reason or "request failed"
+    raise RuntimeError(f"Telegram {method} failed ({response.status_code}): {description}")
 
 
 def normalize_agent_text(text: str) -> str:

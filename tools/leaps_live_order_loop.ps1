@@ -85,6 +85,9 @@ function Get-OrderBatchHash {
             }
         }
     }
+    if ($signatures.Count -eq 0) {
+        return ""
+    }
     $stableOrders = $signatures | Sort-Object sleeve_id, symbol, side, quantity, reference_price, limit_price, order_type, time_in_force, tag, current_quantity, target_quantity
     $ordersJson = ($stableOrders | ConvertTo-Json -Depth 16 -Compress)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($ordersJson)

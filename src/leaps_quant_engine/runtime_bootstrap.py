@@ -34,7 +34,12 @@ from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPor
 from leaps_quant_engine.portfolio_state import PortfolioEngineState
 from leaps_quant_engine.runtime_config import ActiveUniverseRuntimeConfig, ModuleReference, RuntimeConfigSnapshot, SleeveRuntimeConfig
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker, SnapshotWorkerRunReport
-from leaps_quant_engine.snapshots import IndicatorSnapshot, SnapshotQualityReport, SnapshotQualityStatus
+from leaps_quant_engine.snapshots import (
+    IndicatorSnapshot,
+    IndicatorSnapshotStore,
+    SnapshotQualityReport,
+    SnapshotQualityStatus,
+)
 from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.universe.fine import FineUniverseRefreshReport, FineUniverseRuntime
 from leaps_quant_engine.universe.loader import load_universe_definition
@@ -65,6 +70,8 @@ class RuntimeBootstrapDependencies:
     risk_model_loader: PythonRiskManagementModelLoader = PythonRiskManagementModelLoader()
     execution_model_loader: PythonExecutionModelLoader = PythonExecutionModelLoader()
     portfolio_provider: PortfolioProvider | None = None
+    indicator_engine: IndicatorEngine | None = None
+    indicator_snapshot_stores: dict[str, IndicatorSnapshotStore] | None = None
 
     def __post_init__(self) -> None:
         if self.live_provider_factory is None:
@@ -112,6 +119,9 @@ class RuntimeSleeveRuntime:
             warmup=self.sleeve_config.indicators.warmup_enabled if warmup is None else warmup,
             refresh_history=self.sleeve_config.indicators.refresh_history,
         )
+        return self.build_run_once_report(run_report)
+
+    def build_run_once_report(self, worker_report: SnapshotWorkerRunReport) -> "RuntimeRunOnceReport":
         framework_result = self._run_framework_once()
         portfolio_state = self._portfolio_engine_state(framework_result)
         report = RuntimeRunOnceReport(
@@ -123,7 +133,7 @@ class RuntimeSleeveRuntime:
             fine_refresh_report=self.fine_refresh_report,
             active_result=self.active_result,
             selection_warmup_report=self.selection_warmup_report,
-            worker=run_report,
+            worker=worker_report,
             framework=framework_result,
             portfolio_state=portfolio_state,
         )
@@ -449,7 +459,8 @@ def bootstrap_sleeve_runtime(
         min_ready_ratio=sleeve_config.indicators.min_ready_ratio,
     )
     should_preselect_warmup = sleeve_config.indicators.warmup_enabled if preselect_warmup is None else preselect_warmup
-    indicator_engine = IndicatorEngine()
+    indicator_engine = deps.indicator_engine or IndicatorEngine()
+    indicator_snapshot_stores = deps.indicator_snapshot_stores if deps.indicator_snapshot_stores is not None else {}
     selection_warmup_report = None
     selection_indicator_snapshot = None
     portfolio_provider = deps.portfolio_provider or _build_portfolio_provider(snapshot, sleeve_config)
@@ -529,6 +540,7 @@ def bootstrap_sleeve_runtime(
         min_success=sleeve_config.worker.min_success,
         interval_seconds=sleeve_config.worker.cycle_interval_seconds,
         indicator_engine=indicator_engine,
+        stores_by_sleeve=indicator_snapshot_stores,
         warmup_policy=warmup_policy,
         entry_block_reasons=_warmup_entry_block_reasons(selection_warmup_report),
     )

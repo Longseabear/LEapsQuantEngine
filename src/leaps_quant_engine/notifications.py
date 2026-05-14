@@ -23,6 +23,7 @@ class TelegramClientProtocol(Protocol):
         text: str,
         chat_id: str | None = None,
         disable_notification: bool = False,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         """Send one Telegram message and return the provider response."""
 
@@ -62,9 +63,11 @@ class NotificationService:
 
     paths: NotificationPaths | None = None
     telegram_client: TelegramClientProtocol | None = None
+    category_telegram_clients: Mapping[str, TelegramClientProtocol] | None = None
 
     def __post_init__(self) -> None:
         self.paths = self.paths or NotificationPaths()
+        self.category_telegram_clients = dict(self.category_telegram_clients or {})
 
     @classmethod
     def from_env(
@@ -79,17 +82,26 @@ class NotificationService:
         token = _env_first("LEAPS_TELEGRAM_BOT_TOKEN", "STOCKPROGRAM_TELEGRAM_BOT_TOKEN")
         chat_id = _env_first("LEAPS_TELEGRAM_CHAT_ID", "STOCKPROGRAM_TELEGRAM_CHAT_ID")
         client = TelegramClient(bot_token=token, default_chat_id=chat_id or None) if token else None
+        order_token = _env_first("LEAPS_ORDER_TELEGRAM_BOT_TOKEN", "STOCKPROGRAM_TELEGRAM_BOT_TOKEN")
+        order_chat_id = _env_first("LEAPS_ORDER_TELEGRAM_CHAT_ID", "STOCKPROGRAM_TELEGRAM_CHAT_ID")
+        category_clients: dict[str, TelegramClientProtocol] = {}
+        if order_token:
+            order_client = TelegramClient(bot_token=order_token, default_chat_id=order_chat_id or None)
+            category_clients["order"] = order_client
         return cls(
             paths=NotificationPaths(
                 root=root or DEFAULT_NOTIFICATION_ROOT,
                 audit_log_path=audit_log_path or DEFAULT_AUDIT_LOG_PATH,
             ),
             telegram_client=client,
+            category_telegram_clients=category_clients,
         )
 
     @property
     def delivery_mode(self) -> str:
-        return "telegram" if self.telegram_client is not None else "dry-run"
+        if self.telegram_client is not None or self.category_telegram_clients:
+            return "telegram"
+        return "dry-run"
 
     def health_check(self) -> dict[str, Any]:
         paths = _paths(self.paths)
@@ -111,13 +123,15 @@ class NotificationService:
         message: str,
         disable_notification: bool = False,
         chat_id: str | None = None,
+        parse_mode: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         paths = _paths(self.paths)
         record_id = _make_record_id("outbound")
+        category_value = _sanitize_line(category, limit=40) or "status"
         payload: dict[str, Any] = {
             "record_id": record_id,
-            "category": _sanitize_line(category, limit=40) or "status",
+            "category": category_value,
             "title": _sanitize_line(normalize_agent_text(title), limit=120),
             "message": _sanitize_message_body(normalize_agent_text(message), limit=1500),
             "created_at": _utc_timestamp(),
@@ -125,17 +139,24 @@ class NotificationService:
             "delivery_status": "queued",
             "metadata": dict(metadata or {}),
         }
+        if parse_mode:
+            payload["parse_mode"] = _sanitize_line(parse_mode, limit=40)
         _write_json_file(paths.outbox_root / f"{record_id}.json", payload)
 
         try:
-            if self.telegram_client is None:
+            telegram_client = self._telegram_client_for_category(category_value)
+            if telegram_client is None:
                 payload["delivery_status"] = "saved_only"
             else:
-                response = self.telegram_client.send_message(
-                    text=_format_message(payload["title"], payload["message"], category=payload["category"]),
-                    chat_id=chat_id,
-                    disable_notification=disable_notification,
-                )
+                payload["delivery_route"] = _notification_route_for_category(category_value)
+                send_kwargs: dict[str, Any] = {
+                    "text": _format_message(payload["title"], payload["message"], category=payload["category"]),
+                    "chat_id": chat_id,
+                    "disable_notification": disable_notification,
+                }
+                if payload.get("parse_mode"):
+                    send_kwargs["parse_mode"] = payload["parse_mode"]
+                response = telegram_client.send_message(**send_kwargs)
                 payload["delivery_status"] = "sent"
                 payload["telegram_message_id"] = _telegram_message_id(response)
         except Exception as exc:  # noqa: BLE001
@@ -157,6 +178,12 @@ class NotificationService:
             },
         )
         return payload
+
+    def _telegram_client_for_category(self, category: str) -> TelegramClientProtocol | None:
+        category_key = _sanitize_line(category, limit=40).lower()
+        if self.category_telegram_clients and category_key in self.category_telegram_clients:
+            return self.category_telegram_clients[category_key]
+        return self.telegram_client
 
     def fetch_telegram_updates(self, *, offset: int | None = None, limit: int = 20) -> dict[str, Any]:
         paths = _paths(self.paths)
@@ -280,10 +307,20 @@ def _sanitize_line(text: str, *, limit: int = 1000) -> str:
 
 def _sanitize_message_body(text: str, *, limit: int = 1500) -> str:
     raw_lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    normalized_lines = [" ".join(line.split()) for line in raw_lines]
     compact_lines: list[str] = []
     previous_blank = False
-    for line in normalized_lines:
+    in_code_block = False
+    for raw_line in raw_lines:
+        if raw_line.strip().startswith("```"):
+            compact_lines.append(raw_line.rstrip())
+            in_code_block = not in_code_block
+            previous_blank = False
+            continue
+        if in_code_block:
+            compact_lines.append(raw_line.rstrip())
+            previous_blank = False
+            continue
+        line = " ".join(raw_line.split())
         if not line:
             if previous_blank:
                 continue
@@ -297,6 +334,13 @@ def _sanitize_message_body(text: str, *, limit: int = 1500) -> str:
 
 def _format_message(title: str, body: str, *, category: str) -> str:
     return "\n".join([f"[{category.upper()}] {title}", "", body]).strip()
+
+
+def _notification_route_for_category(category: str) -> str:
+    category_key = _sanitize_line(category, limit=40).lower()
+    if category_key == "order":
+        return "order"
+    return "default"
 
 
 def _telegram_message_id(response: Mapping[str, Any]) -> Any:

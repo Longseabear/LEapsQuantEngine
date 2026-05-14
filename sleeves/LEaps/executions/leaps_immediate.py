@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from leaps_quant_engine.execution import ExecutionContext
-from leaps_quant_engine.market_rules import MarketSession
+from leaps_quant_engine.market_rules import MarketSession, round_krx_price_to_tick
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, TimeInForce
 from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
 
@@ -89,6 +89,8 @@ class LeapsMomentumExecutionModel:
                 order_type=self.order_type,
                 limit_offset_bps=limit_offset_bps,
             )
+            if limit_price is not None and currency_for_symbol(target.symbol) == "KRW":
+                limit_price = float(round_krx_price_to_tick(limit_price, side=side))
             quantities = _split_quantity(
                 executable_quantity,
                 reference_price=bar.close,

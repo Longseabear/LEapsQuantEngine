@@ -4,6 +4,16 @@
 
 Canonical source: `tools/leaps_portfolio_report.py`.
 
+Scope:
+
+- Portfolio report payloads are sleeve-scoped read models.
+- The live submit loop is multi-sleeve and uses
+  `configs/runtime/live_multi_sleeve.json`.
+- A report may use single-sleeve `runtime-run-once` to inspect one sleeve, but
+  live loop liveness must be checked through
+  `tools/leaps_multi_sleeve_live_order_loop.ps1` and the multi-route order
+  status commands.
+
 Required sections:
 
 1. Header
@@ -24,6 +34,8 @@ Required sections:
    - delta quantity
    - status: hold, approved, clamped, rejected, or not_run
    - non-approved reason if present
+   - Telegram output should render this section as a Markdown code-block table
+     so columns stay aligned across clients.
 
 4. Price context
    - market price for held symbols
@@ -33,11 +45,14 @@ Required sections:
    - snapshot degraded/stale status
    - rejected risk decisions
    - missing price or insufficient cash/position-too-small reasons
+   - route/account status when the incident crosses domestic and overseas
+     accounts
 
 Rules:
 
 - Reporting must be read-only.
 - Reporting must never call `order-runtime-submit`.
+- Reporting must not start or stop the live multi-sleeve order loop.
 - Do not infer a sell target from absence of an active target.
 - If risk decisions do not cover a held symbol, show target equal to current
   quantity and status `hold`.

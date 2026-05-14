@@ -65,6 +65,7 @@ from leaps_quant_engine.broker_routing import (
     split_batches_by_account_route,
 )
 from leaps_quant_engine.control import (
+    FileRuntimeControlQueue,
     RuntimeConfigController,
     RuntimeControlApplyReport,
     RuntimeControlCommand,
@@ -263,6 +264,7 @@ from leaps_quant_engine.runtime_bootstrap import (
     bootstrap_sleeve_runtime,
     resolve_runtime_path,
 )
+from leaps_quant_engine.runtime_multi import MultiSleeveRuntimeOnceReport, run_multi_sleeve_once
 from leaps_quant_engine.runtime_config import (
     ActiveUniverseRuntimeConfig,
     AlphaRuntimeConfig,
@@ -554,6 +556,7 @@ __all__ = [
     "RuntimeConfig",
     "RuntimeConfigController",
     "RuntimeConfigSnapshot",
+    "FileRuntimeControlQueue",
     "RuntimeControlApplyReport",
     "RuntimeControlCommand",
     "RuntimeControlCommandType",
@@ -567,6 +570,7 @@ __all__ = [
     "RuntimeRunOnceReport",
     "RuntimeSleeveReloadReport",
     "RuntimeSleeveRuntime",
+    "MultiSleeveRuntimeOnceReport",
     "RuntimeStateStore",
     "SQLiteRuntimeStateStore",
     "Sleeve",
@@ -619,6 +623,7 @@ __all__ = [
     "build_runtime_health_report",
     "build_runtime_preflight_report",
     "bootstrap_sleeve_runtime",
+    "run_multi_sleeve_once",
     "configure_logging",
     "configured_account_ids_for_sleeve",
     "current_engine_source_fingerprint",

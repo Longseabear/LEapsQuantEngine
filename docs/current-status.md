@@ -547,6 +547,7 @@ Implemented contracts:
 - `RuntimeConfigSnapshot`
 - `RuntimeControlCommand`
 - `RuntimeControlQueue`
+- `FileRuntimeControlQueue`
 - `RuntimeConfigController`
 
 The boundary is intentional:
@@ -578,7 +579,7 @@ Runtime bootstrap is also implemented. `bootstrap_sleeve_runtime(...)` takes a v
 - `BackgroundSnapshotWorker`
 
 Sleeves can now declare a `workspace_path`. File-based strategy module references inside `alpha.modules`, `portfolio.model`, `risk.model`, `execution.model`, and active selection models resolve relative to that sleeve workspace. Shared universe paths remain runtime/global paths unless they are absolute.
-Sleeve alpha modules can be managed from the CLI:
+Sleeve model wiring can be managed from the CLI:
 
 ```powershell
 py -3 -m leaps_quant_engine.cli sleeve-alpha-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
@@ -586,12 +587,34 @@ py -3 -m leaps_quant_engine.cli sleeve-alpha-enable configs/runtime/leaps_worksp
 py -3 -m leaps_quant_engine.cli sleeve-alpha-disable configs/runtime/leaps_workspace_smoke.json alphas/momentum.py --sleeve-id LEaps
 py -3 -m leaps_quant_engine.cli sleeve-portfolio-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
 py -3 -m leaps_quant_engine.cli sleeve-portfolio-set configs/runtime/leaps_workspace_smoke.json equal_weight --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-risk-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-risk-set configs/runtime/leaps_workspace_smoke.json basic --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-execution-list configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli sleeve-execution-set configs/runtime/leaps_workspace_smoke.json immediate --sleeve-id LEaps
 ```
 
-These commands update the runtime config and emit a `reload_sleeve` control command payload so an operating agent can apply the change at a runtime boundary. Alpha modules are multi-active; portfolio construction model selection is single-active.
+These commands update the runtime config and emit a `reload_sleeve` control command payload so an operating agent can apply the change at a runtime boundary. Alpha modules are multi-active; portfolio, risk, and execution model selection are single-active.
 
-This is the first executable bridge from option snapshot to a live one-cycle worker path.
-The worker now owns snapshot collection and indicator publication only in this bootstrap path. Alpha and downstream framework stages run after the active `IndicatorSnapshot` is published, so `runtime-run-once` can show both worker timing and framework artifacts.
+Runtime control commands can also be persisted to a JSONL queue instead of only
+being copied from CLI output:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command reload-sleeve --config configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --reason "model update"
+py -3 -m leaps_quant_engine.cli runtime-control-drain --queue data/runtime/control/live.jsonl
+```
+
+The persistent queue is the durable control boundary for future supervised
+runtime processes. Current live operation uses the bounded multi-sleeve
+PowerShell loop, which invokes `runtime-run-multi-once` on each cycle and then
+hands the combined order-intent artifact to the order runtime. Operators should
+still preflight or restart the affected loop after live model/config edits when
+immediate certainty is required. `runtime-run-once` remains the single-sleeve
+diagnostic path.
+
+The worker owns snapshot collection and indicator publication in this bootstrap
+path. Alpha and downstream framework stages run after the active
+`IndicatorSnapshot` is published, so `runtime-run-once` and
+`runtime-run-multi-once` can show both worker timing and framework artifacts.
 
 The first config smoke file is:
 
@@ -659,30 +682,31 @@ Inspect current order runtime and virtual sleeve account state without touching 
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only
 ```
 
-Persist a runtime cycle's execution output as a submit-ready artifact:
+Persist the live multi-sleeve runtime cycle's execution output as a submit-ready
+artifact:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --summary-only --order-batch-output ../../data/order-intents/leaps_latest.json
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only --order-batch-output data/order-intents/live_multi_latest.json
 ```
 
 Dry-run or commit order-intent batches into the order runtime:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --summary-only
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --commit --broker paper --summary-only
-py -3 -m leaps_quant_engine.cli order-runtime-paper-smoke configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json data/order-intents/live_multi_latest.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json data/order-intents/live_multi_latest.json --commit --broker paper --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-paper-smoke configs/runtime/live_multi_sleeve.json data/order-intents/live_multi_latest.json --summary-only
 ```
 
 Run one bounded order maintenance pass. This can poll open tickets, import execution history, reconcile holdings, and still return a warning report instead of stopping the operator loop:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only
 ```
 
 ### Runtime Journal, Recovery, And Health
@@ -943,7 +967,7 @@ Current v0 behavior:
 - The core assumes sleeve-level virtual accounts already exist. KIS account-level holdings are a broker adapter concern, not the portfolio construction source of truth.
 - Runtime bootstrap can now read the current sleeve portfolio through a `PortfolioProvider` before each framework cycle. The default provider preserves the configured starting cash behavior, while tests prove a `LEaps` sleeve can supply its own current virtual portfolio.
 - `VirtualSleeveAccountStore` is the first file-backed virtual account provider for live/paper ownership state. It stores sleeve cash/holdings, `order_id -> sleeve` ownership, broker order aliases, and idempotent fill events. Unknown external fills are routed to the `unassigned` sleeve.
-- Runtime config can opt a sleeve into this store with `portfolio.account_store_path`. For account-level operations it can also define top-level `broker_accounts` and let each sleeve set `broker_account_id`. `configs/runtime/leaps_workspace_smoke.json` now routes `LEaps` and `default sleeve` to `kis-overseas`, with a separate `kis-domestic` profile available for Korean-account sleeves.
+- Runtime config can opt a sleeve into this store with `portfolio.account_store_path`. For account-level operations it can also define top-level `broker_accounts` and let each sleeve set `broker_account_id` or `broker_account_routes`. The canonical live config is now `configs/runtime/live_multi_sleeve.json`: `LEaps` routes to `kis-domestic` and `us_etf_rotation` routes to `kis-overseas`.
 - `BrokerAccountRuntimeConfig` separates account identity from sleeve strategy config: `account_id`, `market_scope`, virtual account store path, order runtime store path, and gateway choice. Order runtime commands resolve stores from this profile first, then fall back to legacy sleeve `portfolio.account_store_path`.
 - Real KIS account attachment is now a read-only sync path, not a direct portfolio source. `KISVirtualAccountSync` calls broker-engine operations for balance, holdings, and execution history, converts executions into `VirtualFillEvent` records, applies owned or explicitly assigned fills into `VirtualSleeveAccountStore`, and records unknown broker fills for later allocation. KIS holdings are reported for reconciliation but do not overwrite sleeve holdings.
 - `FillAllocation` supports partial or full splitting of one broker fill across multiple virtual sleeves by quantity. The broker fill stays in the raw fill ledger, and each sleeve portfolio projection gets only its allocated quantity and proportional fee. This is intentionally lighter than StockProgram's order-chain-lot model: the LEAN engine still sees only `PortfolioProvider.current_portfolio(sleeve_id)`.
@@ -951,15 +975,15 @@ Current v0 behavior:
 - `VirtualSleeveAccountStore` can report allocation status per broker fill (`unallocated`, `partially_allocated`, `fully_allocated`) and reconcile KIS current holdings against the aggregate virtual sleeve projection. This gives operators a bounded daily check instead of replaying all historical fills during every engine cycle.
 - KIS cash balance sync follows the StockProgram lesson without copying the whole fund interface. `virtual-account-sync-cash` stores the KIS account cash snapshot, keeps strategy sleeve cash as internal allocation state, and assigns residual cash to `default sleeve`. `virtual-account-transfer-cash` moves cash between virtual sleeves explicitly.
 - Backtesting remains separated: `run_backtest(...)`, `run_framework_backtest(...)`, and `run_framework_replay(...)` still receive an explicit in-memory `Portfolio` and do not read or write the live/paper virtual account store.
-- The `LEaps` sleeve has an initial workspace at `sleeves/LEaps` with sleeve-local `selections/stock_momentum.py`, `selections/etf_rotation.py`, `selections/operational_symbols.py`, `alphas/momentum.py`, `alphas/volatility_trailing_stop.py`, `alphas/etf_rotation.py`, `portfolios/equal_weight.py`, `risks/basic.py`, and `executions/immediate.py` modules, plus `configs/runtime/leaps_workspace_smoke.json` wired to the USD research universe `configs/universes/leaps_us_research_core.json`.
-- `configs/runtime/leaps_workspace_smoke.json` wires those selectors through `alpha.input_selections`: momentum alpha receives stock-momentum candidates, ETF rotation receives ETF candidates, and the trailing-stop alpha receives operational symbols such as held/open/manual symbols.
+- The `LEaps` sleeve has a workspace at `sleeves/LEaps` with sleeve-local stock momentum selection, operational symbol selection, KOSPI conviction alpha, volatility trailing-stop alpha, RL PPO portfolio construction, KRW risk, and limit execution modules. `us_etf_rotation` has its own workspace and USD ETF rotation models. `configs/runtime/live_multi_sleeve.json` wires both sleeves into one live runner while keeping their model stacks and account routes separate.
+- Sleeve configs wire selectors through `alpha.input_selections`: stock momentum alpha receives stock-momentum candidates, ETF rotation receives ETF candidates, and trailing-stop alpha receives operational symbols such as held/open/manual symbols.
 - Each runtime cycle emits an agent-readable `engine_status` log line through the `leaps_quant_engine.agent_status` logger. The status includes snapshot quality, symbol update counts, portfolio cash/equity, active insight count, target/plan counts, risk approval count, and order intent count.
-- `runtime-run-once --order-batch-output` writes the framework `execution_batch` as an `order_intent_batches.v1` JSON artifact. The file is intentionally the same shape consumed by `order-runtime-submit`, so the paper/live order path can be tested from a captured strategy output rather than hand-written order JSON.
+- `runtime-run-multi-once --order-batch-output` writes the default live multi-sleeve framework output as an `order_intent_batches.v1` JSON artifact. `runtime-run-once --order-batch-output` remains available for single-sleeve diagnostics. Both artifact shapes are intentionally the same shape consumed by `order-runtime-submit`, so the paper/live order path can be tested from captured strategy output rather than hand-written order JSON.
 - `order-runtime-paper-smoke` runs the paper lifecycle from an artifact in one command. It commits through `order-runtime-submit` with paper broker submission but no immediate poll, then runs the supervisor's paper poll to produce fill events and final status. This proves the submit/supervise boundary instead of hiding fill application inside submit.
 - `order-runtime-submit` is the explicit boundary between strategy order intent and account-level order lifecycle. It reads `OrderIntentBatch` JSON, validates sleeve/symbol/notional guards, dry-runs `OrderCoordinator` by default, and commits only with `--commit`. Broker-engine submit is blocked unless `--confirm-live-submit` is also present.
 - `EngineGuard` now checks the order runtime store before commit and rejects duplicate `batch_id:index` order intent ids or ticket ids that were already recorded. It also projects current virtual holdings with open tickets and unapplied fills, so a fresh batch with a new id is blocked when pending orders already cover the target quantity but allowed when the target quantity genuinely increases. Dry-run reports the same conditions as warnings so an operator can see that a captured artifact was already submitted or already covered.
 - `order-runtime-status` provides an explicit operator/agent read model for order operations. It combines the append-only order ticket/event store with the virtual sleeve account store and reports broker account route, market scope, open tickets, ticket/event counts, sleeve cash/holdings, pending buy notional, pending sell quantities, and unallocated broker fills. It does not submit, poll, or reconcile broker orders.
-- `order-runtime-supervise` is the first bounded order maintenance command. It can poll stored open tickets through paper or broker-engine gateways, import recent execution history through broker-engine account operations, run holdings reconciliation, and then attach the final `order-runtime-status` view. Setup, poll, and reconcile failures are returned as warnings so an agent loop can continue. Overseas broker-engine poll/reconcile is blocked explicitly until an overseas broker-engine adapter exists.
+- `order-runtime-supervise` is the first bounded order maintenance command. It can poll stored open tickets through paper or broker-engine gateways, import recent execution history through broker-engine account operations, run holdings reconciliation, and then attach the final `order-runtime-status` view. Setup, poll, and reconcile failures are returned as warnings so an agent loop can continue. Multi-sleeve status/supervisor commands now resolve domestic and overseas routes separately instead of requiring every selected sleeve to belong to every account route.
 - `EqualWeightPortfolioConstructionModel` remains the first model implementation. It emits equal target percentages for active insights instead of quantity targets.
 - `RebalancePolicy` can reserve cash, filter tiny quantity deltas, and suppress tiny non-exit order notionals through `OrderSizingEngine`. It can also opt into `reused_target_churn_guard`, which suppresses adjacent-lot non-exit churn when a previous `PortfolioTargetBatch` is being reused. This is off by default because same-day opposite-side cooldown is a strategy/execution policy, not a universal engine invariant.
 - Portfolio Construction Models can be loaded from Python model modules through `PythonPortfolioConstructionModelLoader`.
@@ -1053,7 +1077,31 @@ Current v0 behavior:
 - `VirtualSleeveAccountStore.ownership_for_order(...)` now resolves broker order aliases too, so KIS execution rows keyed by broker order number can map back to the sleeve-owned order intent when the local store knows the broker id.
 - Research backtests should be able to run one sleeve at a time with isolated cash, holdings, alpha, portfolio, risk, and execution settings. Live/paper orchestration should run all active sleeves together and then coordinate their order intents through the account-level buy/sell layer.
 - `runtime-run-once` now runs this framework path after `BackgroundSnapshotWorker` publishes the active indicator snapshot.
+- `runtime-run-multi-once` is the live/paper orchestration path for multiple sleeves. It bootstraps each sleeve with separate alpha/portfolio/risk/execution/account state, collects one union live market snapshot, publishes sleeve-namespaced indicator snapshots through one shared `IndicatorEngine`, runs each sleeve's framework, and writes one combined order-intent artifact for `order-runtime-submit`.
+- `tools/leaps_multi_sleeve_live_order_loop.ps1` is the default live order loop started by `tools/leaps_start_live_stack.ps1`. It runs `LEaps` and `us_etf_rotation` in one process using `configs/runtime/live_multi_sleeve.json`, while account routing and submit guards still split domestic and overseas orders by broker account.
+- The multi-sleeve runner deliberately requires explicit `--sleeve-id` arguments. This prevents a dormant or residual sleeve from joining a live loop simply because it appears in the config.
+- The bounded multi-sleeve live loop supports cycle-boundary hot reload through
+  `data/runtime/control/live.jsonl`. `activate_sleeve` adds a configured sleeve
+  to the active set, `deactivate_sleeve` removes one only when it has no open
+  tickets and no holdings, and `reload_config` / `reload_sleeve` swap validated
+  config/model changes for the next cycle. The active set is persisted at
+  `data/runtime/live-order-loop/multi_sleeve_active_sleeves.json`.
+- Active does not mean every sleeve runs every minute. The live loop has a
+  sleeve schedule gate before `runtime-run-multi-once`: by default `LEaps` runs
+  during KRX 08:30-18:30 KST and `us_etf_rotation` runs during US regular
+  market hours, 09:30-16:00 Eastern Time. Order supervision still checks the
+  active sleeve set, but alpha/portfolio/risk/execution only runs for scheduled
+  sleeves.
 - `bootstrap_sleeve_runtime(...)` pre-warms indicators before active selection when `indicators.warmup_enabled=true`, so indicator-based selection models do not start from an empty snapshot on the first live cycle.
+
+Example hot reload controls:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command activate-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id new_sleeve --reason "operator activate"
+py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command reload-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --reason "model update"
+py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command deactivate-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id old_sleeve --reason "no positions"
+```
 
 ### Universe Selection
 
@@ -1518,7 +1566,7 @@ py -3 -m pytest -q
 Expected current result:
 
 ```text
-322 passed, 1 warning
+424 passed, 1 warning
 ```
 
 Run sample:
@@ -1537,13 +1585,16 @@ py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live
 
 ## Known Limitations
 
-- `BackgroundSnapshotWorker` exists, but it is not yet wrapped by a production process supervisor.
+- A bounded multi-sleeve PowerShell live loop exists, but it is not yet wrapped
+  by a production service supervisor.
 - Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, and `BasicRiskManagementModel` can block new entries when the active snapshot is not fresh. More nuanced degraded/stale handling is still open.
-- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading and a v0 equal-weight allocation model. `OrderSizingEngine` now owns integer quantity conversion, rounding-loss visibility, and rebalance noise filtering before risk and execution. Risk and execution now have basic deterministic models and sleeve-level Python module loading. The order lifecycle, broker gateway, order runtime store, open-ticket polling worker, execution-history reconcile worker, and paper multi-sleeve order orchestrator exist, but the long-running daemon that continuously runs framework cycles, submits, polls, imports broker fills, and reconciles all sleeves is not implemented yet.
+- `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading and a v0 equal-weight allocation model. `OrderSizingEngine` now owns integer quantity conversion, rounding-loss visibility, and rebalance noise filtering before risk and execution. Risk and execution now have deterministic models and sleeve-level Python module loading. The order lifecycle, broker gateway, order runtime store, open-ticket polling worker, execution-history reconcile worker, broker-engine submission path, and multi-sleeve live orchestration path exist. Production daemon packaging and richer model-driven cancel/replace policy remain open.
 - Framework alpha backtesting exists, but n-1 minute delayed indicator snapshot modeling is not implemented yet.
 - Universe selection exists, but is not yet automatically scheduled into the live worker loop.
 - `OrderTicket` / `OrderEvent` exists with paper and broker-engine submission boundaries. Duplicate submit and common fill double-apply paths are guarded, but cancel/replace is still minimal. Broker fill polling remains intentionally conservative and is reconciled through execution-history/event sync.
-- Telegram notifications are outbound-only in the new engine today. Inbound Telegram commands, approval requests, and webhook processing remain in the legacy notification-engine reference and have not been copied into LEapsQuantEngine.
+- Telegram notification delivery and inbound update fetching exist in the new
+  engine. Operator command handling, approval requests, and webhook processing
+  remain outside the current live loop.
 - KIS order-level execution-summary rows are treated as one stable summary fill id for safety. If a summary quantity changes after a partial sync, the engine avoids double-applying it and relies on reconciliation status/operator follow-up rather than inventing missing fill deltas.
 - Live 200-symbol polling is bounded by external KIS/market-data-engine throughput and should not be used as a high-frequency strategy loop.
 - Current live US Top 200 universe generation was tested ad hoc; the committed fixture is a small smoke universe.

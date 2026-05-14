@@ -289,18 +289,31 @@ class LeapsKospiGrowthUsHedgeRiskModel:
 
         if stop_count >= 3 or breadth < 0.25 or average_volatility >= 0.18:
             name = "risk_off"
+            trigger = "stop_pressure_or_weak_breadth_or_high_volatility"
         elif breadth >= 0.55 and average_momentum >= 0.18 and average_volatility <= 0.14:
             name = "strong_risk_on"
+            trigger = "broad_strong_momentum"
         elif breadth >= 0.45 and average_momentum >= 0.08 and average_volatility <= 0.16:
             name = "risk_on"
+            trigger = "broad_positive_momentum"
+        elif (
+            stop_count == 0
+            and breadth >= 0.30
+            and average_momentum >= 0.25
+            and average_volatility <= 0.13
+        ):
+            name = "risk_on"
+            trigger = "narrow_leadership_strong_momentum"
         else:
             name = "neutral"
+            trigger = "mixed_or_insufficient_confirmation"
         return {
             "name": name,
             "market_breadth": breadth,
             "average_momentum": average_momentum,
             "average_volatility": average_volatility,
             "stop_pressure": stop_count,
+            "trigger": trigger,
             "source": "active_insights",
         }
 

@@ -1,7 +1,8 @@
 param(
     [string]$IncludeLiveLoops = "true",
-    [string]$IncludeLeapsLiveLoop = "true",
-    [string]$IncludeUsLiveLoop = "true",
+    [string]$IncludeMultiSleeveLiveLoop = "true",
+    [string]$IncludeLeapsLiveLoop = "false",
+    [string]$IncludeUsLiveLoop = "false",
     [string]$IncludeReports = "true",
     [string]$IncludeEodScheduler = "true"
 )
@@ -64,26 +65,53 @@ function Test-FlagEnabled {
 }
 
 $includeLiveLoopsEnabled = Test-FlagEnabled $IncludeLiveLoops
+$includeMultiSleeveLiveLoopEnabled = Test-FlagEnabled $IncludeMultiSleeveLiveLoop
 $includeLeapsLiveLoopEnabled = Test-FlagEnabled $IncludeLeapsLiveLoop
 $includeUsLiveLoopEnabled = Test-FlagEnabled $IncludeUsLiveLoop
 $includeReportsEnabled = Test-FlagEnabled $IncludeReports
 $includeEodSchedulerEnabled = Test-FlagEnabled $IncludeEodScheduler
 
-Write-StartupLog "startup begin include_live_loops=$includeLiveLoopsEnabled include_leaps_live=$includeLeapsLiveLoopEnabled include_us_live=$includeUsLiveLoopEnabled include_reports=$includeReportsEnabled include_eod_scheduler=$includeEodSchedulerEnabled"
+Write-StartupLog "startup begin include_live_loops=$includeLiveLoopsEnabled include_multi_live=$includeMultiSleeveLiveLoopEnabled include_leaps_live=$includeLeapsLiveLoopEnabled include_us_live=$includeUsLiveLoopEnabled include_reports=$includeReportsEnabled include_eod_scheduler=$includeEodSchedulerEnabled"
+
+if ($includeLiveLoopsEnabled -and $includeMultiSleeveLiveLoopEnabled) {
+    Start-StackProcess `
+        -Name "Multi-sleeve live order loop" `
+        -Needles @("leaps_multi_sleeve_live_order_loop.ps1", "live_multi_sleeve.json", "LEaps", "us_etf_rotation") `
+        -Arguments @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", "tools/leaps_multi_sleeve_live_order_loop.ps1",
+            "-Config", "configs/runtime/live_multi_sleeve.json",
+            "-SleeveIds", "LEaps,us_etf_rotation",
+            "-IntervalSeconds", "60",
+            "-DomesticMaxSubmitNotional", "7000000",
+            "-OverseasMaxSubmitNotional", "2500",
+            "-OrderBatchOutput", "data/runtime/live-order-loop/multi_sleeve_candidate_orders.json",
+            "-Journal", "data/cycle-journal/live_multi_sleeve.jsonl",
+            "-LogPath", "data/runtime/live-order-loop/multi_sleeve.log",
+            "-FrameworkStateDir", "data/runtime/framework-state/multi-sleeve",
+            "-SubmitStatePath", "data/runtime/live-order-loop/multi_sleeve_submit_state.json",
+            "-ControlQueue", "data/runtime/control/live.jsonl",
+            "-ActiveSleevesPath", "data/runtime/live-order-loop/multi_sleeve_active_sleeves.json",
+            "-HotReload", "true",
+            "-StaleAfterSeconds", "300",
+            "-CancelStaleOpenTickets", "true",
+            "-ExpireDayOpenTickets", "true"
+        )
+}
 
 if ($includeLiveLoopsEnabled -and $includeLeapsLiveLoopEnabled) {
     Start-StackProcess `
-        -Name "LEaps live order loop" `
-        -Needles @("leaps_live_order_loop.ps1", "leaps_workspace_smoke.json", "LEaps") `
+        -Name "LEaps legacy single-sleeve live order loop" `
+        -Needles @("leaps_live_order_loop.ps1", "live_multi_sleeve.json", "LEaps") `
         -Arguments @(
             "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", "tools/leaps_live_order_loop.ps1",
-            "-Config", "configs/runtime/leaps_workspace_smoke.json",
+            "-Config", "configs/runtime/live_multi_sleeve.json",
             "-SleeveId", "LEaps",
             "-IntervalSeconds", "60",
             "-MaxSubmitNotional", "7000000",
             "-OrderBatchOutput", "data/runtime/live-order-loop/LEaps_candidate_orders.json",
-            "-Journal", "data/cycle-journal/leaps_workspace_smoke.jsonl",
+            "-Journal", "data/cycle-journal/live_multi_sleeve.jsonl",
             "-LogPath", "data/runtime/live-order-loop/LEaps.log",
             "-SubmitStatePath", "data/runtime/live-order-loop/LEaps_submit_state.json",
             "-SubmitOncePerDay", "true",
@@ -96,12 +124,12 @@ if ($includeLiveLoopsEnabled -and $includeLeapsLiveLoopEnabled) {
 
 if ($includeLiveLoopsEnabled -and $includeUsLiveLoopEnabled) {
     Start-StackProcess `
-        -Name "US ETF rotation live order loop" `
-        -Needles @("leaps_live_order_loop.ps1", "us_etf_rotation_sleeve.json", "us_etf_rotation") `
+        -Name "US ETF rotation legacy single-sleeve live order loop" `
+        -Needles @("leaps_live_order_loop.ps1", "live_multi_sleeve.json", "us_etf_rotation") `
         -Arguments @(
             "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", "tools/leaps_live_order_loop.ps1",
-            "-Config", "configs/runtime/us_etf_rotation_sleeve.json",
+            "-Config", "configs/runtime/live_multi_sleeve.json",
             "-SleeveId", "us_etf_rotation",
             "-IntervalSeconds", "300",
             "-MaxSubmitNotional", "2500",
@@ -119,30 +147,36 @@ if ($includeLiveLoopsEnabled -and $includeUsLiveLoopEnabled) {
 if ($includeReportsEnabled) {
     Start-StackProcess `
         -Name "LEaps portfolio report loop" `
-        -Needles @("leaps_portfolio_report_loop.ps1", "leaps_workspace_smoke.json", "LEaps") `
+        -Needles @("leaps_portfolio_report_loop.ps1", "live_multi_sleeve.json", "LEaps") `
         -Arguments @(
             "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", "tools/leaps_portfolio_report_loop.ps1",
-            "-IntervalSeconds", "3600",
-            "-Config", "configs/runtime/leaps_workspace_smoke.json",
+            "-IntervalSeconds", "60",
+            "-Config", "configs/runtime/live_multi_sleeve.json",
             "-SleeveId", "LEaps",
             "-AccountStore", "data/virtual-accounts/kis_domestic.json",
-            "-Title", "LEaps Portfolio Report",
-            "-LogPath", "data/runtime/portfolio-reports/LEaps_portfolio_report_loop.log"
+            "-Title", "LEaps",
+            "-LogPath", "data/runtime/portfolio-reports/LEaps_portfolio_report_loop.log",
+            "-ScheduleMode", "phase",
+            "-MarketScope", "domestic",
+            "-StatePath", "data/runtime/portfolio-reports/LEaps_portfolio_report_loop.state.json"
         )
 
     Start-StackProcess `
         -Name "US ETF rotation portfolio report loop" `
-        -Needles @("leaps_portfolio_report_loop.ps1", "us_etf_rotation_sleeve.json", "us_etf_rotation") `
+        -Needles @("leaps_portfolio_report_loop.ps1", "live_multi_sleeve.json", "us_etf_rotation") `
         -Arguments @(
             "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", "tools/leaps_portfolio_report_loop.ps1",
-            "-IntervalSeconds", "3600",
-            "-Config", "configs/runtime/us_etf_rotation_sleeve.json",
+            "-IntervalSeconds", "300",
+            "-Config", "configs/runtime/live_multi_sleeve.json",
             "-SleeveId", "us_etf_rotation",
             "-AccountStore", "data/virtual-accounts/kis_overseas.json",
-            "-Title", "US ETF Rotation Portfolio Report",
-            "-LogPath", "data/runtime/portfolio-reports/us_etf_rotation_portfolio_report_loop.log"
+            "-Title", "US_ETF",
+            "-LogPath", "data/runtime/portfolio-reports/us_etf_rotation_portfolio_report_loop.log",
+            "-ScheduleMode", "phase",
+            "-MarketScope", "overseas",
+            "-StatePath", "data/runtime/portfolio-reports/us_etf_rotation_portfolio_report_loop.state.json"
         )
 }
 

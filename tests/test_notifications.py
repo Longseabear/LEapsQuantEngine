@@ -9,7 +9,7 @@ class FakeTelegramClient:
         self.fail = fail
         self.sent = []
 
-    def send_message(self, *, text, chat_id=None, disable_notification=False):
+    def send_message(self, *, text, chat_id=None, disable_notification=False, parse_mode=None):
         if self.fail:
             raise RuntimeError("telegram down")
         self.sent.append(
@@ -17,6 +17,7 @@ class FakeTelegramClient:
                 "text": text,
                 "chat_id": chat_id,
                 "disable_notification": disable_notification,
+                "parse_mode": parse_mode,
             }
         )
         return {"ok": True, "result": {"message_id": 123}}
@@ -76,8 +77,39 @@ def test_notification_service_sends_telegram_and_records_history(tmp_path):
             "text": "[ORDER] Submitted\n\nLEaps KRX:005930 buy 1",
             "chat_id": "chat-1",
             "disable_notification": True,
+            "parse_mode": None,
         }
     ]
+
+
+def test_notification_service_routes_order_category_to_order_client(tmp_path):
+    report_client = FakeTelegramClient()
+    order_client = FakeTelegramClient()
+    service = NotificationService(
+        paths=NotificationPaths(root=tmp_path / "notification-engine"),
+        telegram_client=report_client,
+        category_telegram_clients={"order": order_client},
+    )
+
+    report = service.notify_user_message(
+        category="status",
+        title="Daily Report",
+        message="report only",
+    )
+    order = service.notify_user_message(
+        category="order",
+        title="Order filled",
+        message="fill only",
+    )
+
+    assert report["delivery_status"] == "sent"
+    assert report["delivery_route"] == "default"
+    assert order["delivery_status"] == "sent"
+    assert order["delivery_route"] == "order"
+    assert len(report_client.sent) == 1
+    assert report_client.sent[0]["text"] == "[STATUS] Daily Report\n\nreport only"
+    assert len(order_client.sent) == 1
+    assert order_client.sent[0]["text"] == "[ORDER] Order filled\n\nfill only"
 
 
 def test_notification_service_preserves_korean_utf8_text(tmp_path):
@@ -102,6 +134,30 @@ def test_notification_service_preserves_korean_utf8_text(tmp_path):
     assert history["message"] == "삼성전자 매수 후보\n현금 5,000,000원"
 
 
+def test_notification_service_passes_telegram_parse_mode(tmp_path):
+    fake = FakeTelegramClient()
+    service = NotificationService(
+        paths=NotificationPaths(root=tmp_path / "notification-engine"),
+        telegram_client=fake,
+    )
+
+    result = service.notify_user_message(
+        category="status",
+        title="Portfolio",
+        message="```\nA   B\n```",
+        parse_mode="Markdown",
+    )
+
+    assert result["parse_mode"] == "Markdown"
+    assert result["message"] == "```\nA   B\n```"
+    assert fake.sent[0]["parse_mode"] == "Markdown"
+    assert "A   B" in fake.sent[0]["text"]
+    history = json.loads(
+        (tmp_path / "notification-engine" / "history" / f"{result['record_id']}.json").read_text(encoding="utf-8")
+    )
+    assert history["parse_mode"] == "Markdown"
+
+
 def test_normalize_agent_text_repairs_utf8_decoded_as_cp949():
     broken = "문서 모델".encode("utf-8").decode("cp949")
 
@@ -112,6 +168,9 @@ def test_telegram_client_normalizes_text_before_post(monkeypatch):
     captured = {}
 
     class FakeResponse:
+        status_code = 200
+        reason = "OK"
+
         def raise_for_status(self):
             return None
 
@@ -132,6 +191,55 @@ def test_telegram_client_normalizes_text_before_post(monkeypatch):
 
     assert response["ok"] is True
     assert captured["json"]["text"] == "문서 모델"
+    assert "parse_mode" not in captured["json"]
+
+
+def test_telegram_client_sends_parse_mode_when_requested(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        reason = "OK"
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 10}}
+
+    def fake_post(url, *, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr("leaps_quant_engine.telegram.requests.post", fake_post)
+
+    client = TelegramClient(bot_token="token", default_chat_id="chat")
+    response = client.send_message(text="```\nA B\n```", parse_mode="Markdown")
+
+    assert response["ok"] is True
+    assert captured["json"]["parse_mode"] == "Markdown"
+
+
+def test_telegram_client_http_error_does_not_include_bot_token(monkeypatch):
+    class FakeResponse:
+        status_code = 400
+        reason = "Bad Request"
+
+        def json(self):
+            return {"ok": False, "description": "Bad Request: chat not found"}
+
+    def fake_post(url, *, json, timeout):
+        return FakeResponse()
+
+    monkeypatch.setattr("leaps_quant_engine.telegram.requests.post", fake_post)
+    client = TelegramClient(bot_token="secret-token", default_chat_id="chat")
+
+    try:
+        client.send_message(text="hello")
+    except RuntimeError as exc:
+        error = str(exc)
+    else:  # pragma: no cover - defensive assertion.
+        raise AssertionError("expected Telegram send failure")
+
+    assert "chat not found" in error
+    assert "secret-token" not in error
 
 
 def test_notification_service_failure_is_persisted_not_raised(tmp_path):

@@ -18,12 +18,25 @@ happen?
 Use:
 
 ```powershell
-py -3 tools\leaps_portfolio_report.py --config configs\runtime\leaps_workspace_smoke.json --sleeve-id LEaps --notify
+py -3 tools\leaps_portfolio_report.py --config configs\runtime\live_multi_sleeve.json --sleeve-id LEaps --notify
 ```
 
-The helper is read-only. It runs a runtime cycle, compares current virtual
-account quantities against freshly sized targets, and can send the message to
-Telegram through the engine notification module.
+The helper is read-only. It runs a sleeve-scoped report cycle, compares current
+virtual account quantities against freshly sized targets, and can send the
+message to Telegram through the engine notification module.
+
+Live trading itself uses the multi-sleeve single runner:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
+  --summary-only
+```
+
+Do not infer live order-loop health from the portfolio report process alone.
+Portfolio reports are sleeve-scoped read models; order submission is owned by
+`tools/leaps_multi_sleeve_live_order_loop.ps1`.
 
 The message is UTF-8 Korean text and includes:
 
@@ -35,9 +48,15 @@ The message is UTF-8 Korean text and includes:
   `insufficient_cash_or_position_too_small`
 - current cycle order candidates
 
-`runtime-run-once` also emits an `engine_status` object in its JSON output.
-Agents should prefer that compact object for quick health/status checks and use
-the full `framework` / `portfolio_state` payload only for deeper diagnostics.
+Telegram delivery uses legacy `Markdown` parse mode for this helper. The
+current-vs-target and order-candidate sections are rendered as fenced code-block
+tables instead of GitHub-style Markdown tables, because Telegram does not render
+pipe tables as native tables.
+
+`runtime-run-once` and `runtime-run-multi-once` emit compact engine status
+objects in JSON output. Agents should prefer those compact objects for quick
+health/status checks and use the full `framework` / `portfolio_state` payloads
+only for deeper diagnostics.
 
 Position lifecycle state is persisted by the virtual account store, not by
 reporting. A report may display fields such as entry time, high-watermark price,
@@ -45,16 +64,50 @@ or latest stop price after those fields are wired into the report payload, but
 the source of truth remains the store's `PositionState` records that are updated
 from fills and explicit price marks.
 
-Hourly process:
+Phase-scheduled process:
 
 ```powershell
 Start-Process -FilePath powershell.exe `
-  -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','tools\leaps_portfolio_report_loop.ps1','-IntervalSeconds','3600','-Config','configs/runtime/leaps_workspace_smoke.json','-SleeveId','LEaps') `
+  -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','tools\leaps_portfolio_report_loop.ps1','-ScheduleMode','phase','-MarketScope','domestic','-IntervalSeconds','60','-Config','configs/runtime/live_multi_sleeve.json','-SleeveId','LEaps','-Title','LEaps') `
   -WindowStyle Hidden -PassThru
 ```
 
+The live loop sends only one successful report per market-local date and phase:
+
+- domestic: `pre_market` 08:30-09:00 KST, `regular_market` 09:00-15:30 KST, `after_market` 15:40-18:30 KST
+- overseas: `pre_market` 04:00-09:30 ET, `regular_market` 09:30-16:00 ET, `after_market` 16:00-20:00 ET
+
+If a phase attempt fails because live quotes are not yet available, the loop logs
+the failure and retries inside that phase without marking the report as sent.
+Once a report succeeds, the state file blocks duplicate notifications for that
+same `market_date|phase`.
+
+Telegram routing is split by category. Portfolio reports use the default
+`LEAPS_TELEGRAM_BOT_TOKEN` / `LEAPS_TELEGRAM_CHAT_ID` route. Order submit,
+supervisor, and fill lifecycle notifications use `category=order`, which routes
+to `LEAPS_ORDER_TELEGRAM_*` when set, otherwise the existing
+`STOCKPROGRAM_TELEGRAM_*` bot. Do not send routine portfolio reports through
+the order/fill bot.
+
 The report must show held positions as `hold` unless there is an explicit
 sell/exit target. A missing target alone is not a sell instruction.
+
+## Operator Cash Availability
+
+Use this when deciding whether cash can be moved into a sleeve:
+
+```powershell
+py -3 -m leaps_quant_engine.cli sleeve-cash-availability `
+  configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --summary-only
+```
+
+The command is read-only. It reads the virtual account store, the latest broker
+cash snapshot stored there, and the residual `default sleeve` cash. The
+`available_cash_by_currency` field is the amount that can be explicitly
+transferred from `default sleeve` into the selected sleeve without changing
+broker state.
 
 Planned cash-policy fields:
 
@@ -86,10 +139,10 @@ When a live trade is surprising, collect:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --recent-events 20 --summary-only
-py -3 tools\leaps_portfolio_report.py --config configs\runtime\leaps_workspace_smoke.json --sleeve-id LEaps
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --recent-events 20 --summary-only
+py -3 tools\leaps_portfolio_report.py --config configs\runtime\live_multi_sleeve.json --sleeve-id LEaps
 ```
 
 Then inspect the order runtime JSONL, virtual account store, latest live
-operator artifact, and cycle journal. Classify the event as strategy intended,
-risk/guard blocked, operational, or bug-like.
+operator artifact, multi-sleeve live loop log, and cycle journal. Classify the
+event as strategy intended, risk/guard blocked, operational, or bug-like.

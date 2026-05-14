@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from leaps_quant_engine.control import (
+    FileRuntimeControlQueue,
     RuntimeControlCommand,
     RuntimeControlCommandType,
     RuntimeControlQueue,
@@ -284,11 +285,33 @@ def test_control_queue_drains_commands_in_order():
     queue = RuntimeControlQueue()
     first = queue.submit(RuntimeControlCommand.reload_config("configs/runtime/live_us.json"))
     second = queue.submit(RuntimeControlCommand.reload_sleeve("configs/runtime/live_us.json", "LEaps"))
-    third = queue.submit(RuntimeControlCommand.pause_worker())
+    third = queue.submit(RuntimeControlCommand.activate_sleeve("configs/runtime/live_us.json", "ETF"))
+    fourth = queue.submit(RuntimeControlCommand.deactivate_sleeve("configs/runtime/live_us.json", "ETF"))
+    fifth = queue.submit(RuntimeControlCommand.pause_worker())
 
-    assert queue.drain() == (first, second, third)
+    assert queue.drain() == (first, second, third, fourth, fifth)
     assert queue.drain() == ()
     assert second.sleeve_id() == "LEaps"
+    assert third.sleeve_id() == "ETF"
+    assert fourth.sleeve_id() == "ETF"
+
+
+def test_file_control_queue_persists_and_drains_commands(tmp_path):
+    queue_path = tmp_path / "runtime-control.jsonl"
+    queue = FileRuntimeControlQueue(queue_path)
+    first = queue.submit(RuntimeControlCommand.reload_config("configs/runtime/live_us.json", reason="new model"))
+    second = queue.submit(RuntimeControlCommand.reload_sleeve("configs/runtime/live_us.json", "LEaps"))
+    third = queue.submit(RuntimeControlCommand.activate_sleeve("configs/runtime/live_us.json", "ETF"))
+
+    assert len(queue) == 3
+    drained = queue.drain()
+
+    assert [command.command_id for command in drained] == [first.command_id, second.command_id, third.command_id]
+    assert drained[0].reason == "new model"
+    assert drained[1].sleeve_id() == "LEaps"
+    assert drained[2].command_type == RuntimeControlCommandType.ACTIVATE_SLEEVE
+    assert queue.drain() == ()
+    assert not queue_path.exists()
 
 
 def test_runtime_config_controller_loads_only_on_reload_command(tmp_path):
@@ -354,4 +377,37 @@ def test_runtime_config_controller_loads_on_reload_sleeve_command(tmp_path):
 
     assert calls == [tmp_path / "updated.json"]
     assert report.applied_commands[0].command_type == RuntimeControlCommandType.RELOAD_SLEEVE
+    assert report.current_version == "sha256:updated"
+
+
+def test_runtime_config_controller_loads_on_activate_and_deactivate_sleeve_commands(tmp_path):
+    initial = RuntimeConfigSnapshot(
+        config=parse_runtime_config(_runtime_payload()),
+        source_path=tmp_path / "initial.json",
+        version="sha256:initial",
+        loaded_at="2026-05-09T09:00:00",
+    )
+    loaded = RuntimeConfigSnapshot(
+        config=parse_runtime_config({**_runtime_payload(), "runtime_id": "live-us-updated"}),
+        source_path=tmp_path / "updated.json",
+        version="sha256:updated",
+        loaded_at="2026-05-09T09:01:00",
+    )
+    calls = []
+
+    def loader(path):
+        calls.append(path)
+        return loaded
+
+    queue = RuntimeControlQueue()
+    controller = RuntimeConfigController(snapshot=initial, queue=queue, loader=loader)
+    queue.submit(RuntimeControlCommand.activate_sleeve(tmp_path / "updated.json", "us-live"))
+    queue.submit(RuntimeControlCommand.deactivate_sleeve(tmp_path / "updated.json", "us-live"))
+    report = controller.apply_pending()
+
+    assert calls == [tmp_path / "updated.json", tmp_path / "updated.json"]
+    assert [command.command_type for command in report.applied_commands] == [
+        RuntimeControlCommandType.ACTIVATE_SLEEVE,
+        RuntimeControlCommandType.DEACTIVATE_SLEEVE,
+    ]
     assert report.current_version == "sha256:updated"

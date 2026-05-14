@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs" / "runtime" / "leaps_workspace_smoke.json"
+DEFAULT_CONFIG = ROOT / "configs" / "runtime" / "live_multi_sleeve.json"
 DEFAULT_OUT_DIR = ROOT / "data" / "runtime" / "portfolio-reports"
 DEFAULT_ACCOUNT_STORE = ROOT / "data" / "virtual-accounts" / "kis_domestic.json"
 DEFAULT_FRAMEWORK_STATE_DIR = ROOT / "data" / "runtime" / "framework-state"
@@ -26,7 +27,7 @@ def main() -> int:
     parser.add_argument("--account-store", default=str(DEFAULT_ACCOUNT_STORE))
     parser.add_argument("--framework-state")
     parser.add_argument("--notify", action="store_true")
-    parser.add_argument("--title", default="LEaps 포트폴리오 리포트")
+    parser.add_argument("--title", default="LEaps Portfolio Report")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -133,6 +134,8 @@ def _send_notification(*, title: str, message_path: Path) -> None:
         str(message_path),
         "--root",
         str(ROOT / "data" / "notification-engine"),
+        "--parse-mode",
+        "Markdown",
         "--summary-only",
     ]
     completed = subprocess.run(
@@ -213,32 +216,24 @@ def _format_report(
     )
     if not symbols:
         lines.append("- 보유/목표 없음")
-    for symbol in symbols:
-        current_item = current_by_symbol.get(symbol, {})
-        target_item = target_by_symbol.get(symbol, {})
-        current_qty = int(current_item.get("quantity", 0) or 0)
-        target_qty = int(target_item.get("target_quantity", current_qty) or 0)
-        delta = target_qty - current_qty
-        action = _delta_action(delta)
-        market_value = current_item.get("market_value")
-        pnl = float(current_item.get("unrealized_pnl") or 0.0)
-        realized_symbol = float(realized_pnl_by_symbol.get(symbol) or 0.0)
-        risk_note = _risk_note(target_item)
-        lines.append(
-            f"- {_format_symbol(symbol, symbol_names)} | {current_qty}주 -> {target_qty}주 "
-            f"({action}) | 평가 {_money(market_value, currency)}"
+    else:
+        table_lines, detail_lines = _holding_table_lines(
+            symbols,
+            current_by_symbol=current_by_symbol,
+            target_by_symbol=target_by_symbol,
+            symbol_names=symbol_names,
+            realized_pnl_by_symbol=realized_pnl_by_symbol,
+            currency=currency,
         )
-        lines.append(
-            f"  현재 {_money(current_item.get('market_price'), currency)} / "
-            f"평균 {_money(current_item.get('average_price'), currency)} / "
-            f"미실현 {_signed_money(pnl, currency)} ({_pct(current_item.get('unrealized_pnl_pct'))})"
-            f"{_realized_suffix(realized_symbol, currency)}{risk_note}"
-        )
+        lines.extend(_markdown_code_block(table_lines))
+        if detail_lines:
+            lines.extend(["", "메모"])
+            lines.extend(f"- {line}" for line in detail_lines)
 
     order_lines = _order_lines(framework, symbol_names, currency)
     if order_lines:
         lines.extend(["", "주문 후보"])
-        lines.extend(order_lines)
+        lines.extend(_markdown_code_block(order_lines))
 
     attention = _attention_lines(snapshot_quality, execution, risk, warnings)
     if attention:
@@ -305,15 +300,160 @@ def _target_by_symbol(
     return targets
 
 
+def _holding_table_lines(
+    symbols: list[str],
+    *,
+    current_by_symbol: Mapping[str, Mapping[str, Any]],
+    target_by_symbol: Mapping[str, Mapping[str, Any]],
+    symbol_names: Mapping[str, str],
+    realized_pnl_by_symbol: Mapping[str, float],
+    currency: str,
+) -> tuple[list[str], list[str]]:
+    rows: list[list[str]] = []
+    detail_lines: list[str] = []
+    for symbol in symbols:
+        current_item = current_by_symbol.get(symbol, {})
+        target_item = target_by_symbol.get(symbol, {})
+        current_qty = int(current_item.get("quantity", 0) or 0)
+        target_qty = int(target_item.get("target_quantity", current_qty) or 0)
+        delta = target_qty - current_qty
+        pnl = float(current_item.get("unrealized_pnl") or 0.0)
+        rows.append(
+            [
+                _format_symbol(symbol, symbol_names),
+                f"{current_qty}주",
+                f"{target_qty}주",
+                _delta_cell(delta),
+                _money(current_item.get("market_price"), currency),
+                _money(current_item.get("average_price"), currency),
+                _pnl_cell(pnl, current_item.get("unrealized_pnl_pct"), currency),
+            ]
+        )
+        realized_symbol = float(realized_pnl_by_symbol.get(symbol) or 0.0)
+        if abs(realized_symbol) >= 0.5:
+            detail_lines.append(f"{_format_symbol(symbol, symbol_names)} 실현 {_signed_money(realized_symbol, currency)}")
+        risk_note = _risk_note(target_item)
+        if risk_note:
+            detail_lines.append(f"{_format_symbol(symbol, symbol_names)} {risk_note}")
+    return _format_table(
+        ["종목", "보유", "목표", "증감", "현재가", "평단", "손익"],
+        rows,
+        max_widths=[22, 5, 5, 8, 10, 10, 16],
+        right_align={1, 2, 4, 5, 6},
+    ), detail_lines
+
+
 def _order_lines(framework: Mapping[str, Any], symbol_names: Mapping[str, str], currency: str) -> list[str]:
-    lines: list[str] = []
+    rows: list[list[str]] = []
     for order in framework.get("order_intents", []) or []:
         symbol = str(order.get("symbol") or "")
-        side = str(order.get("side") or "")
+        side = _side_label(order.get("side"))
         quantity = int(order.get("quantity") or 0)
         price = order.get("reference_price")
-        lines.append(f"- {_format_symbol(symbol, symbol_names)} {side} {quantity}주 @ {_money(price, currency)}")
-    return lines
+        rows.append([_format_symbol(symbol, symbol_names), side, f"{quantity}주", _money(price, currency)])
+    if not rows:
+        return []
+    return _format_table(
+        ["종목", "방향", "수량", "기준가"],
+        rows,
+        max_widths=[22, 4, 5, 10],
+        right_align={2, 3},
+    )
+
+
+def _markdown_code_block(lines: list[str]) -> list[str]:
+    return ["```", *lines, "```"]
+
+
+def _format_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    max_widths: list[int],
+    right_align: set[int] | None = None,
+) -> list[str]:
+    right_align = right_align or set()
+    clipped_rows = [
+        [_truncate_display(str(cell), max_widths[index]) for index, cell in enumerate(row)]
+        for row in rows
+    ]
+    clipped_headers = [
+        _truncate_display(header, max_widths[index])
+        for index, header in enumerate(headers)
+    ]
+    widths = [
+        min(
+            max_widths[index],
+            max(
+                [_display_width(clipped_headers[index])]
+                + [_display_width(row[index]) for row in clipped_rows]
+            ),
+        )
+        for index in range(len(headers))
+    ]
+
+    def row_line(values: list[str]) -> str:
+        return "| " + " | ".join(
+            _pad_display(value, widths[index], right=index in right_align)
+            for index, value in enumerate(values)
+        ) + " |"
+
+    separator = "| " + " | ".join("-" * width for width in widths) + " |"
+    return [row_line(clipped_headers), separator, *(row_line(row) for row in clipped_rows)]
+
+
+def _truncate_display(text: str, limit: int) -> str:
+    if _display_width(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    result = ""
+    width = 0
+    for char in text:
+        char_width = _display_width(char)
+        if width + char_width > limit - 1:
+            break
+        result += char
+        width += char_width
+    return result + "…"
+
+
+def _pad_display(text: str, width: int, *, right: bool = False) -> str:
+    padding = max(width - _display_width(text), 0)
+    if right:
+        return " " * padding + text
+    return text + " " * padding
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def _delta_cell(delta: int) -> str:
+    if delta > 0:
+        return f"+{delta} 매수"
+    if delta < 0:
+        return f"{delta} 매도"
+    return "유지"
+
+
+def _side_label(side: Any) -> str:
+    text = str(side or "").lower()
+    if text == "buy":
+        return "매수"
+    if text == "sell":
+        return "매도"
+    return str(side or "-")
+
+
+def _pnl_cell(pnl: float, pnl_pct: Any, currency: str) -> str:
+    pct = _pct(pnl_pct)
+    if pct == "-":
+        return _signed_money(pnl, currency)
+    return f"{_signed_money(pnl, currency)} {pct}"
 
 
 def _attention_lines(
@@ -348,20 +488,12 @@ def _attention_lines(
     return lines
 
 
-def _delta_action(delta: int) -> str:
-    if delta > 0:
-        return f"매수 +{delta}"
-    if delta < 0:
-        return f"매도 {delta}"
-    return "유지"
-
-
 def _risk_note(target_item: Mapping[str, Any]) -> str:
     status = str(target_item.get("risk_status") or "")
     reason = str(target_item.get("risk_reason") or "")
     if status in {"", "hold", "approved"} and reason in {"", "no_delta"}:
         return ""
-    return f" / risk {status}:{_friendly_risk_reason(reason, target_item.get('risk_metadata') or {})}"
+    return f"risk {status}:{_friendly_risk_reason(reason, target_item.get('risk_metadata') or {})}"
 
 
 def _friendly_risk_reason(reason: Any, metadata: Mapping[str, Any] | None = None) -> str:
@@ -394,12 +526,6 @@ def _friendly_risk_reason(reason: Any, metadata: Mapping[str, Any] | None = None
     if text == "currency_policy_clamped":
         return "통화/노출 정책으로 수량 조정"
     return text
-
-
-def _realized_suffix(realized_symbol: float, currency: str) -> str:
-    if abs(realized_symbol) < 0.5:
-        return ""
-    return f" / 실현 {_signed_money(realized_symbol, currency)}"
 
 
 def _format_symbol(symbol: str, symbol_names: Mapping[str, str]) -> str:

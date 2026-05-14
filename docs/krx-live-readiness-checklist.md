@@ -1,9 +1,9 @@
-# KRX Live Readiness Checklist
+﻿# KRX Live Readiness Checklist
 
-Last updated: 2026-05-11 01:00 KST
+Last updated: 2026-05-14 15:30 KST
 
 This checklist is for running `LEaps` against the Korean market through
-`configs/runtime/leaps_workspace_smoke.json`.
+the default live multi-sleeve config, `configs/runtime/live_multi_sleeve.json`.
 
 For the short morning operating procedure, see
 `docs/krx-market-open-runbook.md`.
@@ -11,7 +11,7 @@ For the short morning operating procedure, see
 The live boundary is:
 
 ```text
-runtime-run-once
+runtime-run-multi-once
   -> OrderIntent artifact
   -> order-runtime-submit dry-run
   -> order-runtime-submit --commit --confirm-live-submit
@@ -85,8 +85,8 @@ Go only if every item is true:
 - `virtual-account-reconcile` is either `ok`, or every mismatch is deliberately
   assigned to a non-LEaps sleeve and documented.
 - LEaps virtual cash is the intended live allocation.
-- `runtime-run-once` snapshot quality is `fresh`.
-- `runtime-run-once` has `failed_symbol_count: 0`.
+- `runtime-run-multi-once` snapshot quality is `fresh` for the LEaps sleeve.
+- `runtime-run-multi-once` has `failed_symbol_count: 0` for the LEaps sleeve.
 - `order-runtime-submit` dry-run is not `blocked`.
 - Dry-run guard has no `reserved_cash_exceeded`, `oversell`, route mismatch, or
   unsupported broker route decision.
@@ -123,9 +123,9 @@ not treat a holiday as a live orderable day.
 2. Check config and code identity.
 
 ```powershell
-py -3 -m leaps_quant_engine.cli runtime-config-validate configs/runtime/leaps_workspace_smoke.json
+py -3 -m leaps_quant_engine.cli runtime-config-validate configs/runtime/live_multi_sleeve.json
 
-py -3 -m leaps_quant_engine.cli runtime-preflight configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-preflight configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --include-order-status `
   --summary-only
@@ -142,24 +142,25 @@ py -3 -m leaps_quant_engine.cli kis-quote 005930 --market KRX
 4. Check order and recovery state.
 
 ```powershell
-py -3 -m leaps_quant_engine.cli runtime-recovery-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-recovery-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --broker broker-engine `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --summary-only
 ```
 
 5. Check broker holdings against virtual sleeve state.
 
 ```powershell
-py -3 -m leaps_quant_engine.cli virtual-account-reconcile configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli virtual-account-reconcile configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --market domestic `
   --summary-only
@@ -171,25 +172,27 @@ the mismatch is explicitly accepted as another sleeve's responsibility.
 6. Generate a dry-run cycle artifact.
 
 ```powershell
-py -3 -m leaps_quant_engine.cli --log-level ERROR runtime-run-once configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli --log-level ERROR runtime-run-multi-once configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --summary-only `
-  --order-batch-output "$PWD/artifacts/prelive/leaps_krx_order_intents.json"
+  --order-batch-output "$PWD/artifacts/prelive/multi_sleeve_order_intents.json"
 ```
 
 Required readout:
 
-- `snapshot_quality.status` is `fresh`.
-- `failed_symbol_count` is `0`.
+- LEaps report `snapshot_quality.status` is `fresh`.
+- LEaps report `failed_symbol_count` is `0`.
 - `order_batch_artifact.order_count` matches expectation.
-- `portfolio_state.current.cash_by_currency.KRW` is the intended LEaps cash.
+- LEaps `portfolio_state.current.cash_by_currency.KRW` is the intended cash.
 
 7. Dry-run order submit.
 
 ```powershell
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json `
-  artifacts/prelive/leaps_krx_order_intents.json `
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json `
+  artifacts/prelive/multi_sleeve_order_intents.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --broker broker-engine `
   --summary-only
 ```
@@ -212,9 +215,10 @@ before live commit.
 Only after the pre-open checklist is green:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json `
-  artifacts/prelive/leaps_krx_order_intents.json `
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json `
+  artifacts/prelive/multi_sleeve_order_intents.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --broker broker-engine `
   --commit `
   --confirm-live-submit `
@@ -231,13 +235,14 @@ holdings changed.
 Run this loop while the engine is operating:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --broker broker-engine `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --summary-only
 ```
 
@@ -254,10 +259,10 @@ Watch these fields:
 If a live order is submitted, supervise boundedly:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --broker broker-engine `
-  --market domestic `
   --summary-only
 ```
 
@@ -287,18 +292,18 @@ recovery/status before restarting automated submission.
 After the session:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --broker broker-engine `
-  --market domestic `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli virtual-account-reconcile configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli virtual-account-reconcile configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --market domestic `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli runtime-recovery-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-recovery-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --summary-only
 ```
@@ -311,3 +316,4 @@ Expected end state:
 - Unknown/manual broker fills are assigned or deliberately left for operator
   allocation.
 - Cycle journal has the final cycle and current config/code identity.
+

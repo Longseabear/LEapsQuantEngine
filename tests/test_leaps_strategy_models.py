@@ -283,6 +283,69 @@ def test_kospi_growth_risk_raises_exposure_cap_in_strong_regime():
     assert batch.decisions[0].metadata["max_total_exposure_pct"] == 0.80
 
 
+def test_kospi_growth_risk_treats_narrow_leadership_momentum_as_risk_on():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 14)
+    samsung = Symbol("005930", "KRX")
+    samsung_ct = Symbol("028260", "KRX")
+    hyundai = Symbol("005380", "KRX")
+    kia = Symbol("000270", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={
+            samsung.key: Bar(samsung, now, 298_000, 298_000, 298_000, 298_000, 1000),
+            samsung_ct.key: Bar(samsung_ct, now, 443_500, 443_500, 443_500, 443_500, 1000),
+            hyundai.key: Bar(hyundai, now, 713_000, 713_000, 713_000, 713_000, 1000),
+            kia.key: Bar(kia, now, 179_000, 179_000, 179_000, 179_000, 1000),
+        },
+    )
+    portfolio = Portfolio(
+        cash=4_830_406,
+        cash_by_currency={"KRW": 4_830_406},
+        holdings={
+            samsung.key: Holding(samsung, quantity=10, average_price=274_552),
+            samsung_ct.key: Holding(samsung_ct, quantity=4, average_price=429_500),
+            hyundai.key: Holding(hyundai, quantity=2, average_price=682_519),
+            kia.key: Holding(kia, quantity=5, average_price=174_920),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 0.26},
+            "max_total_exposure_pct_by_currency": {"KRW": 0.68},
+            "cash_buffer_pct_by_currency": {"KRW": 0.10},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {
+                "KRW": {
+                    "neutral": 0.60,
+                    "risk_on": 0.78,
+                    "strong_risk_on": 0.95,
+                }
+            },
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(PortfolioTarget(samsung_ct, 7),),
+            active_insights=(
+                _regime_insight(samsung, now, breadth=0.3125, momentum=0.46, volatility=0.10),
+                _regime_insight(samsung_ct, now, breadth=0.3125, momentum=0.47, volatility=0.11),
+            ),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.metadata["market_regime"]["name"] == "risk_on"
+    assert decision.metadata["market_regime"]["trigger"] == "narrow_leadership_strong_momentum"
+    assert decision.metadata["max_total_exposure_pct"] == 0.78
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 6
+
+
 def test_kospi_growth_risk_explains_when_exposure_cap_has_no_room():
     module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
     now = datetime(2026, 5, 13)
@@ -403,6 +466,20 @@ def test_leaps_execution_uses_more_aggressive_limit_for_stop_sells():
     assert orders[0].side is OrderSide.SELL
     assert orders[0].limit_price == 99_500
     assert orders[0].metadata["limit_offset_bps"] == 50
+
+
+def test_leaps_execution_rounds_domestic_limit_prices_to_krx_tick():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("006400", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 634_000, 634_000, 634_000, 634_000, 1_000_000)})
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=1, average_price=675_000)})
+    model = module.create_execution_model({"sell_limit_offset_bps": 15})
+
+    orders = model.create_orders("LEaps", portfolio, data, [PortfolioTarget(symbol, 0, tag="exit")])
+
+    assert len(orders) == 1
+    assert orders[0].limit_price == 633_000
 
 
 def test_leaps_execution_reduces_entries_in_extended_session():

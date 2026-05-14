@@ -99,15 +99,15 @@ Implemented now:
 - Alpha: Python Alpha Model loader, `AlphaRuntime`, per-alpha cadence, alpha-specific selected symbol inputs, `Insight`, `InsightBatch`, and example alpha modules.
 - Framework: `InsightManager`, `PortfolioConstructionEngine`, target persistence through rebalance cadence, equal-weight portfolio model, `PortfolioAllocationTarget`, `OrderSizingEngine`, basic risk gates, immediate execution, and order-intent output.
 - Orders: global order coordination, `OrderTicket`, `OrderEvent`, append-only order runtime state, open-ticket polling, execution-history reconciliation, simulated fills, multi-sleeve order orchestration, paper broker gateway, and a StockProgram-style broker-engine gateway.
-- Operations: `runtime-run-once --order-batch-output` persists strategy output as a submit-ready order-intent artifact. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from that artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation, can expire rolled-over `day` tickets, can cancel stale tickets when explicitly requested, and returns a final status report. Order runtime commands can route through sleeve-level broker account profiles.
-- Runtime: config validation, broker account profiles, runtime bootstrap, one-cycle live smoke command, logging, and summary reports.
+- Operations: `runtime-run-multi-once --order-batch-output` is the default live/paper orchestration path for active sleeves. It collects one union live market snapshot, runs each sleeve's framework separately, and writes a submit-ready order-intent artifact. `runtime-run-once` remains useful for single-sleeve diagnostics. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from an artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation, can expire rolled-over `day` tickets, can cancel stale tickets when explicitly requested, and returns a final status report. Order runtime commands route through sleeve-level broker account profiles.
+- Runtime: config validation, broker account profiles, runtime bootstrap, one-cycle single-sleeve diagnostics, multi-sleeve live runner with cycle-boundary hot reload and per-sleeve schedule gating, logging, and summary reports.
 - Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills and report metrics.
 
 Not complete yet:
 
-- Long-running live submit/poll/fill-sync/reconcile orchestration across all sleeves.
+- Production-grade daemon/supervisor packaging around the current bounded PowerShell live loops.
 - Rich model-driven replace policy beyond bounded stale cancellation, plus broker fill event ingestion beyond execution-history sync.
-- Overseas broker-engine live submit, poll, and account reconciliation. Overseas sleeve routes are explicit now, but broker-engine side effects are blocked until the overseas adapter exists.
+- More exhaustive overseas broker reconciliation diagnostics beyond the current broker-engine submit/supervise path.
 - Long-running production daemon/supervisor with scheduled universe reselection.
 
 ## Shape
@@ -149,7 +149,7 @@ py -3 -m pytest -q
 Current expected result:
 
 ```text
-270 passed
+424 passed
 ```
 
 ## Run Sample
@@ -184,23 +184,28 @@ $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli runtime-config-validate configs/runtime/live_us_smoke.json
 ```
 
-Run one configured runtime cycle:
+Run one configured single-sleeve diagnostic cycle:
 
 ```powershell
 $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/live_us_smoke.json --sleeve-id us-live --held IBM --skip-warmup --summary-only
 ```
 
-Persist the runtime cycle's execution output as a submit-ready artifact:
+Run the default multi-sleeve live/paper cycle and persist execution output as a
+submit-ready artifact:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/leaps_workspace_smoke.json --sleeve-id LEaps --summary-only --order-batch-output ../../data/order-intents/leaps_latest.json
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
+  --summary-only `
+  --order-batch-output data/order-intents/live_multi_latest.json
 ```
 
 The first sample lives at `configs/runtime/live_us_smoke.json`. It references the coarse universe file, the active selection module, alpha module path, portfolio construction module path, sleeve cash, market-data provider choice, rate limit, warmup settings, rebalance settings, and worker cadence. `bootstrap_sleeve_runtime(...)` turns the snapshot into provider adapters, optional fine refresh, active universe selection, alpha runtime, portfolio construction engine, sleeve portfolio, `FrameworkRunner`, and `BackgroundSnapshotWorker`. The running process should keep the parsed `RuntimeConfigSnapshot` in memory and only reload the file after a control command.
 
-`runtime-run-once` returns both worker and framework sections: worker covers market snapshot collection and indicator publication; framework covers `Alpha -> InsightManager -> Portfolio -> OrderSizing -> Risk -> Execution -> OrderIntent`.
+`runtime-run-once` and `runtime-run-multi-once` return worker and framework sections. Worker covers market snapshot collection and indicator publication; framework covers `Alpha -> InsightManager -> Portfolio -> OrderSizing -> Risk -> Execution -> OrderIntent`.
 
 When `indicators.warmup_enabled=true`, runtime bootstrap warms indicators before active selection and passes the warmed snapshot into selection models. If warmup is incomplete, the runtime marks the cycle with `warmup_not_ready` and blocks new entries instead of making cold-start momentum decisions.
 
@@ -210,23 +215,23 @@ Dry-run or commit an order-intent batch file into the order runtime:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --summary-only
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --commit --broker paper --summary-only
-py -3 -m leaps_quant_engine.cli order-runtime-paper-smoke configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json data/order-intents/sample.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json data/order-intents/sample.json --commit --broker paper --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-paper-smoke configs/runtime/live_multi_sleeve.json data/order-intents/sample.json --summary-only
 ```
 
 Read the current order runtime and sleeve virtual-account state:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only
 ```
 
 Run one bounded order maintenance pass:
 
 ```powershell
 $env:PYTHONPATH='src'
-py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only
 ```
 
 ## Notifications
@@ -247,7 +252,7 @@ The StockProgram variable names are also accepted as fallback for migration.
 $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli notification-status
 py -3 -m leaps_quant_engine.cli notify-user-message --category order --title "Order queued" --message "LEaps KRX:005930 buy 1" --summary-only
-py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/leaps_workspace_smoke.json data/order-intents/sample.json --commit --broker paper --notify --summary-only
+py -3 -m leaps_quant_engine.cli order-runtime-submit configs/runtime/live_multi_sleeve.json data/order-intents/sample.json --commit --broker paper --notify --summary-only
 ```
 
 ## KIS Adapter
@@ -323,10 +328,11 @@ py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_wor
 This path runs configured `universe.active.selection_models` on each backtest
 cycle and passes `alpha.input_selections` into `AlphaRuntime`, so research can
 exercise the same selection-to-alpha wiring used by runtime.
-`leaps_workspace_smoke` now wires LEaps to the USD-only
-`configs/universes/leaps_us_research_core.json` universe and the
-`portfolios/rl_ppo_constructor.py` model. Train the local PPO policy ensemble
-with:
+`leaps_workspace_smoke` remains the single-sleeve LEaps research/backtest config
+and wires LEaps to the KR research universe and the
+`portfolios/rl_ppo_constructor.py` model. The live config
+`live_multi_sleeve.json` combines that LEaps sleeve with the separate
+`us_etf_rotation` USD sleeve. Train the local PPO policy ensemble with:
 
 ```powershell
 $env:PYTHONPATH='src'

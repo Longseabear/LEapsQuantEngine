@@ -164,14 +164,16 @@ to fills, cash changes, and price/equity changes.
 ## Process Boundary State
 
 The current live PowerShell order loop starts a fresh Python process for each
-`runtime-run-once`. Plain in-memory cadence state is therefore not enough for
-live operation. Use the framework state file:
+`runtime-run-multi-once`. Plain in-memory cadence state is therefore not enough
+for live operation. Use a framework state directory so each sleeve keeps its own
+cadence and active insight state:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli runtime-run-once configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
-  --framework-state data/runtime/framework-state/LEaps.json `
-  --order-batch-output data/runtime/live-order-loop/LEaps_candidate_orders.json
+  --sleeve-id us_etf_rotation `
+  --framework-state-dir data/runtime/framework-state/multi-sleeve `
+  --order-batch-output data/runtime/live-order-loop/multi_sleeve_candidate_orders.json
 ```
 
 The state file persists:
@@ -203,7 +205,7 @@ for all safety behavior.
 
 ## LEaps Current Settings
 
-`configs/runtime/leaps_workspace_smoke.json` currently uses:
+The live config `configs/runtime/live_multi_sleeve.json` currently uses:
 
 ```text
 LEaps alpha:
@@ -219,9 +221,9 @@ LEaps indicators:
   strategy indicators are resolution=daily
 ```
 
-The default sleeve has zero cash and no alpha modules in the same runtime
-config, so normal LEaps strategy orders should remain isolated to the LEaps
-sleeve.
+`LEaps` and `us_etf_rotation` run in the same live runner, but each sleeve keeps
+separate cash currency, account route, alpha, portfolio, risk, execution, and
+framework state.
 
 ## Operator Checklist
 

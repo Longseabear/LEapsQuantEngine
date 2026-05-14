@@ -36,6 +36,10 @@ class Bar:
     close: float
     volume: int = 0
     resolution: str = DataResolution.ANY.value
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True, slots=True)

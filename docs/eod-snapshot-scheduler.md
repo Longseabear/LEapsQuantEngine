@@ -14,8 +14,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\leaps_eod_snapshot.ps1
 
 Default targets:
 
-- `LEaps` from `configs/runtime/leaps_workspace_smoke.json`
-- `us_etf_rotation` from `configs/runtime/us_etf_rotation_sleeve.json`
+- `LEaps` from `configs/runtime/live_multi_sleeve.json`
+- `us_etf_rotation` from `configs/runtime/live_multi_sleeve.json`
+
+The EOD snapshot is still stored per sleeve. The shared config keeps it aligned
+with the live multi-sleeve runner, while each target uses its own sleeve id,
+market label, account store, and order-runtime route.
 
 Artifacts are written under:
 
@@ -32,6 +36,39 @@ Each run stores:
 - copies of the current virtual-account and order-runtime stores
 - a top-level manifest with command exit codes and retention cleanup details
 
+## Sleeve Daily Performance
+
+EOD snapshots can be read back as a sleeve-scoped equity curve:
+
+```powershell
+py -3 -m leaps_quant_engine.cli sleeve-daily-performance `
+  --snapshot-root data/eod-snapshots `
+  --sleeve-id LEaps `
+  --include-holdings
+```
+
+The command groups snapshots by `sleeve_id + currency + date`, keeps the latest
+snapshot per date, and reports:
+
+- equity, cash, gross exposure, exposure percentage
+- held symbols, and optionally full holding rows
+- previous equity
+- net cash flow from the virtual-account `cash_transfers` ledger
+- cash-flow-adjusted daily PnL and daily return
+
+This mirrors LEAN's result/statistics layer, but namespaced by sleeve. Do not
+use raw equity changes as strategy return when cash was moved into or out of a
+sleeve; the command subtracts same-period cash transfers before calculating the
+daily return.
+
+Useful variants:
+
+```powershell
+py -3 -m leaps_quant_engine.cli sleeve-daily-performance --sleeve-id us_etf_rotation --currency USD
+py -3 -m leaps_quant_engine.cli sleeve-daily-performance --from-date 2026-05-12 --to-date 2026-05-14
+py -3 -m leaps_quant_engine.cli sleeve-daily-performance --summary-only
+```
+
 ## Scheduler
 
 ```powershell
@@ -46,6 +83,15 @@ Default schedules use KST:
 The scheduler writes one marker per date and label under
 `data/runtime/eod-snapshots/`, so a restarted scheduler will not duplicate the
 same daily capture.
+
+Check scheduler output status without submitting orders:
+
+```powershell
+py -3 -m leaps_quant_engine.cli eod-snapshot-status --summary-only
+```
+
+The status command reads marker files and manifests, then reports each label as
+`scheduled`, `ok_today`, `failed_today`, or `missing_today`.
 
 ## Start Hidden
 

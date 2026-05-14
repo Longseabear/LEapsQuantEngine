@@ -1,7 +1,7 @@
 param(
     [string[]]$Targets = @(
-        "configs/runtime/leaps_workspace_smoke.json|LEaps|domestic",
-        "configs/runtime/us_etf_rotation_sleeve.json|us_etf_rotation|overseas"
+        "configs/runtime/live_multi_sleeve.json|LEaps|domestic",
+        "configs/runtime/live_multi_sleeve.json|us_etf_rotation|overseas"
     ),
     [string]$SnapshotRoot = "data/eod-snapshots",
     [string]$Label = "manual",

@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import json
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
@@ -15,6 +16,8 @@ from leaps_quant_engine.runtime_config import RuntimeConfigSnapshot, load_runtim
 class RuntimeControlCommandType(str, Enum):
     RELOAD_CONFIG = "reload_config"
     RELOAD_SLEEVE = "reload_sleeve"
+    ACTIVATE_SLEEVE = "activate_sleeve"
+    DEACTIVATE_SLEEVE = "deactivate_sleeve"
     PAUSE_WORKER = "pause_worker"
     RESUME_WORKER = "resume_worker"
     RUN_ONCE = "run_once"
@@ -47,6 +50,34 @@ class RuntimeControlCommand:
     ) -> "RuntimeControlCommand":
         return cls(
             command_type=RuntimeControlCommandType.RELOAD_SLEEVE,
+            payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
+            reason=reason,
+        )
+
+    @classmethod
+    def activate_sleeve(
+        cls,
+        config_path: str | Path,
+        sleeve_id: str,
+        *,
+        reason: str | None = None,
+    ) -> "RuntimeControlCommand":
+        return cls(
+            command_type=RuntimeControlCommandType.ACTIVATE_SLEEVE,
+            payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
+            reason=reason,
+        )
+
+    @classmethod
+    def deactivate_sleeve(
+        cls,
+        config_path: str | Path,
+        sleeve_id: str,
+        *,
+        reason: str | None = None,
+    ) -> "RuntimeControlCommand":
+        return cls(
+            command_type=RuntimeControlCommandType.DEACTIVATE_SLEEVE,
             payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
             reason=reason,
         )
@@ -88,6 +119,23 @@ class RuntimeControlCommand:
             "reason": self.reason,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RuntimeControlCommand":
+        command_type = RuntimeControlCommandType(str(payload.get("command_type", "")))
+        command_id = str(payload.get("command_id") or uuid4())
+        created_at = str(payload.get("created_at") or datetime.now().isoformat())
+        command_payload = payload.get("payload", {})
+        if not isinstance(command_payload, dict):
+            raise ValueError("Runtime control command payload must be an object.")
+        reason = payload.get("reason")
+        return cls(
+            command_type=command_type,
+            command_id=command_id,
+            created_at=created_at,
+            payload=dict(command_payload),
+            reason=str(reason) if reason is not None else None,
+        )
+
 
 @dataclass(slots=True)
 class RuntimeControlQueue:
@@ -108,6 +156,56 @@ class RuntimeControlQueue:
     def __len__(self) -> int:
         with self._lock:
             return len(self._commands)
+
+
+@dataclass(slots=True)
+class FileRuntimeControlQueue:
+    path: Path
+
+    def submit(self, command: RuntimeControlCommand) -> RuntimeControlCommand:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(command.to_dict(), ensure_ascii=False, sort_keys=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        return command
+
+    def drain(self) -> tuple[RuntimeControlCommand, ...]:
+        if not self.path.exists():
+            return ()
+        draining_path = self.path.with_name(f"{self.path.name}.draining-{uuid4().hex}")
+        try:
+            self.path.replace(draining_path)
+        except FileNotFoundError:
+            return ()
+        try:
+            commands = _load_control_commands(draining_path)
+        except Exception:
+            if not self.path.exists():
+                draining_path.replace(self.path)
+            raise
+        draining_path.unlink(missing_ok=True)
+        return commands
+
+    def __len__(self) -> int:
+        if not self.path.exists():
+            return 0
+        return sum(1 for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def _load_control_commands(path: Path) -> tuple[RuntimeControlCommand, ...]:
+    commands: list[RuntimeControlCommand] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid runtime control command JSON at line {line_number}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Runtime control command at line {line_number} must be an object.")
+        commands.append(RuntimeControlCommand.from_dict(payload))
+    return tuple(commands)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +241,12 @@ class RuntimeConfigController:
         run_once_requested = False
         shutdown_requested = False
         for command in self.queue.drain():
-            if command.command_type in {RuntimeControlCommandType.RELOAD_CONFIG, RuntimeControlCommandType.RELOAD_SLEEVE}:
+            if command.command_type in {
+                RuntimeControlCommandType.RELOAD_CONFIG,
+                RuntimeControlCommandType.RELOAD_SLEEVE,
+                RuntimeControlCommandType.ACTIVATE_SLEEVE,
+                RuntimeControlCommandType.DEACTIVATE_SLEEVE,
+            }:
                 self.snapshot = self.loader(command.config_path())
             elif command.command_type == RuntimeControlCommandType.PAUSE_WORKER:
                 self.paused = True

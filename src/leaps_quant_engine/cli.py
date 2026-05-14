@@ -38,6 +38,7 @@ from leaps_quant_engine.broker_routing import (
 )
 from leaps_quant_engine.brokerage import BrokerEngineExecutionGateway, BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.cycle_journal import CycleJournalEntry, FileCycleJournalStore
+from leaps_quant_engine.control import FileRuntimeControlQueue, RuntimeControlCommand
 from leaps_quant_engine.framework import FileFrameworkRunnerStateStore, FrameworkRunner
 from leaps_quant_engine.fundamentals import (
     DEFAULT_FUNDAMENTAL_ARTIFACT_ROOT,
@@ -63,22 +64,34 @@ from leaps_quant_engine.order_status import build_order_runtime_status
 from leaps_quant_engine.order_submit import OrderRuntimeSubmitter, load_order_intent_batches, write_order_intent_batches
 from leaps_quant_engine.order_supervisor import OrderMaintenancePolicy, OrderRuntimeSupervisor
 from leaps_quant_engine.order_worker import ExecutionHistoryReconcileWorker, OpenTicketPollWorker
+from leaps_quant_engine.operator_status import (
+    DEFAULT_EOD_SCHEDULES,
+    CashAvailabilityRouteInput,
+    build_cash_availability_report,
+    build_eod_snapshot_status,
+)
+from leaps_quant_engine.performance import build_sleeve_daily_performance_report
 from leaps_quant_engine.portfolio import Portfolio, StaticPortfolioProvider
 from leaps_quant_engine.runtime import build_indicator_engine_from_file, run_once_from_file
 from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, bootstrap_sleeve_runtime, resolve_runtime_path
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
 from leaps_quant_engine.runtime_health import build_runtime_health_report
 from leaps_quant_engine.runtime_integrity import build_runtime_code_identity
+from leaps_quant_engine.runtime_multi import run_multi_sleeve_once
 from leaps_quant_engine.runtime_preflight import build_runtime_preflight_report
 from leaps_quant_engine.runtime_recovery import build_recovery_account_report, build_recovery_report
 from leaps_quant_engine.rl import train_ppo_portfolio_constructor
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
 from leaps_quant_engine.sleeve_workspace import (
     describe_sleeve_alpha_modules,
+    describe_sleeve_execution_model,
     describe_sleeve_portfolio_model,
+    describe_sleeve_risk_model,
     disable_sleeve_alpha_module,
     enable_sleeve_alpha_module,
+    set_sleeve_execution_model,
     set_sleeve_portfolio_model,
+    set_sleeve_risk_model,
 )
 from leaps_quant_engine.universe.fine import FineUniverseRuntime
 from leaps_quant_engine.universe.loader import load_universe_definition
@@ -122,6 +135,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_run_once.add_argument("--framework-state-read-only", action="store_true")
     runtime_run_once.add_argument("--summary-only", action="store_true")
 
+    runtime_run_multi_once = subparsers.add_parser("runtime-run-multi-once")
+    runtime_run_multi_once.add_argument("config", type=Path)
+    runtime_run_multi_once.add_argument("--sleeve-id", action="append", default=[])
+    runtime_run_multi_once.add_argument("--skip-fine-refresh", action="store_true")
+    runtime_run_multi_once.add_argument("--skip-warmup", action="store_true")
+    runtime_run_multi_once.add_argument("--order-batch-output", type=Path)
+    runtime_run_multi_once.add_argument("--journal", type=Path)
+    runtime_run_multi_once.add_argument("--framework-state-dir", type=Path)
+    runtime_run_multi_once.add_argument("--framework-state-read-only", action="store_true")
+    runtime_run_multi_once.add_argument("--summary-only", action="store_true")
+
+    runtime_control_submit = subparsers.add_parser("runtime-control-submit")
+    runtime_control_submit.add_argument("--queue", type=Path, required=True)
+    runtime_control_submit.add_argument(
+        "--command",
+        dest="control_command",
+        choices=[
+            "reload-config",
+            "reload-sleeve",
+            "activate-sleeve",
+            "deactivate-sleeve",
+            "pause-worker",
+            "resume-worker",
+            "run-once",
+            "shutdown",
+        ],
+        required=True,
+    )
+    runtime_control_submit.add_argument("--config", type=Path)
+    runtime_control_submit.add_argument("--sleeve-id")
+    runtime_control_submit.add_argument("--reason")
+
+    runtime_control_drain = subparsers.add_parser("runtime-control-drain")
+    runtime_control_drain.add_argument("--queue", type=Path, required=True)
+
     sleeve_alpha_list = subparsers.add_parser("sleeve-alpha-list")
     sleeve_alpha_list.add_argument("config", type=Path)
     sleeve_alpha_list.add_argument("--sleeve-id", required=True)
@@ -144,6 +192,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     sleeve_portfolio_set.add_argument("config", type=Path)
     sleeve_portfolio_set.add_argument("portfolio_ref")
     sleeve_portfolio_set.add_argument("--sleeve-id", required=True)
+
+    sleeve_risk_list = subparsers.add_parser("sleeve-risk-list")
+    sleeve_risk_list.add_argument("config", type=Path)
+    sleeve_risk_list.add_argument("--sleeve-id", required=True)
+
+    sleeve_risk_set = subparsers.add_parser("sleeve-risk-set")
+    sleeve_risk_set.add_argument("config", type=Path)
+    sleeve_risk_set.add_argument("risk_ref")
+    sleeve_risk_set.add_argument("--sleeve-id", required=True)
+
+    sleeve_execution_list = subparsers.add_parser("sleeve-execution-list")
+    sleeve_execution_list.add_argument("config", type=Path)
+    sleeve_execution_list.add_argument("--sleeve-id", required=True)
+
+    sleeve_execution_set = subparsers.add_parser("sleeve-execution-set")
+    sleeve_execution_set.add_argument("config", type=Path)
+    sleeve_execution_set.add_argument("execution_ref")
+    sleeve_execution_set.add_argument("--sleeve-id", required=True)
 
     subparsers.add_parser("kis-health")
 
@@ -213,6 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     order_runtime_submit.add_argument("--poll-after-submit", action="store_true")
     order_runtime_submit.add_argument("--paper-no-fill", action="store_true")
     order_runtime_submit.add_argument("--max-submit-notional", type=float)
+    order_runtime_submit.add_argument("--max-submit-notional-by-account", action="append", default=[])
     order_runtime_submit.add_argument("--allow-symbol", action="append", default=[])
     order_runtime_submit.add_argument("--recent-events", type=int, default=10)
     order_runtime_submit.add_argument("--journal", type=Path)
@@ -284,6 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     notify_user_message.add_argument("--message-stdin", action="store_true")
     notify_user_message.add_argument("--root", type=Path)
     notify_user_message.add_argument("--chat-id")
+    notify_user_message.add_argument("--parse-mode", choices=("Markdown", "MarkdownV2", "HTML"))
     notify_user_message.add_argument("--disable-notification", action="store_true")
     notify_user_message.add_argument("--summary-only", action="store_true")
 
@@ -322,6 +390,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_preflight.add_argument("--strict-live", action="store_true")
     runtime_preflight.add_argument("--skip-bootstrap", action="store_true")
     runtime_preflight.add_argument("--summary-only", action="store_true")
+
+    sleeve_cash_availability = subparsers.add_parser("sleeve-cash-availability")
+    sleeve_cash_availability.add_argument("config", type=Path)
+    sleeve_cash_availability.add_argument("--sleeve-id", action="append", default=[])
+    sleeve_cash_availability.add_argument("--account-id")
+    sleeve_cash_availability.add_argument("--account-store", type=Path)
+    sleeve_cash_availability.add_argument("--order-store", type=Path)
+    sleeve_cash_availability.add_argument("--residual-sleeve-id", default="default sleeve")
+    sleeve_cash_availability.add_argument("--summary-only", action="store_true")
+
+    eod_snapshot_status = subparsers.add_parser("eod-snapshot-status")
+    eod_snapshot_status.add_argument("--snapshot-root", type=Path, default=Path("data/eod-snapshots"))
+    eod_snapshot_status.add_argument("--state-dir", type=Path, default=Path("data/runtime/eod-snapshots"))
+    eod_snapshot_status.add_argument("--schedule", action="append", default=[])
+    eod_snapshot_status.add_argument("--summary-only", action="store_true")
+
+    sleeve_daily_performance = subparsers.add_parser("sleeve-daily-performance")
+    sleeve_daily_performance.add_argument("--snapshot-root", type=Path, default=Path("data/eod-snapshots"))
+    sleeve_daily_performance.add_argument("--sleeve-id", action="append", default=[])
+    sleeve_daily_performance.add_argument("--currency")
+    sleeve_daily_performance.add_argument("--from-date")
+    sleeve_daily_performance.add_argument("--to-date")
+    sleeve_daily_performance.add_argument("--include-holdings", action="store_true")
+    sleeve_daily_performance.add_argument("--summary-only", action="store_true")
 
     indicators_kis = subparsers.add_parser("indicators-kis-once")
     indicators_kis.add_argument("config", type=Path)
@@ -668,6 +760,102 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command == "runtime-run-multi-once":
+        if not args.sleeve_id:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": "runtime-run-multi-once requires at least one --sleeve-id.",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_ids = _status_sleeve_ids(snapshot, args.sleeve_id)
+        framework_state_dir = (
+            resolve_runtime_path(snapshot, args.framework_state_dir).resolve()
+            if args.framework_state_dir is not None
+            else None
+        )
+        report = run_multi_sleeve_once(
+            snapshot,
+            sleeve_ids,
+            refresh_fine=not args.skip_fine_refresh,
+            warmup=False if args.skip_warmup else None,
+            framework_state_dir=framework_state_dir,
+            framework_state_read_only=args.framework_state_read_only,
+        )
+        journal_summary = None
+        journal_path = _runtime_journal_path(snapshot, args.journal)
+        if journal_path is not None:
+            store = FileCycleJournalStore(journal_path)
+            entries = []
+            for sleeve_report in report.reports:
+                runtime_sleeve = snapshot.config.sleeve(sleeve_report.sleeve_id)
+                market_scope = market_scope_from_market(_default_market_from_runtime_snapshot(snapshot, sleeve_report.sleeve_id))
+                account_id = runtime_sleeve.broker_account_routes.get(
+                    market_scope,
+                    runtime_sleeve.broker_account_id,
+                )
+                entry = CycleJournalEntry.from_runtime_run_once_report(
+                    sleeve_report,
+                    account_id=account_id,
+                    route_id=account_id,
+                    market_scope=market_scope,
+                    source="runtime-run-multi-once",
+                )
+                entry = _with_runtime_code_identity_metadata(snapshot, entry, (sleeve_report.sleeve_id,))
+                store.append(entry)
+                entries.append(entry.entry_id)
+            journal_summary = {"path": str(journal_path.resolve()), "entry_ids": entries}
+        order_batch_artifact = None
+        if args.order_batch_output is not None:
+            order_batch_artifact = write_order_intent_batches(
+                resolve_runtime_path(snapshot, args.order_batch_output),
+                report.execution_batches(),
+                runtime_id=report.runtime_id,
+                config_version=report.config_version,
+                source="runtime-run-multi-once",
+            )
+            order_batch_artifact["path"] = str(Path(order_batch_artifact["path"]).resolve())
+            order_batch_artifact["submit_command"] = [
+                "order-runtime-submit",
+                str(args.config),
+                order_batch_artifact["path"],
+            ]
+            for sleeve_id in sleeve_ids:
+                order_batch_artifact["submit_command"].extend(["--sleeve-id", sleeve_id])
+        print_payload = report.to_dict(
+            include_candidates=not args.summary_only,
+            include_warmup_symbols=not args.summary_only,
+            include_failures=not args.summary_only,
+            include_framework_details=not args.summary_only,
+        )
+        if order_batch_artifact is not None:
+            print_payload["order_batch_artifact"] = order_batch_artifact
+        if journal_summary is not None:
+            print_payload["cycle_journal"] = journal_summary
+        print(json.dumps(print_payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "runtime-control-submit":
+        command = _build_runtime_control_command(args)
+        FileRuntimeControlQueue(args.queue).submit(command)
+        print(json.dumps(command.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "runtime-control-drain":
+        commands = FileRuntimeControlQueue(args.queue).drain()
+        print(
+            json.dumps(
+                {"queue": str(args.queue), "command_count": len(commands), "commands": [command.to_dict() for command in commands]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "sleeve-alpha-list":
         print(
             json.dumps(
@@ -708,6 +896,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 set_sleeve_portfolio_model(args.config, args.sleeve_id, args.portfolio_ref),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-risk-list":
+        print(
+            json.dumps(
+                describe_sleeve_risk_model(args.config, args.sleeve_id),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-risk-set":
+        print(
+            json.dumps(
+                set_sleeve_risk_model(args.config, args.sleeve_id, args.risk_ref),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-execution-list":
+        print(
+            json.dumps(
+                describe_sleeve_execution_model(args.config, args.sleeve_id),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "sleeve-execution-set":
+        print(
+            json.dumps(
+                set_sleeve_execution_model(args.config, args.sleeve_id, args.execution_ref),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -1084,6 +1308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             title=args.title,
             message=message,
             chat_id=args.chat_id,
+            parse_mode=args.parse_mode,
             disable_notification=args.disable_notification,
         )
         if args.summary_only:
@@ -1192,6 +1417,84 @@ def main(argv: Sequence[str] | None = None) -> int:
             check_bootstrap=not args.skip_bootstrap,
         )
         print(json.dumps(report.to_dict(include_details=not args.summary_only), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "sleeve-cash-availability":
+        snapshot = load_runtime_config_snapshot(args.config)
+        sleeve_ids = _status_sleeve_ids(snapshot, args.sleeve_id)
+        routes = _resolve_order_runtime_routes(snapshot, args.account_id, args.account_store, args.order_store, sleeve_ids)
+        report = build_cash_availability_report(
+            runtime_id=snapshot.config.runtime_id,
+            sleeve_ids=sleeve_ids,
+            residual_sleeve_id=args.residual_sleeve_id,
+            routes=tuple(
+                CashAvailabilityRouteInput(
+                    account_id=route.account_id,
+                    market_scope=route.market_scope,
+                    currency=route.currency,
+                    account_store_path=route.account_store_path,
+                    default_cash_by_sleeve=_default_cash_by_sleeve(snapshot, route.currency, route.account_id),
+                )
+                for route in routes
+            ),
+        )
+        if args.summary_only:
+            report = {
+                key: value
+                for key, value in report.items()
+                if key not in {"routes"}
+            } | {
+                "routes": [
+                    {
+                        key: value
+                        for key, value in route.items()
+                        if key not in {"all_sleeve_cash"}
+                    }
+                    for route in report["routes"]
+                ]
+            }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "eod-snapshot-status":
+        report = build_eod_snapshot_status(
+            snapshot_root=args.snapshot_root,
+            state_dir=args.state_dir,
+            schedules=tuple(args.schedule) if args.schedule else DEFAULT_EOD_SCHEDULES,
+        )
+        if args.summary_only:
+            report = {
+                **report,
+                "labels": [
+                    {
+                        "label": item["label"],
+                        "schedule_time": item["schedule_time"],
+                        "status": item["status"],
+                        "today_marker": item["today_marker"],
+                        "latest_marker": item["latest_marker"],
+                        "latest_manifest": item["latest_manifest"],
+                    }
+                    for item in report["labels"]
+                ],
+            }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "sleeve-daily-performance":
+        report = build_sleeve_daily_performance_report(
+            args.snapshot_root,
+            sleeve_ids=tuple(args.sleeve_id),
+            currency=args.currency,
+            from_date=args.from_date,
+            to_date=args.to_date,
+        )
+        print(
+            json.dumps(
+                report.to_dict(
+                    include_rows=not args.summary_only,
+                    include_holdings=args.include_holdings and not args.summary_only,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "virtual-account-allocate-fill":
         snapshot = load_runtime_config_snapshot(args.config)
@@ -2415,6 +2718,7 @@ def _resolve_order_runtime_routes(
             None,
             explicit_order_store,
             sleeve_ids,
+            strict_account_scope=False,
         )
         for route_account_id in unique_account_ids
     )
@@ -2426,8 +2730,9 @@ def _resolve_order_runtime_route(
     explicit_account_store: Path | None,
     explicit_order_store: Path | None,
     sleeve_ids: Sequence[str],
+    strict_account_scope: bool = True,
 ) -> _OrderRuntimeRoute:
-    account = _broker_account_for_order_runtime(snapshot, account_id, sleeve_ids)
+    account = _broker_account_for_order_runtime(snapshot, account_id, sleeve_ids, strict_account_scope=strict_account_scope)
     if explicit_account_store is not None:
         account_store_path = resolve_runtime_path(snapshot, explicit_account_store).resolve()
         order_store_path = _resolve_status_order_store_path(snapshot, explicit_order_store, account_store_path)
@@ -2462,15 +2767,30 @@ def _resolve_order_runtime_route(
     )
 
 
-def _broker_account_for_order_runtime(snapshot, account_id: str | None, sleeve_ids: Sequence[str]):
+def _broker_account_for_order_runtime(
+    snapshot,
+    account_id: str | None,
+    sleeve_ids: Sequence[str],
+    *,
+    strict_account_scope: bool = True,
+):
     if account_id:
         try:
             account = snapshot.config.broker_account(account_id)
         except KeyError as exc:
             raise RuntimeError(f"Unknown broker account_id: {account_id}") from exc
-        for sleeve_id in sleeve_ids:
-            sleeve = snapshot.config.sleeve(sleeve_id)
-            valid_account_ids = set(configured_account_ids_for_sleeve(sleeve))
+        valid_account_ids_by_sleeve = {
+            sleeve_id: set(configured_account_ids_for_sleeve(snapshot.config.sleeve(sleeve_id)))
+            for sleeve_id in sleeve_ids
+        }
+        if not strict_account_scope:
+            allowed_account_ids = set().union(*valid_account_ids_by_sleeve.values()) if valid_account_ids_by_sleeve else set()
+            if allowed_account_ids and account.account_id not in allowed_account_ids:
+                raise RuntimeError(
+                    f"Selected sleeves route to broker_account_id values {sorted(allowed_account_ids)}, not '{account.account_id}'."
+                )
+            return account
+        for sleeve_id, valid_account_ids in valid_account_ids_by_sleeve.items():
             if valid_account_ids and account.account_id not in valid_account_ids:
                 raise RuntimeError(
                     f"Sleeve '{sleeve_id}' routes to broker_account_id values {sorted(valid_account_ids)}, not '{account.account_id}'."
@@ -2530,6 +2850,7 @@ def _routed_batches_for_submit(
             explicit_account_store,
             explicit_order_store,
             sleeve_ids,
+            strict_account_scope=False,
         )
         if route.market_scope is None and market_scope_by_account.get(route_account_id) is not None:
             route = _OrderRuntimeRoute(
@@ -2586,11 +2907,27 @@ def _run_order_runtime_submit_for_route(snapshot, args, route: _OrderRuntimeRout
         commit=args.commit,
         confirm_live_submit=args.confirm_live_submit,
         poll_after_submit=args.poll_after_submit,
-        max_submit_notional=args.max_submit_notional,
+        max_submit_notional=_max_submit_notional_for_route(args, route),
         allowed_symbols=tuple(args.allow_symbol),
         recent_events=args.recent_events,
         initial_errors=tuple(setup_errors),
     )
+
+
+def _max_submit_notional_for_route(args, route: _OrderRuntimeRoute) -> float | None:
+    overrides = getattr(args, "max_submit_notional_by_account", ()) or ()
+    for item in overrides:
+        key, separator, value = str(item).partition("=")
+        if not separator:
+            raise RuntimeError("--max-submit-notional-by-account must use account_id=value or market_scope=value.")
+        route_keys = {
+            str(route.account_id or "").strip().lower(),
+            str(route.market_scope or "").strip().lower(),
+            str(route.currency or "").strip().lower(),
+        }
+        if key.strip().lower() in route_keys:
+            return float(value)
+    return args.max_submit_notional
 
 
 def _market_session_for_route(route: _OrderRuntimeRoute):
@@ -2876,6 +3213,34 @@ def _default_market_from_runtime_snapshot(snapshot, sleeve_id: str | None) -> st
         return "KRX"
     universe = load_universe_definition(resolve_runtime_path(snapshot, sleeve.universe.coarse_path))
     return universe.market
+
+
+def _build_runtime_control_command(args) -> RuntimeControlCommand:
+    if args.control_command == "reload-config":
+        if args.config is None:
+            raise SystemExit("runtime-control-submit --command reload-config requires --config.")
+        return RuntimeControlCommand.reload_config(args.config, reason=args.reason)
+    if args.control_command == "reload-sleeve":
+        if args.config is None or not args.sleeve_id:
+            raise SystemExit("runtime-control-submit --command reload-sleeve requires --config and --sleeve-id.")
+        return RuntimeControlCommand.reload_sleeve(args.config, args.sleeve_id, reason=args.reason)
+    if args.control_command == "activate-sleeve":
+        if args.config is None or not args.sleeve_id:
+            raise SystemExit("runtime-control-submit --command activate-sleeve requires --config and --sleeve-id.")
+        return RuntimeControlCommand.activate_sleeve(args.config, args.sleeve_id, reason=args.reason)
+    if args.control_command == "deactivate-sleeve":
+        if args.config is None or not args.sleeve_id:
+            raise SystemExit("runtime-control-submit --command deactivate-sleeve requires --config and --sleeve-id.")
+        return RuntimeControlCommand.deactivate_sleeve(args.config, args.sleeve_id, reason=args.reason)
+    if args.control_command == "pause-worker":
+        return RuntimeControlCommand.pause_worker(reason=args.reason)
+    if args.control_command == "resume-worker":
+        return RuntimeControlCommand.resume_worker(reason=args.reason)
+    if args.control_command == "run-once":
+        return RuntimeControlCommand.run_once(reason=args.reason)
+    if args.control_command == "shutdown":
+        return RuntimeControlCommand.shutdown(reason=args.reason)
+    raise SystemExit(f"Unsupported runtime control command: {args.control_command}")
 
 
 if __name__ == "__main__":

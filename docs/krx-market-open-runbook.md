@@ -1,6 +1,6 @@
 # KRX Market Open Runbook
 
-Last updated: 2026-05-13 12:00 KST
+Last updated: 2026-05-14 08:30 KST
 
 This runbook is the short morning procedure for starting the `LEaps` Korean
 market live loop. Use it with the fuller readiness checklist in
@@ -26,8 +26,8 @@ Morning failures usually come from one of these conditions:
   service boundaries.
 - Before 09:00 KST, KIS domestic quotes can return reference prices with
   unusable live bid/ask or latest trade fields. In that state
-  `runtime-run-once` may fail with `Collected 0 bars, below min_success=1`.
-  This is expected before the market is actually usable.
+  `runtime-run-multi-once` may report a degraded or failed KRX snapshot. This
+  is expected before the market is actually usable.
 - A long-running PowerShell loop starts a fresh Python process every cycle.
   Live loops therefore need persisted framework state for active insights,
   portfolio cadence, and the last target batch. The submit state file is still
@@ -90,13 +90,14 @@ $env:PYTHONPATH='src'
 2. Run the live readiness gates.
 
 ```powershell
-py -3 -m leaps_quant_engine.cli runtime-preflight configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli runtime-preflight configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
   --include-order-status `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --summary-only
 ```
 
@@ -108,9 +109,14 @@ Required readout:
 - `needs_attention` is `false`
 - LEaps virtual cash and holdings match the intended live sleeve ownership
 
-3. Start the guarded live loop.
+3. Start the guarded multi-sleeve live loop.
 
-Use a per-sleeve submit state file. The state file is the morning safety latch:
+Default live operation now uses one multi-sleeve runner for `LEaps` and
+`us_etf_rotation`. It collects one union market snapshot, runs sleeve-specific
+alpha/portfolio/risk/execution separately, then lets `order-runtime-submit`
+split domestic and overseas orders by broker account route.
+
+Use a submit state file. The state file is the morning safety latch:
 after a successful live submit with orders, the loop records the last submitted
 artifact for audit and exact-artifact idempotency. It does not block every later
 buy for the same date. Duplicate or stale orders are blocked by
@@ -121,59 +127,80 @@ open tickets, and fill state.
 $args = @(
   '-NoProfile',
   '-ExecutionPolicy', 'Bypass',
-  '-File', 'tools\leaps_live_order_loop.ps1',
-  '-Config', 'configs/runtime/leaps_workspace_smoke.json',
-  '-SleeveId', 'LEaps',
+  '-File', 'tools\leaps_multi_sleeve_live_order_loop.ps1',
+  '-Config', 'configs/runtime/live_multi_sleeve.json',
+  '-SleeveIds', 'LEaps', 'us_etf_rotation',
   '-IntervalSeconds', '60',
-  '-MaxSubmitNotional', '7000000',
-  '-OrderBatchOutput', 'data/runtime/live-order-loop/LEaps_candidate_orders.json',
-  '-Journal', 'data/cycle-journal/leaps_workspace_smoke_live_loop.jsonl',
-  '-LogPath', 'data/runtime/live-order-loop/LEaps.log',
-  '-FrameworkStatePath', 'data/runtime/framework-state/LEaps.json',
+  '-DomesticMaxSubmitNotional', '7000000',
+  '-OverseasMaxSubmitNotional', '2500',
+  '-OrderBatchOutput', 'data/runtime/live-order-loop/multi_sleeve_candidate_orders.json',
+  '-Journal', 'data/cycle-journal/live_multi_sleeve.jsonl',
+  '-LogPath', 'data/runtime/live-order-loop/multi_sleeve.log',
+  '-FrameworkStateDir', 'data/runtime/framework-state/multi-sleeve',
   '-ReconcileEveryCycles', '5',
-  '-SubmitStatePath', 'data/runtime/live-order-loop/LEaps_submit_state.json',
-  '-SubmitOncePerDay', 'true'
+  '-SubmitStatePath', 'data/runtime/live-order-loop/multi_sleeve_submit_state.json',
+  '-ControlQueue', 'data/runtime/control/live.jsonl',
+  '-ActiveSleevesPath', 'data/runtime/live-order-loop/multi_sleeve_active_sleeves.json',
+  '-HotReload', 'true'
 )
 
 Start-Process -FilePath powershell -ArgumentList $args -WindowStyle Hidden -PassThru
 ```
 
-Keep `MaxSubmitNotional` just above the expected total absolute notional for
-the first live batch. Do not use a very large value just to avoid thinking about
-the order plan.
+`DomesticMaxSubmitNotional` and `OverseasMaxSubmitNotional` are intentionally
+separate because KRW and USD notionals are not comparable.
+
+The loop drains `data/runtime/control/live.jsonl` at cycle boundaries. Use
+`runtime-control-submit --command reload-sleeve`, `activate-sleeve`, or
+`deactivate-sleeve` to change the active sleeve set without restarting the
+process. Deactivation is rejected while the sleeve still has holdings or open
+tickets.
+
+The active sleeve set is additionally filtered by a live schedule before the
+framework run. Defaults:
+
+- `LEaps`: KRX 08:30-18:30 KST
+- `us_etf_rotation`: US regular market, 09:30-16:00 Eastern Time
+
+The skipped sleeve is not passed to `runtime-run-multi-once`, so its market data
+is not collected and its alpha/portfolio/risk/execution stack is not called
+outside its scheduled strategy window. `order-runtime-supervise` can still
+inspect active sleeves for open-ticket maintenance.
 
 4. Watch the first cycles.
 
 ```powershell
-Get-Content data/runtime/live-order-loop/LEaps.log -Tail 120 -Encoding UTF8
+Get-Content data/runtime/live-order-loop/multi_sleeve.log -Tail 120 -Encoding UTF8
 
-Select-String -Path data/runtime/live-order-loop/LEaps.log `
-  -Pattern 'cycle begin|runtime-run-once exit|order-runtime-submit exit|submit guard|submit state saved|order-runtime-supervise exit|cycle end' |
+Select-String -Path data/runtime/live-order-loop/multi_sleeve.log `
+  -Pattern 'cycle begin|runtime-run-multi-once exit|order-runtime-submit exit|submit guard|submit state saved|order-runtime-supervise exit|cycle end' |
   Select-Object -Last 40
 ```
 
-Before 09:00, this failure is acceptable:
+Before 09:00, this degraded cycle is acceptable:
 
 ```text
-RuntimeError: Collected 0 bars, below min_success=1.
-runtime-run-once exit=1
+runtime-run-multi-once exit=0
+order-runtime-submit skipped: no candidate orders
 order-runtime-supervise exit=0
 ```
 
-It means no order was generated or submitted. The loop should keep running and
-try again on the next interval.
+It means no usable order was generated or submitted. The loop should keep
+running and try again on the next interval. A continuing `exit=1` is not normal
+and should be debugged as a runtime error.
 
 After 09:00, the expected success path is:
 
 ```text
-runtime-run-once exit=0
+runtime-run-multi-once exit=0
 order-runtime-submit exit=0
 submit state saved ...
 order-runtime-supervise exit=0
 ```
 
-If `runtime-run-once exit=1` continues after live KRX quotes should be usable,
-stop and debug the market-data snapshot path instead of forcing an old artifact.
+If `runtime-run-multi-once exit=1` continues after live KRX quotes should be
+usable, stop and debug the market-data snapshot path instead of forcing an old
+artifact.
 
 5. Confirm the submit latch.
 
@@ -249,7 +276,7 @@ messages directly into command-line string literals.
 Go:
 
 - loop process is alive
-- `runtime-run-once exit=0`
+- `runtime-run-multi-once exit=0`
 - `order-runtime-submit exit=0` if there are orders
 - submit state saved after a nonzero order submit
 - `order-runtime-supervise exit=0`
@@ -261,7 +288,7 @@ No-go:
 - `runtime-preflight` is not `ok`
 - open tickets exist and are unexplained
 - unallocated fills exist
-- `runtime-run-once exit=1` continues after live quotes are usable
+- `runtime-run-multi-once exit=1` continues after live quotes are usable
 - submit state exists from today but the operator expected a new first batch
 - `order-runtime-submit` reports blocked guards, oversell, route mismatch, or
   notional limit breach
@@ -272,11 +299,11 @@ Find the loop:
 
 ```powershell
 Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like '*leaps_live_order_loop.ps1*LEaps*' } |
+  Where-Object { $_.CommandLine -like '*leaps_multi_sleeve_live_order_loop.ps1*' } |
   Select-Object ProcessId,CommandLine
 ```
 
-Stop only the LEaps loop:
+Stop only the multi-sleeve live loop:
 
 ```powershell
 Stop-Process -Id <PID>
@@ -285,17 +312,19 @@ Stop-Process -Id <PID>
 Then supervise and inspect:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --broker broker-engine `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --summary-only
 ```
 
-Do not delete `LEaps_submit_state.json` during market hours unless the operator
+Do not delete `multi_sleeve_submit_state.json` during market hours unless the operator
 explicitly decides a second same-day submit is intended.
 
 ## End Of Session
@@ -303,13 +332,15 @@ explicitly decides a second same-day submit is intended.
 After close:
 
 ```powershell
-py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-supervise configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --broker broker-engine `
   --summary-only
 
-py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/leaps_workspace_smoke.json `
+py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json `
   --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
   --summary-only
 ```
 

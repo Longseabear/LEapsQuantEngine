@@ -46,6 +46,24 @@ class SequentialLiveProvider:
         return []
 
 
+class ReferencePriceProvider(SequentialLiveProvider):
+    def get_latest_bar(self, symbol):
+        self.calls.append(symbol.key)
+        return Bar(
+            symbol=symbol,
+            time=datetime(2026, 5, 8, 8, 40),
+            open=100.0,
+            high=100.0,
+            low=100.0,
+            close=100.0,
+            volume=100,
+            metadata={
+                "live_price_usable": False,
+                "price_quality_reason": "reference_price_without_distinct_orderbook_price",
+            },
+        )
+
+
 class OneInsightAlpha:
     alpha_id = "one-insight"
     version = "1.0"
@@ -167,6 +185,28 @@ def test_background_snapshot_worker_attaches_degraded_quality_to_partial_cycle()
     assert report.failed_symbol_count == 1
     assert report.snapshot_quality.status == SnapshotQualityStatus.DEGRADED
     assert report.failures == ({"symbol": "KRX:000660", "message": "quote unavailable"},)
+    active = worker.stores_by_sleeve["swing-kor"].active()
+    assert active is not None
+    assert active.quality_report is report.snapshot_quality
+
+
+def test_background_snapshot_worker_degrades_reference_price_cycle_without_failing_collection():
+    universe = _worker_universe()
+    worker = BackgroundSnapshotWorker(
+        universe=universe,
+        sleeve_id="swing-kor",
+        live_provider=ReferencePriceProvider(),
+        min_success=1,
+    )
+
+    report = worker.run_once()
+
+    assert report.updated_symbol_count == 2
+    assert report.failed_symbol_count == 0
+    assert report.snapshot_quality.status == SnapshotQualityStatus.DEGRADED
+    assert report.snapshot_quality.allows_new_entries is False
+    assert "live_price_unusable" in report.snapshot_quality.reasons
+    assert "price_quality:reference_price_without_distinct_orderbook_price" in report.snapshot_quality.reasons
     active = worker.stores_by_sleeve["swing-kor"].active()
     assert active is not None
     assert active.quality_report is report.snapshot_quality
