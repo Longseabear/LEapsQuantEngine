@@ -8,6 +8,7 @@ param(
     [string]$Journal = "data/cycle-journal/live_multi_sleeve.jsonl",
     [string]$LogPath = "data/runtime/live-order-loop/multi_sleeve.log",
     [string]$FrameworkStateDir = "data/runtime/framework-state/multi-sleeve",
+    [string]$RuntimeStatePath = "data/runtime/runtime-state/live_multi_sleeve.sqlite",
     [string]$SubmitStatePath = "data/runtime/live-order-loop/multi_sleeve_submit_state.json",
     [string]$ControlQueue = "data/runtime/control/live.jsonl",
     [string]$ActiveSleevesPath = "data/runtime/live-order-loop/multi_sleeve_active_sleeves.json",
@@ -68,6 +69,8 @@ $journalFullPath = Resolve-LoopPath $Journal
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $journalFullPath) | Out-Null
 $frameworkStateDirFullPath = Resolve-LoopPath $FrameworkStateDir
 New-Item -ItemType Directory -Force -Path $frameworkStateDirFullPath | Out-Null
+$runtimeStateFullPath = Resolve-LoopPath $RuntimeStatePath
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $runtimeStateFullPath) | Out-Null
 $submitStateFullPath = Resolve-LoopPath $SubmitStatePath
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $submitStateFullPath) | Out-Null
 $controlQueueFullPath = Resolve-LoopPath $ControlQueue
@@ -629,6 +632,7 @@ while ($true) {
                 "--journal", $journalFullPath,
                 "--order-batch-output", $orderBatchFullPath,
                 "--framework-state-dir", $frameworkStateDirFullPath,
+                "--runtime-state", $runtimeStateFullPath,
                 "--summary-only"
             ) -SleeveIdsForArgs $scheduledSleeveIds
             py @runArgs 2>&1 | Out-File -FilePath $logFullPath -Append -Encoding utf8

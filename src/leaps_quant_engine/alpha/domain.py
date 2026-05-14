@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from leaps_quant_engine.fundamentals import FundamentalSnapshot, FundamentalValue
 from leaps_quant_engine.models import Symbol
+from leaps_quant_engine.runtime_state import RuntimeModelStateView, StatePatch
 from leaps_quant_engine.snapshots import IndicatorSnapshot, SnapshotQualityReport
 
 
@@ -97,6 +98,7 @@ class InsightBatch:
     generated_at: datetime
     alpha_ids: tuple[str, ...]
     insights: tuple[Insight, ...]
+    state_patches: tuple[StatePatch, ...] = ()
     batch_id: str = field(default_factory=lambda: f"insights-{uuid4()}")
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -113,6 +115,8 @@ class InsightBatch:
             "alpha_ids": list(self.alpha_ids),
             "insight_count": len(self.insights),
             "insights": [insight.to_dict() for insight in self.insights],
+            "state_patch_count": len(self.state_patches),
+            "state_patches": [patch.to_dict() for patch in self.state_patches],
             "metadata": dict(self.metadata),
         }
 
@@ -130,6 +134,7 @@ class SnapshotContext:
     quality_report: SnapshotQualityReport | None = None
     fundamental_snapshot: FundamentalSnapshot | None = None
     input_symbol_keys: tuple[str, ...] | None = None
+    model_state: RuntimeModelStateView = field(default_factory=RuntimeModelStateView)
 
     @classmethod
     def from_indicator_snapshot(
@@ -137,6 +142,7 @@ class SnapshotContext:
         snapshot: IndicatorSnapshot,
         *,
         fundamental_snapshot: FundamentalSnapshot | None = None,
+        model_state: RuntimeModelStateView | None = None,
     ) -> "SnapshotContext":
         if fundamental_snapshot is not None and fundamental_snapshot.as_of > snapshot.as_of:
             raise ValueError("fundamental_snapshot.as_of cannot be later than indicator_snapshot.as_of.")
@@ -147,6 +153,7 @@ class SnapshotContext:
             as_of=snapshot.as_of,
             quality_report=snapshot.quality_report,
             fundamental_snapshot=fundamental_snapshot,
+            model_state=model_state or RuntimeModelStateView(),
         )
 
     @property

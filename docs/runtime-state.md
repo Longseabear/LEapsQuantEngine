@@ -1,9 +1,8 @@
 # Runtime State
 
 Runtime state is the engine-owned persistence surface for optional model state.
-It is not wired into the live loop yet; this document describes the intended
-contract and the offline foundation currently available for tests and future
-integration.
+It is wired into runtime cycles only when an explicit runtime state store is
+provided. Stateless models remain the default.
 
 ## LEAN-Style Principle
 
@@ -20,6 +19,16 @@ market data + orders + fills
 Models should not write runtime state directly. A stateful model returns
 `StatePatch` records, and the runtime validates and commits them. Stateless
 models return no patches and remain the default.
+
+The current runtime supports this through `context.model_state` plus optional
+model `state_patches(...)` hooks:
+
+```text
+context.model_state.get(...)
+model.generate/create_targets/manage_risk/create_orders(...)
+model.state_patches(...)
+FrameworkRunner commits patches after the cycle succeeds
+```
 
 ## State Ownership
 
@@ -60,7 +69,7 @@ It provides:
 - `SQLiteRuntimeStateStore`: local SQLite-backed implementation.
 
 The SQLite store is intentionally separate from current live JSON/JSONL stores
-until the live runtime explicitly wires it in.
+and is used only when runtime commands receive `--runtime-state`.
 
 ## Trailing Stop Example
 
@@ -69,7 +78,6 @@ It should read a context value and return a patch:
 
 ```python
 state = context.model_state.get(
-    sleeve_id="LEaps",
     model_id="volatility_trailing_stop",
     namespace="trailing_stop",
     symbol_key="KRX:005930",
@@ -113,15 +121,37 @@ of truth should become a compact local database rather than a growing file set.
 
 ## Live Safety
 
-Do not connect this state store to live runtime by default.
+Do not connect this state store to live runtime implicitly. A live loop must pass
+`--runtime-state` or a tool parameter such as `RuntimeStatePath`.
 
-The live integration path should be:
+The live integration path is:
 
-1. Add model state to runtime/backtest context behind a feature flag.
-2. Prove state patches in backtests and paper runs.
-3. Add journal/report visibility for patches.
-4. Switch one stateful model, such as trailing stop, in shadow mode.
-5. Enable live writes only after state replay matches expectations.
+1. Prove state patches in tests, backtests, or paper runs.
+2. Run live shadow mode with `--runtime-state-read-only` if needed.
+3. Inspect `framework.model_state`, cycle journal patch/event counts, and the
+   SQLite `model_state_events` audit.
+4. Enable writes by removing read-only mode.
+5. Keep rollback simple: remove the runtime-state argument and stateless models
+   continue unchanged.
+
+Runtime commands:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-run-once `
+  configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --framework-state data/runtime/framework-state/LEaps.json `
+  --runtime-state data/runtime/runtime-state/live_multi_sleeve.sqlite `
+  --summary-only
+
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once `
+  configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
+  --framework-state-dir data/runtime/framework-state/multi-sleeve `
+  --runtime-state data/runtime/runtime-state/live_multi_sleeve.sqlite `
+  --summary-only
+```
 
 ## After-Close Checklist
 
@@ -147,10 +177,10 @@ is intentionally stopped.
    - write bootstrap output to a temporary SQLite file
    - inspect records for sleeve/model/symbol/position namespacing
 
-4. Add context wiring in non-live mode first:
-   - expose `RuntimeStateStore.get(...)` through immutable model context
-   - collect model `StatePatch` outputs
-   - keep commit disabled by default
+4. Add or enable stateful models in shadow mode first:
+   - read state through immutable model context
+   - return model `StatePatch` outputs
+   - use `--runtime-state-read-only` when only observing
    - include state patch counts in cycle journal/report output
 
 5. Prove with replay:

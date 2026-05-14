@@ -1,6 +1,6 @@
 # Current Status
 
-Last updated: 2026-05-13
+Last updated: 2026-05-14
 
 This document records what is currently implemented and what should come next. It is intentionally operational: keep it close to the code and update it whenever a public runtime contract changes.
 
@@ -17,13 +17,13 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
 - `ExecutionModel` that creates order intents instead of broker orders,
   including order type, limit price, time-in-force, and optional slice lineage.
 - Runtime config loaders and a sample swing pipeline.
-- `RuntimeStateStore` is now available as an offline foundation for
+- `RuntimeStateStore` is now available as an opt-in runtime foundation for
   model-owned state. `ModelStateKey`, `StatePatch`, `ModelStateRecord`, and
   `ModelStateEvent` define the LEAN-style contract: models may request state
-  changes, but the runtime commits them at a boundary. `InMemoryRuntimeStateStore`
-  and `SQLiteRuntimeStateStore` are implemented for tests and future
-  backtest/live wiring; they are not connected to the live order loop by
-  default. See `docs/runtime-state.md`.
+  changes, but `FrameworkRunner` commits them only after a successful cycle.
+  `InMemoryRuntimeStateStore` and `SQLiteRuntimeStateStore` are implemented;
+  `runtime-run-once` and `runtime-run-multi-once` can attach SQLite with
+  `--runtime-state`. See `docs/runtime-state.md`.
 
 ### Backtesting
 

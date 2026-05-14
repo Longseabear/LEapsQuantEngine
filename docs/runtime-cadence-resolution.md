@@ -187,6 +187,53 @@ Operator/reporting commands may pass `--framework-state-read-only` so they can
 inspect the current target state without advancing cadence or changing the live
 state file.
 
+Stateful models need one more store. Pass `--runtime-state` to attach the
+SQLite model-state store:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-run-multi-once configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation `
+  --framework-state-dir data/runtime/framework-state/multi-sleeve `
+  --runtime-state data/runtime/runtime-state/live_multi_sleeve.sqlite `
+  --order-batch-output data/runtime/live-order-loop/multi_sleeve_candidate_orders.json
+```
+
+Framework state answers "what target thesis is currently active?" Runtime
+model state answers "what stateful model memory should survive restart?" Keep
+them separate.
+
+## Market Session Gate
+
+Runtime cycles may include multiple market scopes. The framework passes
+normalized `MarketSession` objects into execution context, and order submit
+guards use the same session metadata before touching KIS.
+
+Working rules:
+
+- Daily alpha/portfolio cadence is independent of orderable sessions.
+- Execution models may choose whether to emit regular, pre-market, or
+  after-hours order intents.
+- Broker/session capability checks remain core guards.
+- KRX holiday and US holiday handling should be added as market-calendar
+  inputs to the session layer; do not encode holiday assumptions inside alpha
+  or portfolio models.
+
+## Warmup Sources
+
+Live warmup should prefer cache/history providers and produce confirmed daily
+indicator state before the first live cycle. FinanceDataReader is used as a
+daily fallback provider in the current adapter stack; it should not be treated
+as the v0 source of 30-day minute bars.
+
+For minute simulation:
+
+- Use existing minute replay files when available.
+- Use `download-us-minute-feed` for US minute research feeds, understanding
+  that public providers may limit how much 1-minute history is available.
+- For deterministic multi-day minute replay, prefer our own live collector or
+  KIS/cache artifacts over ad-hoc downloads.
+
 ## Exit And Safety Path
 
 Daily cadence must not be the only exit path.

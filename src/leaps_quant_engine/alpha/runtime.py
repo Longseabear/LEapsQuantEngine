@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import inspect
 import logging
 from threading import Lock
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from leaps_quant_engine.alpha.domain import AlphaModel, Insight, InsightBatch, SnapshotContext
 from leaps_quant_engine.cadence import cadence_due, normalize_cadence
 from leaps_quant_engine.models import Symbol
 from leaps_quant_engine.alpha.store import InsightStore
+from leaps_quant_engine.runtime_state import StatePatch
 
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,7 @@ class AlphaRuntime:
             last_run_by_alpha_id = dict(self._last_run_by_alpha_id)
         generated_at = context.as_of
         insights: list[Insight] = []
+        state_patches: list[StatePatch] = []
         ran_alpha_ids: list[str] = []
         skipped_alpha_ids: list[str] = []
         cadences_by_alpha: dict[str, str] = {}
@@ -117,6 +120,7 @@ class AlphaRuntime:
             )
             model_insights = list(model.generate(model_context))
             insights.extend(model_insights)
+            state_patches.extend(_state_patches_for_model(model, model_context, model_insights))
             ran_alpha_ids.append(alpha_id)
             logger.info(
                 "alpha_runtime.model.complete",
@@ -141,10 +145,12 @@ class AlphaRuntime:
             generated_at=generated_at,
             alpha_ids=tuple(_model_id(model) for model in models),
             insights=tuple(insights),
+            state_patches=tuple(state_patches),
             metadata={
                 "ran_alpha_ids": ran_alpha_ids,
                 "skipped_alpha_ids": skipped_alpha_ids,
                 "cadence_by_alpha": cadences_by_alpha,
+                "state_patch_count": len(state_patches),
             },
         )
         if publish_active:
@@ -191,3 +197,40 @@ def _context_for_alpha(
     if default_symbols is not None:
         return context.with_input_symbols(default_symbols)
     return context
+
+
+def _state_patches_for_model(
+    model: AlphaModel,
+    context: SnapshotContext,
+    insights: list[Insight],
+) -> tuple[StatePatch, ...]:
+    producer = getattr(model, "state_patches", None)
+    if not callable(producer):
+        return ()
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(producer).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    supports_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if supports_kwargs or "insights" in parameters:
+        kwargs["insights"] = tuple(insights)
+    if supports_kwargs or "context" in parameters:
+        kwargs["context"] = context
+    if kwargs:
+        result = producer(**kwargs)
+    elif not parameters:
+        result = producer()
+    else:
+        result = producer(context, tuple(insights))
+    return _coerce_state_patches(result)
+
+
+def _coerce_state_patches(value: Any) -> tuple[StatePatch, ...]:
+    if value is None:
+        return ()
+    patches = tuple(value)
+    for patch in patches:
+        if not isinstance(patch, StatePatch):
+            raise TypeError("state_patches(...) must return StatePatch objects.")
+    return patches

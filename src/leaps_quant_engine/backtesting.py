@@ -256,6 +256,14 @@ class FrameworkBacktestResult:
         return len(self.orders)
 
     @property
+    def model_state_patch_count(self) -> int:
+        return sum(len(cycle.state_patches) for cycle in self.framework_cycles)
+
+    @property
+    def model_state_event_count(self) -> int:
+        return sum(len(cycle.state_events) for cycle in self.framework_cycles)
+
+    @property
     def framework_total_ms(self) -> float:
         return sum(cycle.timings.total_ms for cycle in self.framework_cycles)
 
@@ -282,6 +290,8 @@ class FrameworkBacktestResult:
             "order_ticket_count": len(self.order_tickets),
             "order_event_count": len(self.order_events),
             "order_collision_count": len(self.order_collisions),
+            "model_state_patch_count": self.model_state_patch_count,
+            "model_state_event_count": self.model_state_event_count,
             "framework_total_ms": self.framework_total_ms,
             "final_cash": self.final_cash,
             "final_cash_by_currency": dict(self.final_cash_by_currency),

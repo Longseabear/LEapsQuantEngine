@@ -7,6 +7,7 @@ from typing import Any, Mapping, Protocol
 
 from leaps_quant_engine.models import DataSlice, PortfolioTarget
 from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
+from leaps_quant_engine.runtime_state import RuntimeModelStateView, StatePatch
 from leaps_quant_engine.snapshots import SnapshotQualityReport, SnapshotQualityStatus
 
 
@@ -43,6 +44,7 @@ class RiskDecision:
 class RiskDecisionBatch:
     sleeve_id: str
     decisions: tuple[RiskDecision, ...]
+    state_patches: tuple[StatePatch, ...] = ()
 
     @property
     def approved_targets(self) -> tuple[PortfolioTarget, ...]:
@@ -59,6 +61,8 @@ class RiskDecisionBatch:
             "decision_count": len(self.decisions),
             "approved_count": len(self.approved_targets),
             "decisions": [decision.to_dict() for decision in self.decisions],
+            "state_patch_count": len(self.state_patches),
+            "state_patches": [patch.to_dict() for patch in self.state_patches],
         }
 
 
@@ -70,6 +74,7 @@ class RiskManagementContext:
     targets: tuple[PortfolioTarget, ...]
     snapshot_quality: SnapshotQualityReport | None = None
     active_insights: tuple[Any, ...] = ()
+    model_state: RuntimeModelStateView = field(default_factory=RuntimeModelStateView)
 
 
 class RiskManagementModel(Protocol):

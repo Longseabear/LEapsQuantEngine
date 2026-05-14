@@ -113,6 +113,14 @@ py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_wor
 Warmup bars prepare indicators. Metrics and report cycles should still be read
 from the requested `--start` to `--end` evaluation window.
 
+## Model State Replay
+
+Stateful models are replayable in backtests. Runtime backtest commands attach an
+in-memory `RuntimeStateStore`, so models can read `context.model_state`, return
+`StatePatch` records, and receive the projected state on the next replay cycle.
+Summary reports include `model_state_patch_count` and
+`model_state_event_count`.
+
 ## Runtime Sleeve Backtest
 
 This is the default research command for `LEaps`:

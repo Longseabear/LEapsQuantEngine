@@ -7,6 +7,7 @@ import pytest
 from leaps_quant_engine.runtime_state import (
     InMemoryRuntimeStateStore,
     ModelStateKey,
+    RuntimeModelStateView,
     SQLiteRuntimeStateStore,
     StatePatch,
     StatePatchOperation,
@@ -161,3 +162,19 @@ def test_state_patch_requires_values_for_set_and_merge():
     delete_patch = StatePatch(key=key, operation=StatePatchOperation.DELETE)
     assert delete_patch.operation is StatePatchOperation.DELETE
 
+
+def test_runtime_model_state_view_is_read_only_and_uses_defaults():
+    store = InMemoryRuntimeStateStore()
+    view = RuntimeModelStateView(store=store, default_sleeve_id="LEaps", default_model_id="trailing-stop")
+    key = view.key(namespace="stop", symbol_key="KRX:005930")
+
+    store.apply_patches((StatePatch(key=key, value={"high": 84000}),))
+
+    record = view.get(namespace="stop", symbol_key="KRX:005930")
+    assert record is not None
+    assert record.value["high"] == 84000
+    assert view.entries(namespace="stop") == (record,)
+
+    empty_view = RuntimeModelStateView()
+    assert empty_view.get(key) is None
+    assert empty_view.entries() == ()

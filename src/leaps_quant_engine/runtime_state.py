@@ -196,6 +196,72 @@ class RuntimeStateStore(Protocol):
         """Commit model-requested patches and return audit events."""
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeModelStateView:
+    """Read-only model-facing view over optional runtime state."""
+
+    store: RuntimeStateStore | None = None
+    default_sleeve_id: str = ""
+    default_model_id: str = ""
+
+    def get(
+        self,
+        key: ModelStateKey | None = None,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+    ) -> ModelStateRecord | None:
+        if self.store is None:
+            return None
+        resolved = key or self.key(
+            sleeve_id=sleeve_id,
+            model_id=model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+        )
+        return self.store.get(resolved)
+
+    def entries(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str | None = None,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+    ) -> tuple[ModelStateRecord, ...]:
+        if self.store is None:
+            return ()
+        return self.store.entries(
+            sleeve_id=sleeve_id if sleeve_id is not None else self.default_sleeve_id or None,
+            model_id=model_id if model_id is not None else self.default_model_id or None,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+        )
+
+    def key(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+    ) -> ModelStateKey:
+        return ModelStateKey(
+            sleeve_id=sleeve_id if sleeve_id is not None else self.default_sleeve_id,
+            model_id=model_id if model_id is not None else self.default_model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+        )
+
+
 class InMemoryRuntimeStateStore:
     def __init__(self) -> None:
         self._records: dict[tuple[str, str, str, str, str], ModelStateRecord] = {}

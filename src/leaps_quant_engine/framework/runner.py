@@ -28,6 +28,7 @@ from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import DataSlice, OrderIntent, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.fundamentals import FundamentalSnapshot
+from leaps_quant_engine.runtime_state import ModelStateEvent, RuntimeModelStateView, RuntimeStateStore, StatePatch
 from leaps_quant_engine.snapshots import IndicatorSnapshot
 
 
@@ -77,6 +78,9 @@ class FrameworkCycleResult:
     execution_batch: OrderIntentBatch
     order_intents: tuple[OrderIntent, ...]
     timings: StageTiming
+    state_patches: tuple[StatePatch, ...] = ()
+    state_events: tuple[ModelStateEvent, ...] = ()
+    state_commit_enabled: bool = False
     stage_decisions: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -99,6 +103,7 @@ class FrameworkCycleResult:
             "generated_at": self.new_insight_batch.generated_at.isoformat(),
             "alpha_ids": list(self.new_insight_batch.alpha_ids),
             "insight_count": self.new_insight_batch.insight_count,
+            "state_patch_count": len(self.new_insight_batch.state_patches),
         }
         manager_update = self.insight_manager_update.to_dict() if include_details else {
             "added_count": self.insight_manager_update.added_count,
@@ -122,6 +127,7 @@ class FrameworkCycleResult:
                 "reason": self.portfolio_target_batch.reason,
                 "source_insight_ids": list(self.portfolio_target_batch.source_insight_ids),
                 "target_count": self.portfolio_target_batch.target_count,
+                "state_patch_count": len(self.portfolio_target_batch.state_patches),
                 "metadata": dict(self.portfolio_target_batch.metadata),
             },
             "portfolio_targets": [
@@ -150,6 +156,7 @@ class FrameworkCycleResult:
                 "model_name": self.execution_batch.model_name,
                 "reason": self.execution_batch.reason,
                 "order_count": self.execution_batch.order_count,
+                "state_patch_count": len(self.execution_batch.state_patches),
                 "metadata": dict(self.execution_batch.metadata),
             },
             "order_intents": [
@@ -163,6 +170,13 @@ class FrameworkCycleResult:
                 }
                 for order in self.order_intents
             ],
+            "model_state": {
+                "patch_count": len(self.state_patches),
+                "event_count": len(self.state_events),
+                "commit_enabled": self.state_commit_enabled,
+                "patches": [patch.to_dict() for patch in self.state_patches] if include_details else [],
+                "events": [event.to_dict() for event in self.state_events] if include_details else [],
+            },
             "timings": self.timings.to_dict(),
             "stage_decisions": dict(self.stage_decisions),
         }
@@ -179,6 +193,8 @@ class FrameworkRunner:
     order_sizing_engine: OrderSizingEngine = None  # type: ignore[assignment]
     execution_model: ImmediateExecutionModel = None  # type: ignore[assignment]
     execution_engine: ExecutionEngine = None  # type: ignore[assignment]
+    runtime_state_store: RuntimeStateStore | None = None
+    runtime_state_commit_enabled: bool = True
     _last_portfolio_run_at: datetime | None = field(default=None, init=False)
     _last_portfolio_target_batch: PortfolioTargetBatch | None = field(default=None, init=False)
 
@@ -246,6 +262,7 @@ class FrameworkRunner:
         context = SnapshotContext.from_indicator_snapshot(
             indicator_snapshot,
             fundamental_snapshot=fundamental_snapshot,
+            model_state=self._model_state_view(),
         )
 
         started = time.perf_counter()
@@ -275,6 +292,7 @@ class FrameworkRunner:
                     portfolio=portfolio,
                     active_insights=active_insights,
                     managed_symbols=self.insight_manager.tracked_symbols(self.sleeve_id),
+                    model_state=self._model_state_view(),
                 )
             )
             self._last_portfolio_target_batch = portfolio_target_batch
@@ -313,6 +331,7 @@ class FrameworkRunner:
                 targets=order_sizing_batch.targets,
                 snapshot_quality=indicator_snapshot.quality_report,
                 active_insights=active_insights,
+                model_state=self._model_state_view(),
             )
         )
         risk_ms = _elapsed_ms(started)
@@ -327,6 +346,7 @@ class FrameworkRunner:
                 approved_targets=risk_decisions.approved_targets,
                 market_session=market_session,
                 market_sessions=dict(market_sessions or {}),
+                model_state=self._model_state_view(),
             )
         )
         orders = execution_batch.order_intents
@@ -337,6 +357,18 @@ class FrameworkRunner:
                 scope: session.to_dict()
                 for scope, session in sorted(dict(market_sessions or {}).items())
             },
+        }
+        state_patches = (
+            *insight_batch.state_patches,
+            *portfolio_target_batch.state_patches,
+            *risk_decisions.state_patches,
+            *execution_batch.state_patches,
+        )
+        state_events = self._commit_state_patches(state_patches, applied_at=data.time)
+        stage_decisions["model_state"] = {
+            "patch_count": len(state_patches),
+            "event_count": len(state_events),
+            "commit_enabled": self.runtime_state_store is not None and self.runtime_state_commit_enabled,
         }
 
         return FrameworkCycleResult(
@@ -359,8 +391,24 @@ class FrameworkRunner:
                 risk_ms=risk_ms,
                 execution_ms=execution_ms,
             ),
+            state_patches=state_patches,
+            state_events=state_events,
+            state_commit_enabled=self.runtime_state_store is not None and self.runtime_state_commit_enabled,
             stage_decisions=stage_decisions,
         )
+
+    def _model_state_view(self) -> RuntimeModelStateView:
+        return RuntimeModelStateView(store=self.runtime_state_store, default_sleeve_id=self.sleeve_id)
+
+    def _commit_state_patches(
+        self,
+        patches: tuple[StatePatch, ...],
+        *,
+        applied_at: datetime,
+    ) -> tuple[ModelStateEvent, ...]:
+        if not patches or self.runtime_state_store is None or not self.runtime_state_commit_enabled:
+            return ()
+        return self.runtime_state_store.apply_patches(patches, applied_at=applied_at)
 
 
 def _elapsed_ms(started: float) -> float:

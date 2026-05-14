@@ -93,24 +93,28 @@
           "allocation_mode": "rl_weights",
           "fallback_gross_exposure": 0.90,
           "max_portfolio_pct": 1.0,
-          "max_position_pct": 0.30,
+          "max_position_pct": 0.35,
           "long_only": true
         },
         "rebalance": {
-          "cash_reserve_pct": 0.05,
-          "min_order_notional": 75.0,
-          "min_quantity_delta": 1,
+          "cash_reserve_pct": 0.02,
+          "min_order_notional": 200.0,
+          "min_quantity_delta": 2,
           "allow_exit_below_min_notional": true,
-          "cadence": "every_5_minutes"
+          "cadence": "every_5_minutes",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 10.0
         }
       },
       "risk": {
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 0.30,
-          "max_total_exposure_pct": 0.95,
-          "cash_buffer_pct": 0.05,
+          "max_position_pct": 0.35,
+          "max_total_exposure_pct": 0.98,
+          "cash_buffer_pct": 0.02,
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }

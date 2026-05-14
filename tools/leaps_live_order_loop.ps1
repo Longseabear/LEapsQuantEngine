@@ -12,6 +12,7 @@ param(
     [string]$SubmitStatePath = "",
     [string]$SubmitOncePerDay = "true",
     [string]$RequireSupportedSubmitSession = "true",
+    [string]$RuntimeStatePath = "",
     [double]$StaleAfterSeconds = 0,
     [string]$CancelStaleOpenTickets = "false",
     [string]$ExpireDayOpenTickets = "true"
@@ -54,6 +55,16 @@ $frameworkStateFullPath = if ([System.IO.Path]::IsPathRooted($frameworkStateRela
     Join-Path $root $frameworkStateRelativePath
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $frameworkStateFullPath) | Out-Null
+$runtimeStateArgs = @()
+if ($RuntimeStatePath) {
+    $runtimeStateFullPath = if ([System.IO.Path]::IsPathRooted($RuntimeStatePath)) {
+        $RuntimeStatePath
+    } else {
+        Join-Path $root $RuntimeStatePath
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $runtimeStateFullPath) | Out-Null
+    $runtimeStateArgs = @("--runtime-state", $runtimeStateFullPath)
+}
 
 function Write-LoopLog {
     param([string]$Message)
@@ -281,6 +292,7 @@ while ($true) {
             --journal $journalFullPath `
             --order-batch-output $orderBatchFullPath `
             --framework-state $frameworkStateFullPath `
+            @runtimeStateArgs `
             2>&1 | Out-File -FilePath $logFullPath -Append -Encoding utf8
         $runExit = $LASTEXITCODE
         Write-LoopLog "runtime-run-once exit=$runExit"

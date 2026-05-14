@@ -80,6 +80,7 @@ from leaps_quant_engine.runtime_integrity import build_runtime_code_identity
 from leaps_quant_engine.runtime_multi import run_multi_sleeve_once
 from leaps_quant_engine.runtime_preflight import build_runtime_preflight_report
 from leaps_quant_engine.runtime_recovery import build_recovery_account_report, build_recovery_report
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, SQLiteRuntimeStateStore
 from leaps_quant_engine.rl import train_ppo_portfolio_constructor
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
 from leaps_quant_engine.sleeve_workspace import (
@@ -133,6 +134,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_run_once.add_argument("--journal", type=Path)
     runtime_run_once.add_argument("--framework-state", type=Path)
     runtime_run_once.add_argument("--framework-state-read-only", action="store_true")
+    runtime_run_once.add_argument("--runtime-state", type=Path)
+    runtime_run_once.add_argument("--runtime-state-read-only", action="store_true")
     runtime_run_once.add_argument("--summary-only", action="store_true")
 
     runtime_run_multi_once = subparsers.add_parser("runtime-run-multi-once")
@@ -144,6 +147,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_run_multi_once.add_argument("--journal", type=Path)
     runtime_run_multi_once.add_argument("--framework-state-dir", type=Path)
     runtime_run_multi_once.add_argument("--framework-state-read-only", action="store_true")
+    runtime_run_multi_once.add_argument("--runtime-state", type=Path)
+    runtime_run_multi_once.add_argument("--runtime-state-read-only", action="store_true")
     runtime_run_multi_once.add_argument("--summary-only", action="store_true")
 
     runtime_control_submit = subparsers.add_parser("runtime-control-submit")
@@ -679,9 +684,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "runtime-run-once":
         snapshot = load_runtime_config_snapshot(args.config)
         default_market = _default_market_from_runtime_snapshot(snapshot, args.sleeve_id)
+        runtime_state_store, runtime_state_summary = _runtime_state_store_from_args(
+            snapshot,
+            args.runtime_state,
+            read_only=bool(args.runtime_state_read_only),
+        )
         runtime = bootstrap_sleeve_runtime(
             snapshot,
             args.sleeve_id,
+            dependencies=RuntimeBootstrapDependencies(
+                runtime_state_store=runtime_state_store,
+                runtime_state_commit_enabled=not bool(args.runtime_state_read_only),
+            ),
             refresh_fine=not args.skip_fine_refresh,
             held_symbols=_parse_symbol_refs(args.held, default_market),
             open_order_symbols=_parse_symbol_refs(args.open_order, default_market),
@@ -752,6 +766,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_payload["cycle_journal"] = journal_summary
         if framework_state_summary is not None:
             print_payload["framework_state"] = framework_state_summary
+        if runtime_state_summary is not None:
+            print_payload["runtime_state"] = runtime_state_summary
         print(
             json.dumps(
                 print_payload,
@@ -776,6 +792,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         snapshot = load_runtime_config_snapshot(args.config)
         sleeve_ids = _status_sleeve_ids(snapshot, args.sleeve_id)
+        runtime_state_store, runtime_state_summary = _runtime_state_store_from_args(
+            snapshot,
+            args.runtime_state,
+            read_only=bool(args.runtime_state_read_only),
+        )
         framework_state_dir = (
             resolve_runtime_path(snapshot, args.framework_state_dir).resolve()
             if args.framework_state_dir is not None
@@ -788,6 +809,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             warmup=False if args.skip_warmup else None,
             framework_state_dir=framework_state_dir,
             framework_state_read_only=args.framework_state_read_only,
+            dependencies=RuntimeBootstrapDependencies(
+                runtime_state_store=runtime_state_store,
+                runtime_state_commit_enabled=not bool(args.runtime_state_read_only),
+            ),
         )
         journal_summary = None
         journal_path = _runtime_journal_path(snapshot, args.journal)
@@ -839,6 +864,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_payload["order_batch_artifact"] = order_batch_artifact
         if journal_summary is not None:
             print_payload["cycle_journal"] = journal_summary
+        if runtime_state_summary is not None:
+            print_payload["runtime_state"] = runtime_state_summary
         print(json.dumps(print_payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "runtime-control-submit":
@@ -1612,6 +1639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             framework_runner=FrameworkRunner(
                 sleeve_id=args.sleeve_id,
                 alpha_runtime=AlphaRuntime(active_models=(alpha_load.model,)),
+                runtime_state_store=InMemoryRuntimeStateStore(),
             ),
             portfolio=Portfolio(cash=args.cash),
             start=_parse_cli_datetime(args.start),
@@ -1656,6 +1684,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             live_provider_factory=lambda universe, rate_limit_per_second: provider,
             history_provider_factory=lambda: provider,
             portfolio_provider=StaticPortfolioProvider(portfolios={args.sleeve_id: portfolio}),
+            runtime_state_store=InMemoryRuntimeStateStore(),
         )
         runtime = bootstrap_sleeve_runtime(
             snapshot,
@@ -1752,6 +1781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             live_provider_factory=lambda universe, rate_limit_per_second: daily_provider,
             history_provider_factory=lambda: daily_provider,
             portfolio_provider=StaticPortfolioProvider(portfolios={args.sleeve_id: portfolio}),
+            runtime_state_store=InMemoryRuntimeStateStore(),
         )
         runtime = bootstrap_sleeve_runtime(
             snapshot,
@@ -2622,6 +2652,17 @@ def _runtime_journal_path(snapshot, explicit_path: Path | None) -> Path | None:
 def _runtime_journal_store(snapshot, explicit_path: Path | None):
     journal_path = _runtime_journal_path(snapshot, explicit_path)
     return FileCycleJournalStore(journal_path) if journal_path is not None else None
+
+
+def _runtime_state_store_from_args(snapshot, explicit_path: Path | None, *, read_only: bool):
+    if explicit_path is None:
+        return None, None
+    path = resolve_runtime_path(snapshot, explicit_path).resolve()
+    return SQLiteRuntimeStateStore(path), {
+        "path": str(path),
+        "store": "sqlite",
+        "read_only": bool(read_only),
+    }
 
 
 def _status_sleeve_ids(snapshot, requested_sleeve_ids: Sequence[str]) -> tuple[str, ...]:

@@ -32,6 +32,7 @@ from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
 from leaps_quant_engine.portfolio_state import PortfolioEngineState
+from leaps_quant_engine.runtime_state import RuntimeStateStore
 from leaps_quant_engine.runtime_config import ActiveUniverseRuntimeConfig, ModuleReference, RuntimeConfigSnapshot, SleeveRuntimeConfig
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker, SnapshotWorkerRunReport
 from leaps_quant_engine.snapshots import (
@@ -72,6 +73,8 @@ class RuntimeBootstrapDependencies:
     portfolio_provider: PortfolioProvider | None = None
     indicator_engine: IndicatorEngine | None = None
     indicator_snapshot_stores: dict[str, IndicatorSnapshotStore] | None = None
+    runtime_state_store: RuntimeStateStore | None = None
+    runtime_state_commit_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.live_provider_factory is None:
@@ -344,6 +347,9 @@ class RuntimeSleeveRuntime:
                 "risk_decision_count": len(framework.risk_decisions.decisions) if framework is not None else 0,
                 "approved_target_count": len(framework.risk_decisions.approved_targets) if framework is not None else 0,
                 "order_intent_count": len(framework.order_intents) if framework is not None else 0,
+                "model_state_patch_count": len(framework.state_patches) if framework is not None else 0,
+                "model_state_event_count": len(framework.state_events) if framework is not None else 0,
+                "model_state_commit_enabled": framework.state_commit_enabled if framework is not None else False,
             },
             "portfolio_engine_state": portfolio_state.to_dict(include_details=False)
             if portfolio_state is not None
@@ -472,6 +478,8 @@ def bootstrap_sleeve_runtime(
         portfolio_engine=portfolio_engine,
         risk_model=risk_model,
         execution_engine=execution_engine,
+        runtime_state_store=deps.runtime_state_store,
+        runtime_state_commit_enabled=deps.runtime_state_commit_enabled,
     )
     if sleeve_config.universe.fine.enabled:
         fine_runtime = FineUniverseRuntime(

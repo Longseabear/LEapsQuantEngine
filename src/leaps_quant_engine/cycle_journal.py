@@ -147,6 +147,8 @@ class CycleJournalEntry:
             "risk_decision_count": len(framework.risk_decisions.decisions) if framework is not None else 0,
             "approved_target_count": len(framework.risk_decisions.approved_targets) if framework is not None else 0,
             "order_intent_count": len(framework.order_intents) if framework is not None else 0,
+            "model_state_patch_count": len(getattr(framework, "state_patches", ())) if framework is not None else 0,
+            "model_state_event_count": len(getattr(framework, "state_events", ())) if framework is not None else 0,
         }
         timings = framework.timings.to_dict() if framework is not None else {}
         status = "ok"
@@ -219,6 +221,8 @@ class CycleJournalEntry:
                 "risk_decision_count": len(cycle.risk_decisions.decisions),
                 "approved_target_count": len(cycle.risk_decisions.approved_targets),
                 "order_intent_count": len(cycle.order_intents),
+                "model_state_patch_count": len(getattr(cycle, "state_patches", ())),
+                "model_state_event_count": len(getattr(cycle, "state_events", ())),
             },
             timings=cycle.timings.to_dict(),
             warnings=tuple(warnings),

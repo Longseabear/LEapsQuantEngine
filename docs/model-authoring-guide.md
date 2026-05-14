@@ -313,8 +313,53 @@ engine guard validates order/account safety separately
 ```
 
 Use `ModelStateKey` to namespace state by sleeve, model, namespace, symbol, and
-optionally position. See `docs/runtime-state.md` for the current offline
-`RuntimeStateStore` foundation. It is not enabled in the live loop by default.
+optionally position. Runtime contexts expose a read-only `context.model_state`
+view; models may add an optional `state_patches(...)` method to request updates
+after their normal decision output is created.
+
+Alpha example:
+
+```python
+from leaps_quant_engine.runtime_state import StatePatch
+
+
+class TrailingStopAlpha:
+    alpha_id = "trailing-stop"
+    version = "0.1.0"
+
+    def generate(self, context):
+        state = context.model_state.get(
+            model_id=self.alpha_id,
+            namespace="trailing_stop",
+            symbol_key="KRX:005930",
+        )
+        ...
+
+    def state_patches(self, context, insights):
+        return (
+            StatePatch(
+                key=context.model_state.key(
+                    model_id=self.alpha_id,
+                    namespace="trailing_stop",
+                    symbol_key="KRX:005930",
+                ),
+                value={"high_watermark_price": 84000},
+                reason="trailing_stop_mark",
+            ),
+        )
+```
+
+Supported state hook shapes:
+
+- alpha: `state_patches(context, insights)`
+- portfolio: `state_patches(context, targets)`
+- execution: `state_patches(context, orders)`
+- risk: return `RiskDecisionBatch(..., state_patches=(...))`
+
+The runtime commits patches only after a successful framework cycle and records
+patch/event counts in the framework result and cycle journal. Live loops must
+pass `--runtime-state` explicitly; without it, state reads return empty and
+patches are reported but not persisted.
 
 ## Portfolio Construction Models
 
@@ -366,6 +411,14 @@ Notes:
 - Do not round to lots or shares. `OrderSizingEngine` owns quantity conversion
   and recomputes current quantity targets from live portfolio state every
   cycle.
+- `PortfolioTarget Ledger` is an engine responsibility. The portfolio model owns
+  desired target percentages; `FrameworkRunner` persists active insights,
+  rebalance cadence, and the last target batch through framework state, while
+  `OrderSizingEngine` recomputes target share quantities from current virtual
+  account state every cycle.
+- If target smoothing is strategic, implement the smoothing policy in the
+  portfolio model and store its anchors with `StatePatch`. The engine should not
+  invent smoothing weights.
 - Use `context.active_insights`, `context.portfolio`, and `context.data`.
 - Multi-currency sleeves are bucket-aware. Do not use mixed global equity for
   KRW and USD decisions unless an FX conversion layer is explicitly added later.
@@ -658,6 +711,11 @@ Notes:
 - If a model needs more aggressive exit behavior, express that as execution
   policy through order type, limit offset, urgency metadata, or a future
   replace policy. Do not hide broker cancel/replace calls inside the model.
+- Cancel/replace policy is an execution-model responsibility, while the order
+  runtime owns broker lifecycle execution. A future replace-aware model should
+  emit policy fields such as max order age, price-drift threshold, minimum
+  replace interval, max replacement count, and urgency. The runtime should then
+  cancel/replace only at ticket-safe boundaries.
 
 ## Validation Checklist
 

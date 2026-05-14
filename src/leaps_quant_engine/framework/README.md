@@ -17,6 +17,7 @@ active insights
 - `runner.py`: sleeve-local alpha, insight manager, portfolio, risk, and execution cycle.
 - `portfolio_construction.py`: `PortfolioConstructionEngine`, target batches, target plans, rebalance policy, and equal-weight model.
 - `state.py`: optional file-backed framework state for `runtime-run-once` process loops.
+- `../runtime_state.py`: optional SQLite/in-memory model state store for stateful models.
 - `portfolio_model_loader.py`: Python portfolio construction model loading.
 - `risk.py`: `RiskManagementModel`, `RiskDecisionBatch`, `BasicRiskManagementModel`, and risk limits.
 - `risk_model_loader.py`: Python risk model loading.
@@ -35,6 +36,18 @@ new process each cycle, pass `runtime-run-once --framework-state ...` so the
 runner can restore the last portfolio target batch and active insights before
 checking cadence. A non-due cycle reuses the previous target batch, then risk,
 execution, and order sync still run against the current virtual portfolio.
+
+`PortfolioTargetBatch` is the engine-owned target ledger. Portfolio models emit
+percent targets; `OrderSizingEngine` converts them into current integer target
+quantities every cycle.
+
+## Model State
+
+Stateful models may read `context.model_state` and return `StatePatch` records
+through their optional `state_patches(...)` hooks. `FrameworkRunner` commits the
+patches at the end of a successful cycle when a runtime state store is attached.
+Without a store, stateless models behave unchanged and emitted patches are only
+visible in the framework result.
 
 ## Risk
 

@@ -10,6 +10,7 @@ from uuid import uuid4
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, TimeInForce
 from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.runtime_state import RuntimeModelStateView, StatePatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class ExecutionContext:
     approved_targets: tuple[PortfolioTarget, ...]
     market_session: MarketSession | None = None
     market_sessions: Mapping[str, MarketSession] = field(default_factory=dict)
+    model_state: RuntimeModelStateView = field(default_factory=RuntimeModelStateView)
 
     def __post_init__(self) -> None:
         sessions = dict(self.market_sessions)
@@ -52,6 +54,7 @@ class OrderIntentBatch:
     order_intents: tuple[OrderIntent, ...]
     model_name: str = ""
     reason: str = ""
+    state_patches: tuple[StatePatch, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
     batch_id: str = field(default_factory=lambda: f"order-intents-{uuid4()}")
 
@@ -70,6 +73,7 @@ class OrderIntentBatch:
             "model_name": self.model_name,
             "reason": self.reason,
             "order_count": self.order_count,
+            "state_patch_count": len(self.state_patches),
             "orders": [
                 {
                     "sleeve_id": order.sleeve_id,
@@ -86,6 +90,7 @@ class OrderIntentBatch:
                 }
                 for order in self.order_intents
             ],
+            "state_patches": [patch.to_dict() for patch in self.state_patches],
             "metadata": dict(self.metadata),
         }
 
@@ -275,12 +280,14 @@ class ExecutionEngine:
             _with_execution_context_metadata(order, context)
             for order in _create_orders(self.model, context)
         )
+        state_patches = _state_patches_for_model(self.model, context, orders)
         return OrderIntentBatch(
             sleeve_id=context.sleeve_id,
             generated_at=context.generated_at,
             order_intents=orders,
             model_name=type(self.model).__name__,
             reason=self.reason,
+            state_patches=state_patches,
             metadata={
                 "approved_target_count": len(context.approved_targets),
                 "created_order_count": len(orders),
@@ -310,6 +317,37 @@ def _create_orders(model: ExecutionModel, context: ExecutionContext) -> list[Ord
         list(context.approved_targets),
         **kwargs,
     )
+
+
+def _state_patches_for_model(
+    model: ExecutionModel,
+    context: ExecutionContext,
+    orders: tuple[OrderIntent, ...],
+) -> tuple[StatePatch, ...]:
+    producer = getattr(model, "state_patches", None)
+    if not callable(producer):
+        return ()
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(producer).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    supports_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if supports_kwargs or "context" in parameters:
+        kwargs["context"] = context
+    if supports_kwargs or "orders" in parameters:
+        kwargs["orders"] = orders
+    if kwargs:
+        result = producer(**kwargs)
+    elif not parameters:
+        result = producer()
+    else:
+        result = producer(context, orders)
+    patches = tuple(result or ())
+    for patch in patches:
+        if not isinstance(patch, StatePatch):
+            raise TypeError("state_patches(...) must return StatePatch objects.")
+    return patches
 
 
 def _with_execution_context_metadata(order: OrderIntent, context: ExecutionContext) -> OrderIntent:

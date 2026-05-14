@@ -11,6 +11,7 @@ from leaps_quant_engine.framework import (
 )
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, ModelStateKey, StatePatch
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
 
 
@@ -44,6 +45,44 @@ class SelectedSymbolsAlpha:
             )
             for symbol_key in context.symbol_keys
         ]
+
+
+class StatefulAlpha:
+    alpha_id = "stateful-alpha"
+    version = "1.0"
+
+    def generate(self, context):
+        record = context.model_state.get(
+            model_id=self.alpha_id,
+            namespace="test",
+            symbol_key=context.symbol_keys[0],
+        )
+        high = (record.value["high"] if record is not None else 0) + 1
+        return [
+            Insight(
+                sleeve_id=context.sleeve_id,
+                symbol=context.symbol(context.symbol_keys[0]),
+                direction=InsightDirection.UP,
+                generated_at=context.as_of,
+                source_snapshot_id=context.source_snapshot_id,
+                alpha_id=self.alpha_id,
+                alpha_version=self.version,
+                metadata={"previous_high": high - 1},
+            )
+        ]
+
+    def state_patches(self, context, insights):
+        return (
+            StatePatch(
+                key=context.model_state.key(
+                    model_id=self.alpha_id,
+                    namespace="test",
+                    symbol_key=context.symbol_keys[0],
+                ),
+                value={"high": insights[0].metadata["previous_high"] + 1},
+                reason="stateful_alpha_test",
+            ),
+        )
 
 
 def _snapshot(as_of: datetime, symbol: Symbol) -> IndicatorSnapshot:
@@ -428,3 +467,72 @@ def test_framework_runner_runs_portfolio_after_minute_rebalance_cadence():
     assert reused.portfolio_target_batch.metadata["reused"] is True
     assert refreshed.stage_decisions["portfolio"]["ran"] is True
     assert refreshed.portfolio_target_batch.metadata.get("reused") is None
+
+
+def test_framework_runner_commits_model_state_patches_after_successful_cycle():
+    symbol = Symbol("NVDA", "US")
+    as_of = datetime(2026, 5, 9, 9, 30)
+    store = InMemoryRuntimeStateStore()
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(StatefulAlpha(),)),
+        portfolio_model=EqualWeightPortfolioConstructionModel(),
+        risk_model=PassThroughRiskManagementModel(),
+        runtime_state_store=store,
+    )
+
+    first = runner.run_once(
+        indicator_snapshot=_snapshot(as_of, symbol),
+        data=_slice(as_of, symbol, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+    )
+    second = runner.run_once(
+        indicator_snapshot=_snapshot(datetime(2026, 5, 9, 9, 31), symbol),
+        data=_slice(datetime(2026, 5, 9, 9, 31), symbol, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    key = ModelStateKey(
+        sleeve_id="us-live",
+        model_id="stateful-alpha",
+        namespace="test",
+        symbol_key="US:NVDA",
+    )
+    record = store.get(key)
+    assert record is not None
+    assert record.value["high"] == 2
+    assert first.state_events[0].new_version == 1
+    assert second.new_insight_batch.insights[0].metadata["previous_high"] == 1
+    assert second.state_events[0].new_version == 2
+    assert second.to_dict(include_details=False)["model_state"] == {
+        "patch_count": 1,
+        "event_count": 1,
+        "commit_enabled": True,
+        "patches": [],
+        "events": [],
+    }
+
+
+def test_framework_runner_can_run_model_state_in_read_only_shadow_mode():
+    symbol = Symbol("NVDA", "US")
+    as_of = datetime(2026, 5, 9, 9, 30)
+    store = InMemoryRuntimeStateStore()
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(StatefulAlpha(),)),
+        portfolio_model=EqualWeightPortfolioConstructionModel(),
+        risk_model=PassThroughRiskManagementModel(),
+        runtime_state_store=store,
+        runtime_state_commit_enabled=False,
+    )
+
+    result = runner.run_once(
+        indicator_snapshot=_snapshot(as_of, symbol),
+        data=_slice(as_of, symbol, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    assert len(result.state_patches) == 1
+    assert result.state_events == ()
+    assert result.state_commit_enabled is False
+    assert store.entries() == ()

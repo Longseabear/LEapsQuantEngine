@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import inspect
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 from uuid import uuid4
@@ -9,6 +10,7 @@ from uuid import uuid4
 from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.models import DataSlice, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
+from leaps_quant_engine.runtime_state import RuntimeModelStateView, StatePatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +24,7 @@ class PortfolioConstructionContext:
     target_portfolio_value: float = 0.0
     portfolio_equity_by_currency: Mapping[str, float] = field(default_factory=dict)
     target_portfolio_value_by_currency: Mapping[str, float] = field(default_factory=dict)
+    model_state: RuntimeModelStateView = field(default_factory=RuntimeModelStateView)
 
     @property
     def equity(self) -> float:
@@ -112,6 +115,7 @@ class PortfolioTargetBatch:
     source_insight_ids: tuple[str, ...] = ()
     model_name: str = ""
     reason: str = ""
+    state_patches: tuple[StatePatch, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
     batch_id: str = field(default_factory=lambda: f"portfolio-targets-{uuid4()}")
 
@@ -136,6 +140,7 @@ class PortfolioTargetBatch:
             "source_insight_ids": list(self.source_insight_ids),
             "target_count": self.target_count,
             "plan_count": self.plan_count,
+            "state_patch_count": len(self.state_patches),
             "targets": [
                 {
                     "symbol": target.symbol.key,
@@ -145,6 +150,7 @@ class PortfolioTargetBatch:
                 for target in self.targets
             ],
             "plans": [plan.to_dict() for plan in self.plans],
+            "state_patches": [patch.to_dict() for patch in self.state_patches],
             "metadata": dict(self.metadata),
         }
 
@@ -204,6 +210,7 @@ class PortfolioConstructionEngine:
             _coerce_allocation_target(prepared_context, target)
             for target in self.model.create_targets(prepared_context)
         )
+        state_patches = _state_patches_for_model(self.model, prepared_context, raw_targets)
         plans = self._build_plans(prepared_context, raw_targets)
         return PortfolioTargetBatch(
             sleeve_id=context.sleeve_id,
@@ -213,6 +220,7 @@ class PortfolioConstructionEngine:
             source_insight_ids=tuple(insight.insight_id for insight in context.active_insights),
             model_name=type(self.model).__name__,
             reason=self.reason,
+            state_patches=state_patches,
             metadata={
                 "raw_target_count": len(raw_targets),
                 "filtered_target_count": len(raw_targets),
@@ -406,3 +414,34 @@ def _coerce_allocation_target(
             tag=target.tag,
         )
     raise TypeError(f"Unsupported portfolio target type: {type(target).__name__}")
+
+
+def _state_patches_for_model(
+    model: PortfolioConstructionModel,
+    context: PortfolioConstructionContext,
+    targets: tuple[PortfolioAllocationTarget, ...],
+) -> tuple[StatePatch, ...]:
+    producer = getattr(model, "state_patches", None)
+    if not callable(producer):
+        return ()
+    kwargs: dict[str, Any] = {}
+    try:
+        parameters = inspect.signature(producer).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    supports_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    if supports_kwargs or "context" in parameters:
+        kwargs["context"] = context
+    if supports_kwargs or "targets" in parameters:
+        kwargs["targets"] = targets
+    if kwargs:
+        result = producer(**kwargs)
+    elif not parameters:
+        result = producer()
+    else:
+        result = producer(context, targets)
+    patches = tuple(result or ())
+    for patch in patches:
+        if not isinstance(patch, StatePatch):
+            raise TypeError("state_patches(...) must return StatePatch objects.")
+    return patches

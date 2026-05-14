@@ -19,6 +19,7 @@ from leaps_quant_engine.framework import FrameworkRunner
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.models import Bar, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, StatePatch
 from leaps_quant_engine.universe.loader import parse_universe_definition
 from leaps_quant_engine.universe.selection import build_universe_selection_result
 
@@ -91,6 +92,42 @@ class ReadyMomentumAlpha:
                 reason="ready_momentum_test",
             )
         ]
+
+
+class StatefulBacktestAlpha:
+    alpha_id = "stateful-backtest"
+    version = "1.0"
+
+    def generate(self, context):
+        symbol_key = context.symbol_keys[0]
+        record = context.model_state.get(model_id=self.alpha_id, namespace="count", symbol_key=symbol_key)
+        seen_count = int(record.value["seen_count"]) if record is not None else 0
+        return [
+            Insight(
+                sleeve_id=context.sleeve_id,
+                symbol=context.symbol(symbol_key),
+                direction=InsightDirection.UP,
+                generated_at=context.as_of,
+                expires_at=context.as_of + timedelta(days=1),
+                source_snapshot_id=context.source_snapshot_id,
+                alpha_id=self.alpha_id,
+                alpha_version=self.version,
+                metadata={"seen_count": seen_count},
+            )
+        ]
+
+    def state_patches(self, context, insights):
+        return (
+            StatePatch(
+                key=context.model_state.key(
+                    model_id=self.alpha_id,
+                    namespace="count",
+                    symbol_key=context.symbol_keys[0],
+                ),
+                value={"seen_count": int(insights[0].metadata["seen_count"]) + 1},
+                reason="backtest_count",
+            ),
+        )
 
 
 class CloseValueAlpha:
@@ -229,6 +266,39 @@ def test_framework_backtest_replays_indicators_alpha_and_metrics():
     assert result.metrics.trade_count == 1
     assert result.metrics.order_count == 2
     assert result.to_report(include_orders=False)["order_count"] == 2
+
+
+def test_framework_backtest_can_replay_model_state_patches():
+    symbol = Symbol("005930", "KRX")
+    universe = parse_universe_definition(
+        {
+            "id": "stateful-framework-backtest",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "close", "type": "close", "period": 1}],
+        }
+    )
+    provider = VirtualMarketDataProvider.from_bars(
+        [_bar(symbol, 0, 100.0), _bar(symbol, 1, 101.0), _bar(symbol, 2, 102.0)]
+    )
+    runner = FrameworkRunner(
+        sleeve_id="framework-kor",
+        alpha_runtime=AlphaRuntime(active_models=(StatefulBacktestAlpha(),)),
+        runtime_state_store=InMemoryRuntimeStateStore(),
+    )
+
+    result = run_framework_backtest(
+        universe,
+        provider,
+        sleeve_id="framework-kor",
+        framework_runner=runner,
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    assert [cycle.new_insight_batch.insights[0].metadata["seen_count"] for cycle in result.framework_cycles] == [0, 1, 2]
+    assert result.model_state_patch_count == 3
+    assert result.model_state_event_count == 3
+    assert result.to_report(include_orders=False)["model_state_event_count"] == 3
 
 
 def test_minute_replay_feed_loader_groups_csv_rows_and_marks_resolution(tmp_path):
