@@ -5,6 +5,7 @@ The framework package owns the LEAN-style model chain after alpha.
 ```text
 active insights
   -> PortfolioConstructionEngine
+  -> PortfolioTargetResolver
   -> PortfolioBlendEngine
   -> OrderSizingEngine
   -> RiskManagementModel
@@ -18,6 +19,7 @@ active insights
 
 - `runner.py`: sleeve-local alpha, insight manager, portfolio, risk, and execution cycle.
 - `portfolio_construction.py`: `PortfolioConstructionEngine`, target batches, target plans, rebalance policy, and equal-weight model.
+- `portfolio_target_resolver.py`: resolves raw portfolio model output into a complete target vector.
 - `portfolio_blend.py`: optional target-transition layer for smooth operational target changes.
 - `state.py`: optional file-backed framework state for `runtime-run-once` process loops.
 - `../runtime_state.py`: optional SQLite/in-memory model state store for stateful models.
@@ -44,12 +46,30 @@ execution, and order sync still run against the current virtual portfolio.
 percent targets; `OrderSizingEngine` converts them into current integer target
 quantities every cycle.
 
+## Target Resolution
+
+`PortfolioTargetResolver` runs after raw portfolio construction and before
+portfolio blend. Its job is to make target semantics explicit:
+
+```text
+raw portfolio output -> resolved complete target vector -> portfolio blend
+```
+
+The default `mode="complete"` treats the portfolio model output as the desired
+portfolio state. A symbol present in the previous target snapshot or current
+sleeve holdings but absent from a non-empty new raw output becomes an explicit
+0% target. Empty raw batches are treated as no-action by default so expired or
+missing insights do not become an implicit all-sell signal. Use `mode="patch"`
+only for models that intentionally emit partial target patches; missing previous
+targets are carried forward before blend.
+
 ## Portfolio Blend
 
 `PortfolioBlendEngine` is an optional engine-level target transition layer. It
 does not run an old portfolio model beside a new one. Instead, it compares the
-previous committed target snapshot with the current raw `PortfolioTargetBatch`
-and linearly blends target percentages for a configured duration.
+previous committed target snapshot with the resolved complete
+`PortfolioTargetBatch` and linearly blends target percentages for a configured
+duration.
 
 This is for operational model/config transitions such as "move from old target
 weights to new target weights over five hours." Strategic smoothing that is part

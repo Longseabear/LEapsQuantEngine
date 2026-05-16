@@ -22,9 +22,9 @@ class FakeMarketDataProvider:
         return self.latest_by_key[symbol.key]
 
 
-def _bar(symbol: Symbol, day: int, close: float, volume: int = 10) -> Bar:
+def _bar(symbol: Symbol, day: int, close: float, volume: int = 10, resolution: str = "any") -> Bar:
     time = datetime(2026, 5, 1) + timedelta(days=day)
-    return Bar(symbol, time, close, close, close, close, volume)
+    return Bar(symbol, time, close, close, close, close, volume, resolution=resolution)
 
 
 def test_runtime_builds_indicator_engine_from_sleeve_universe_config():
@@ -63,7 +63,7 @@ def test_indicator_engine_warms_up_from_market_data_provider_and_updates_latest_
     symbol = Symbol("005930", "KRX")
     provider = FakeMarketDataProvider(
         history_by_key={symbol.key: [_bar(symbol, 0, 10), _bar(symbol, 1, 20)]},
-        latest_by_key={symbol.key: _bar(symbol, 2, 30)},
+        latest_by_key={symbol.key: _bar(symbol, 2, 30, resolution="daily")},
     )
     engine = IndicatorEngine()
     engine.register_universe("swing-kor", universe)

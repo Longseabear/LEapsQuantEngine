@@ -134,6 +134,9 @@ def test_background_snapshot_worker_warms_up_then_publishes_cycles():
     assert [cycle.cycle_index for cycle in report.cycles] == [1, 2]
     assert all(cycle.updated_symbol_count == 2 for cycle in report.cycles)
     assert all(cycle.ready_count_min == 2 for cycle in report.cycles)
+    assert all(cycle.indicator_update_count == 0 for cycle in report.cycles)
+    assert all(cycle.indicator_resolution_mismatch_count == 4 for cycle in report.cycles)
+    assert report.cycles[0].to_dict()["indicator_resolution_mismatch_count"] == 4
     assert len(history_provider.calls) == 2
     assert len(live_provider.calls) == 4
     active = worker.stores_by_sleeve["swing-kor"].active()

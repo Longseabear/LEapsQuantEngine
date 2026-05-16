@@ -185,6 +185,14 @@ class SnapshotContext:
         symbol_key = symbol.key if isinstance(symbol, Symbol) else symbol
         return self.indicator_snapshot.ready_values(symbol_key)
 
+    def metadata(self, symbol: Symbol | str) -> Mapping[str, Any]:
+        symbol_key = symbol.key if isinstance(symbol, Symbol) else symbol
+        return self.indicator_snapshot.metadata(symbol_key)
+
+    def metadata_value(self, symbol: Symbol | str, name: str, default: Any = None) -> Any:
+        symbol_key = symbol.key if isinstance(symbol, Symbol) else symbol
+        return self.indicator_snapshot.metadata_value(symbol_key, name, default)
+
     def fundamental(self, symbol: Symbol | str, name: str) -> float | None:
         if self.fundamental_snapshot is None:
             return None

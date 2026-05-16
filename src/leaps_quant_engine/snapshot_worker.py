@@ -36,6 +36,8 @@ class SnapshotWorkerCycleReport:
     failed_symbol_count: int
     indicator_count_per_symbol: int
     indicator_updates_estimated: int
+    indicator_update_count: int
+    indicator_resolution_mismatch_count: int
     market_snapshot_id: str
     indicator_snapshot_id: str
     snapshot_as_of: str
@@ -63,6 +65,8 @@ class SnapshotWorkerCycleReport:
             "failed_symbol_count": self.failed_symbol_count,
             "indicator_count_per_symbol": self.indicator_count_per_symbol,
             "indicator_updates_estimated": self.indicator_updates_estimated,
+            "indicator_update_count": self.indicator_update_count,
+            "indicator_resolution_mismatch_count": self.indicator_resolution_mismatch_count,
             "market_snapshot_id": self.market_snapshot_id,
             "indicator_snapshot_id": self.indicator_snapshot_id,
             "snapshot_as_of": self.snapshot_as_of,
@@ -233,6 +237,7 @@ class BackgroundSnapshotWorker:
             universe_id_by_sleeve={self.sleeve_id: self.universe.id},
             quality_report_by_sleeve={self.sleeve_id: quality_report},
         )
+        indicator_update_report = self.snapshot_engine.last_indicator_update_report
         indicator_update_ms = (time.perf_counter() - update_started) * 1000
         indicator_snapshot = indicator_snapshots[self.sleeve_id]
         insight_batch = self._run_alpha(indicator_snapshot)
@@ -251,6 +256,8 @@ class BackgroundSnapshotWorker:
             failed_symbol_count=collection.report.failed_symbol_count,
             indicator_count_per_symbol=len(self.universe.indicators),
             indicator_updates_estimated=collection.report.collected_symbol_count * len(self.universe.indicators),
+            indicator_update_count=indicator_update_report.updated_count,
+            indicator_resolution_mismatch_count=indicator_update_report.resolution_mismatch_count,
             market_snapshot_id=collection.snapshot.snapshot_id,
             indicator_snapshot_id=indicator_snapshot.snapshot_id,
             snapshot_as_of=indicator_snapshot.as_of.isoformat(),

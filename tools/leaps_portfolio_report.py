@@ -17,6 +17,8 @@ DEFAULT_CONFIG = ROOT / "configs" / "runtime" / "live_multi_sleeve.json"
 DEFAULT_OUT_DIR = ROOT / "data" / "runtime" / "portfolio-reports"
 DEFAULT_ACCOUNT_STORE = ROOT / "data" / "virtual-accounts" / "kis_domestic.json"
 DEFAULT_FRAMEWORK_STATE_DIR = ROOT / "data" / "runtime" / "framework-state"
+DEFAULT_MULTI_FRAMEWORK_STATE_DIR = DEFAULT_FRAMEWORK_STATE_DIR / "multi-sleeve"
+DEFAULT_LIVE_ORDER_BATCH = ROOT / "data" / "runtime" / "live-order-loop" / "multi_sleeve_candidate_orders.json"
 
 
 def main() -> int:
@@ -24,12 +26,27 @@ def main() -> int:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--sleeve-id", default="LEaps")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
-    parser.add_argument("--account-store", default=str(DEFAULT_ACCOUNT_STORE))
+    parser.add_argument("--account-store")
     parser.add_argument("--framework-state")
+    parser.add_argument("--order-batch", default=str(DEFAULT_LIVE_ORDER_BATCH))
+    parser.add_argument("--order-status-json")
+    parser.add_argument(
+        "--mode",
+        choices=("latest-target", "fast-current", "recompute"),
+        default="latest-target",
+        help=(
+            "latest-target reads the latest live-cycle artifacts, fast-current reads "
+            "account/order state only, and recompute runs runtime-run-once."
+        ),
+    )
     parser.add_argument("--notify", action="store_true")
     parser.add_argument("--title", default="LEaps Portfolio Report")
     parser.add_argument("--layout", choices=("mobile", "table"), default="mobile")
     args = parser.parse_args()
+
+    config_path = Path(args.config)
+    account_store_path = _account_store_path(config_path, args.sleeve_id, args.account_store)
+    framework_state_path = _framework_state_path(args.framework_state, args.sleeve_id)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -38,16 +55,33 @@ def main() -> int:
     order_batch_path = out_dir / f"{args.sleeve_id}_orders_{timestamp}.json"
     message_path = out_dir / f"{args.sleeve_id}_message_{timestamp}.txt"
 
-    payload = _run_runtime_once(
-        config=Path(args.config),
-        sleeve_id=args.sleeve_id,
-        order_batch_path=order_batch_path,
-        framework_state_path=_framework_state_path(args.framework_state, args.sleeve_id),
-    )
+    if args.mode == "recompute":
+        payload = _run_runtime_once(
+            config=config_path,
+            sleeve_id=args.sleeve_id,
+            order_batch_path=order_batch_path,
+            framework_state_path=framework_state_path,
+        )
+        payload.setdefault("report_source", {})["mode"] = "recompute"
+    else:
+        order_status_payload = _load_order_status_payload(
+            config=config_path,
+            sleeve_id=args.sleeve_id,
+            order_status_json=Path(args.order_status_json) if args.order_status_json else None,
+        )
+        payload = _build_fast_report_payload(
+            config=config_path,
+            sleeve_id=args.sleeve_id,
+            mode=args.mode,
+            account_store_path=account_store_path,
+            framework_state_path=framework_state_path,
+            order_batch_path=Path(args.order_batch),
+            order_status_payload=order_status_payload,
+        )
     report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    symbol_names = _symbol_names_from_config(Path(args.config), args.sleeve_id)
-    account_payload = _read_json(Path(args.account_store))
+    symbol_names = _symbol_names_from_config(config_path, args.sleeve_id)
+    account_payload = _read_json(account_store_path)
     realized = _realized_pnl_from_account_store(account_payload, sleeve_id=args.sleeve_id)
     message = _format_report(
         payload,
@@ -119,7 +153,544 @@ def _framework_state_path(value: str | None, sleeve_id: str) -> Path | None:
     if value:
         return Path(value)
     safe_sleeve_id = "".join(char if char.isalnum() or char in "._-" else "_" for char in sleeve_id)
+    multi_sleeve_path = DEFAULT_MULTI_FRAMEWORK_STATE_DIR / f"{safe_sleeve_id}.json"
+    if multi_sleeve_path.exists():
+        return multi_sleeve_path
     return DEFAULT_FRAMEWORK_STATE_DIR / f"{safe_sleeve_id}.json"
+
+
+def _account_store_path(config: Path, sleeve_id: str, value: str | None) -> Path:
+    if value:
+        return Path(value)
+    config_payload = _read_json(config)
+    sleeve = _sleeve_payload(config_payload, sleeve_id)
+    account_id = None
+    if sleeve:
+        routes = sleeve.get("broker_account_routes")
+        if isinstance(routes, Mapping) and routes:
+            account_id = str(next(iter(routes.values())))
+        account_id = account_id or str(sleeve.get("broker_account_id") or "")
+    for account in config_payload.get("broker_accounts", []) or []:
+        if not isinstance(account, Mapping) or str(account.get("account_id") or "") != account_id:
+            continue
+        raw_path = account.get("account_store_path")
+        if raw_path:
+            return _resolve_config_path(config, Path(str(raw_path)))
+    return DEFAULT_ACCOUNT_STORE
+
+
+def _load_order_status_payload(
+    *,
+    config: Path,
+    sleeve_id: str,
+    order_status_json: Path | None,
+) -> dict[str, Any]:
+    if order_status_json is not None:
+        return _read_json(order_status_json)
+    try:
+        return _run_order_runtime_status(config=config, sleeve_id=sleeve_id)
+    except RuntimeError as exc:
+        return {"error": str(exc), "needs_attention": True, "routes": []}
+
+
+def _run_order_runtime_status(*, config: Path, sleeve_id: str) -> dict[str, Any]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    command = [
+        sys.executable,
+        "-m",
+        "leaps_quant_engine.cli",
+        "order-runtime-status",
+        str(config),
+        "--sleeve-id",
+        sleeve_id,
+        "--recent-events",
+        "5",
+        "--summary-only",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    stdout = completed.stdout.strip()
+    if completed.returncode != 0 or not stdout:
+        raise RuntimeError(
+            "order-runtime-status failed. "
+            f"returncode={completed.returncode}, stderr={completed.stderr.strip()}, stdout={stdout[:500]}"
+        )
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "order-runtime-status output was not valid JSON. "
+            f"returncode={completed.returncode}, stderr={completed.stderr.strip()}, stdout_prefix={stdout[:500]}"
+        ) from exc
+
+
+def _build_fast_report_payload(
+    *,
+    config: Path,
+    sleeve_id: str,
+    mode: str,
+    account_store_path: Path,
+    framework_state_path: Path | None,
+    order_batch_path: Path,
+    order_status_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    config_payload = _read_json(config)
+    account_payload = _read_json(account_store_path)
+    framework_state = _read_json(framework_state_path) if framework_state_path is not None else {}
+    order_batch = _read_json(order_batch_path)
+    orders = _orders_for_sleeve(order_batch, sleeve_id)
+    price_by_symbol = _latest_price_by_symbol(framework_state, orders)
+    order_runtime_summary = _order_runtime_summary_for_sleeve(order_status_payload, sleeve_id)
+    currency = _default_currency_for_sleeve(config_payload, sleeve_id, order_runtime_summary)
+    current = _current_portfolio_snapshot(
+        sleeve_id=sleeve_id,
+        account_payload=account_payload,
+        order_runtime_summary=order_runtime_summary,
+        price_by_symbol=price_by_symbol,
+        currency=currency,
+    )
+    cycle_quality = _latest_cycle_snapshot_quality(config, config_payload, sleeve_id)
+    warnings = _fast_report_warnings(
+        mode=mode,
+        framework_state_path=framework_state_path,
+        framework_state=framework_state,
+        order_batch_path=order_batch_path,
+        order_batch=order_batch,
+        order_status_payload=order_status_payload,
+    )
+    framework_payload = _framework_payload_from_artifacts(
+        mode=mode,
+        framework_state=framework_state,
+        orders=orders,
+        current=current,
+    )
+    return {
+        "report_source": {
+            "mode": mode,
+            "generated_at": datetime.now().isoformat(),
+            "config": str(config),
+            "account_store_path": str(account_store_path),
+            "framework_state_path": str(framework_state_path) if framework_state_path is not None else None,
+            "framework_state_updated_at": framework_state.get("updated_at"),
+            "order_batch_path": str(order_batch_path),
+            "order_batch_generated_at": order_batch.get("generated_at"),
+            "read_only": True,
+        },
+        "engine_status": {
+            "framework": {
+                "active_insight_count": len(framework_state.get("active_insights", []) or []),
+            },
+            "snapshot": {
+                "status": cycle_quality.get("status"),
+                "updated_symbol_count": cycle_quality.get("collected_symbol_count"),
+            },
+        },
+        "worker": {"cycles": [{"snapshot_quality": cycle_quality}]},
+        "portfolio_state": {"current": current},
+        "framework": framework_payload,
+        "order_runtime_status": order_runtime_summary,
+        "warnings": warnings,
+    }
+
+
+def _fast_report_warnings(
+    *,
+    mode: str,
+    framework_state_path: Path | None,
+    framework_state: Mapping[str, Any],
+    order_batch_path: Path,
+    order_batch: Mapping[str, Any],
+    order_status_payload: Mapping[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    if order_status_payload.get("error"):
+        warnings.append(f"order-runtime-status read failed: {order_status_payload.get('error')}")
+    if mode == "latest-target":
+        if framework_state_path is None or not framework_state:
+            warnings.append("latest framework-state artifact missing; target view may be incomplete")
+        if not order_batch:
+            warnings.append("latest order-batch artifact missing; candidate order view may be incomplete")
+    return warnings
+
+
+def _framework_payload_from_artifacts(
+    *,
+    mode: str,
+    framework_state: Mapping[str, Any],
+    orders: list[Mapping[str, Any]],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    if mode == "fast-current":
+        return {
+            "risk": {"decisions": []},
+            "execution": {"order_count": 0},
+            "order_intents": [],
+        }
+    order_plans = _target_plans_from_framework_state(framework_state)
+    order_plans_by_symbol = {str(plan.get("symbol") or ""): dict(plan) for plan in order_plans if plan.get("symbol")}
+    current_quantities = {
+        str(item.get("symbol")): int(item.get("quantity") or 0)
+        for item in current.get("holdings", []) or []
+        if item.get("symbol")
+    }
+    for order in orders:
+        symbol = str(order.get("symbol") or "")
+        if not symbol:
+            continue
+        metadata = order.get("metadata") if isinstance(order.get("metadata"), Mapping) else {}
+        target_quantity = metadata.get("target_quantity")
+        if target_quantity is None:
+            current_quantity = int(metadata.get("current_quantity") or current_quantities.get(symbol, 0))
+            quantity = int(order.get("quantity") or 0)
+            side = str(order.get("side") or "").lower()
+            target_quantity = current_quantity + quantity if side == "buy" else current_quantity - quantity
+        order_plans_by_symbol[symbol] = {
+            "symbol": symbol,
+            "target_quantity": int(target_quantity or 0),
+            "risk_status": "approved",
+            "risk_reason": "",
+            "reason": "latest_candidate_order",
+        }
+    return {
+        "portfolio_target_batch": framework_state.get("last_portfolio_target_batch") or {},
+        "order_sizing": {"plans": list(order_plans_by_symbol.values())},
+        "risk": {"decisions": []},
+        "execution": {"order_count": len(orders)},
+        "order_intents": [dict(order) for order in orders],
+    }
+
+
+def _target_plans_from_framework_state(framework_state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    batch = framework_state.get("last_portfolio_target_batch")
+    if not isinstance(batch, Mapping):
+        return []
+    plans: list[dict[str, Any]] = []
+    for plan in batch.get("plans", []) or []:
+        if not isinstance(plan, Mapping):
+            continue
+        symbol = str(plan.get("symbol") or "")
+        if not symbol:
+            continue
+        target_quantity = _target_quantity_from_plan(plan)
+        plans.append(
+            {
+                "symbol": symbol,
+                "target_quantity": target_quantity,
+                "risk_status": "latest_target",
+                "risk_reason": "",
+                "reason": "latest_live_target",
+                "target_percent": plan.get("target_percent"),
+            }
+        )
+    return plans
+
+
+def _target_quantity_from_plan(plan: Mapping[str, Any]) -> int:
+    price = _float_or_none(plan.get("current_price"))
+    desired_value = _float_or_none(plan.get("desired_value"))
+    if price is not None and price > 0 and desired_value is not None:
+        return max(int(desired_value // price), 0)
+    return max(int(plan.get("current_quantity") or 0), 0)
+
+
+def _orders_for_sleeve(order_batch: Mapping[str, Any], sleeve_id: str) -> list[Mapping[str, Any]]:
+    orders: list[Mapping[str, Any]] = []
+    for batch in order_batch.get("batches", []) or []:
+        if not isinstance(batch, Mapping) or str(batch.get("sleeve_id") or "") != sleeve_id:
+            continue
+        for order in batch.get("orders", []) or []:
+            if isinstance(order, Mapping):
+                orders.append(order)
+    return orders
+
+
+def _latest_price_by_symbol(
+    framework_state: Mapping[str, Any],
+    orders: list[Mapping[str, Any]],
+) -> dict[str, float]:
+    prices: dict[str, float] = {}
+    batch = framework_state.get("last_portfolio_target_batch")
+    if isinstance(batch, Mapping):
+        for plan in batch.get("plans", []) or []:
+            if not isinstance(plan, Mapping):
+                continue
+            symbol = str(plan.get("symbol") or "")
+            price = _float_or_none(plan.get("current_price"))
+            if symbol and price is not None and price > 0:
+                prices[symbol] = price
+    for order in orders:
+        symbol = str(order.get("symbol") or "")
+        price = _float_or_none(order.get("reference_price")) or _float_or_none(order.get("limit_price"))
+        if symbol and price is not None and price > 0:
+            prices.setdefault(symbol, price)
+    return prices
+
+
+def _order_runtime_summary_for_sleeve(
+    order_status_payload: Mapping[str, Any],
+    sleeve_id: str,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "needs_attention": bool(order_status_payload.get("needs_attention")),
+        "open_ticket_count": 0,
+        "pending_buy_notional": 0.0,
+        "pending_sell_quantities": {},
+        "open_tickets": [],
+        "sleeve_portfolios": [],
+    }
+    for route in order_status_payload.get("routes", []) or []:
+        if not isinstance(route, Mapping):
+            continue
+        currency = str(route.get("currency") or "").upper()
+        runtime = route.get("order_runtime") if isinstance(route.get("order_runtime"), Mapping) else {}
+        for ticket in runtime.get("open_tickets", []) or []:
+            if not isinstance(ticket, Mapping) or str(ticket.get("sleeve_id") or "") != sleeve_id:
+                continue
+            enriched = dict(ticket)
+            if currency:
+                enriched.setdefault("currency", currency)
+            enriched.setdefault("broker_account_id", route.get("broker_account_id"))
+            summary["open_tickets"].append(enriched)
+        for sleeve in route.get("sleeves", []) or []:
+            if not isinstance(sleeve, Mapping) or str(sleeve.get("sleeve_id") or "") != sleeve_id:
+                continue
+            sleeve_payload = dict(sleeve)
+            sleeve_payload.setdefault("currency", currency)
+            sleeve_payload.setdefault("market_scope", route.get("market_scope"))
+            summary["sleeve_portfolios"].append(sleeve_payload)
+            summary["open_ticket_count"] += int(sleeve.get("open_ticket_count") or 0)
+            summary["pending_buy_notional"] += float(sleeve.get("pending_buy_notional") or 0.0)
+            pending_sells = sleeve.get("pending_sell_quantities") if isinstance(sleeve.get("pending_sell_quantities"), Mapping) else {}
+            for symbol, quantity in pending_sells.items():
+                summary["pending_sell_quantities"][str(symbol)] = (
+                    float(summary["pending_sell_quantities"].get(str(symbol), 0.0)) + float(quantity or 0.0)
+                )
+    if not summary["open_ticket_count"]:
+        summary["open_ticket_count"] = len(summary["open_tickets"])
+    return summary
+
+
+def _default_currency_for_sleeve(
+    config_payload: Mapping[str, Any],
+    sleeve_id: str,
+    order_runtime_summary: Mapping[str, Any],
+) -> str:
+    portfolios = order_runtime_summary.get("sleeve_portfolios", []) or []
+    for portfolio in portfolios:
+        currency = str(portfolio.get("currency") or "").upper() if isinstance(portfolio, Mapping) else ""
+        if currency:
+            return currency
+    sleeve = _sleeve_payload(config_payload, sleeve_id)
+    account_id = None
+    if sleeve:
+        routes = sleeve.get("broker_account_routes")
+        if isinstance(routes, Mapping) and routes:
+            account_id = str(next(iter(routes.values())))
+        account_id = account_id or str(sleeve.get("broker_account_id") or "")
+    for account in config_payload.get("broker_accounts", []) or []:
+        if isinstance(account, Mapping) and str(account.get("account_id") or "") == account_id:
+            currency = str(account.get("currency") or "").upper()
+            if currency:
+                return currency
+    return "KRW"
+
+
+def _current_portfolio_snapshot(
+    *,
+    sleeve_id: str,
+    account_payload: Mapping[str, Any],
+    order_runtime_summary: Mapping[str, Any],
+    price_by_symbol: Mapping[str, float],
+    currency: str,
+) -> dict[str, Any]:
+    portfolios = order_runtime_summary.get("sleeve_portfolios", []) or []
+    if portfolios:
+        portfolio = _merge_order_status_portfolios(portfolios, currency)
+    else:
+        portfolio = _portfolio_from_account_store(account_payload, sleeve_id, currency)
+    holdings = [
+        _enriched_holding(item, price_by_symbol=price_by_symbol)
+        for item in portfolio.get("holdings", []) or []
+        if isinstance(item, Mapping)
+    ]
+    cash_by_currency = dict(portfolio.get("cash_by_currency") or {})
+    cash = _float_or_none(portfolio.get("cash"))
+    if cash is None:
+        cash = float(sum(float(value or 0.0) for value in cash_by_currency.values()))
+    exposure = sum(float(item.get("market_value") or 0.0) for item in holdings)
+    equity = cash + exposure
+    result = {
+        "currency": currency,
+        "cash": cash,
+        "cash_by_currency": cash_by_currency or ({currency: cash} if currency else {}),
+        "equity": equity,
+        "gross_exposure": exposure,
+        "gross_exposure_pct": exposure / equity if equity > 0 else 0.0,
+        "holdings": holdings,
+    }
+    if currency:
+        result["equity_by_currency"] = {currency: equity}
+    return result
+
+
+def _merge_order_status_portfolios(portfolios: list[Mapping[str, Any]], currency: str) -> dict[str, Any]:
+    cash_by_currency: dict[str, float] = {}
+    holdings: dict[str, dict[str, Any]] = {}
+    for sleeve_payload in portfolios:
+        portfolio = sleeve_payload.get("portfolio") if isinstance(sleeve_payload.get("portfolio"), Mapping) else {}
+        for key, value in dict(portfolio.get("cash_by_currency") or {}).items():
+            cash_by_currency[str(key).upper()] = cash_by_currency.get(str(key).upper(), 0.0) + float(value or 0.0)
+        if not portfolio.get("cash_by_currency") and portfolio.get("cash") is not None:
+            cash_by_currency[currency] = cash_by_currency.get(currency, 0.0) + float(portfolio.get("cash") or 0.0)
+        for item in portfolio.get("holdings", []) or []:
+            if not isinstance(item, Mapping):
+                continue
+            symbol = _symbol_key_from_holding(item)
+            if not symbol:
+                continue
+            existing = holdings.setdefault(
+                symbol,
+                {
+                    "symbol": symbol,
+                    "quantity": 0.0,
+                    "average_price": 0.0,
+                    "cost_basis": 0.0,
+                },
+            )
+            quantity = float(item.get("quantity") or 0.0)
+            average_price = float(item.get("average_price") or 0.0)
+            existing["quantity"] = float(existing.get("quantity") or 0.0) + quantity
+            existing["cost_basis"] = float(existing.get("cost_basis") or 0.0) + quantity * average_price
+            if existing["quantity"] > 0:
+                existing["average_price"] = existing["cost_basis"] / existing["quantity"]
+    cash = sum(cash_by_currency.values())
+    return {"cash": cash, "cash_by_currency": cash_by_currency, "holdings": list(holdings.values())}
+
+
+def _portfolio_from_account_store(
+    account_payload: Mapping[str, Any],
+    sleeve_id: str,
+    currency: str,
+) -> dict[str, Any]:
+    sleeve = (account_payload.get("sleeves") or {}).get(sleeve_id)
+    if not isinstance(sleeve, Mapping):
+        return {"cash": 0.0, "cash_by_currency": {currency: 0.0}, "holdings": []}
+    holdings_payload = sleeve.get("holdings") or {}
+    holdings = holdings_payload.values() if isinstance(holdings_payload, Mapping) else holdings_payload
+    return {
+        "cash": float(sleeve.get("cash") or 0.0),
+        "cash_by_currency": dict(sleeve.get("cash_by_currency") or ({currency: float(sleeve.get("cash") or 0.0)})),
+        "holdings": [
+            {
+                "symbol": _symbol_key_from_holding(item),
+                "quantity": item.get("quantity"),
+                "average_price": item.get("average_price"),
+            }
+            for item in holdings
+            if isinstance(item, Mapping) and _symbol_key_from_holding(item)
+        ],
+    }
+
+
+def _enriched_holding(
+    item: Mapping[str, Any],
+    *,
+    price_by_symbol: Mapping[str, float],
+) -> dict[str, Any]:
+    symbol = _symbol_key_from_holding(item)
+    quantity = float(item.get("quantity") or 0.0)
+    average_price = float(item.get("average_price") or 0.0)
+    market_price = _float_or_none(item.get("market_price")) or price_by_symbol.get(symbol) or average_price
+    market_value = quantity * market_price
+    cost_basis = quantity * average_price
+    pnl = market_value - cost_basis
+    return {
+        "symbol": symbol,
+        "quantity": int(quantity) if quantity.is_integer() else quantity,
+        "average_price": average_price,
+        "market_price": market_price,
+        "market_value": market_value,
+        "cost_basis": cost_basis,
+        "unrealized_pnl": pnl,
+        "unrealized_pnl_pct": pnl / cost_basis if cost_basis > 0 else None,
+    }
+
+
+def _symbol_key_from_holding(item: Mapping[str, Any]) -> str:
+    raw_symbol = item.get("symbol")
+    if isinstance(raw_symbol, str):
+        if ":" in raw_symbol:
+            return raw_symbol
+        market = str(item.get("market") or "").strip()
+        return f"{market}:{raw_symbol}" if market else raw_symbol
+    if isinstance(raw_symbol, Mapping):
+        ticker = str(raw_symbol.get("ticker") or "").strip()
+        market = str(raw_symbol.get("market") or item.get("market") or "").strip()
+        return f"{market}:{ticker}" if market and ticker else ticker
+    ticker = str(item.get("ticker") or "").strip()
+    market = str(item.get("market") or "").strip()
+    return f"{market}:{ticker}" if market and ticker else ticker
+
+
+def _latest_cycle_snapshot_quality(
+    config: Path,
+    config_payload: Mapping[str, Any],
+    sleeve_id: str,
+) -> dict[str, Any]:
+    journal_path = _journal_path(config, config_payload)
+    entry = _latest_cycle_entry(journal_path, sleeve_id) if journal_path is not None else {}
+    if not entry:
+        return {"status": "unknown", "collected_symbol_count": None, "requested_symbol_count": None}
+    counts = entry.get("counts") if isinstance(entry.get("counts"), Mapping) else {}
+    updated_count = entry.get("updated_symbol_count", counts.get("updated_symbol_count"))
+    failed_count = entry.get("failed_symbol_count", counts.get("failed_symbol_count"))
+    requested_count = entry.get("requested_symbol_count", counts.get("requested_symbol_count"))
+    if requested_count is None and updated_count is not None and failed_count is not None:
+        requested_count = int(updated_count or 0) + int(failed_count or 0)
+    return {
+        "status": entry.get("snapshot_status"),
+        "collected_symbol_count": updated_count,
+        "requested_symbol_count": requested_count,
+        "failed_symbol_count": failed_count,
+        "source": entry.get("source"),
+        "ended_at": entry.get("ended_at") or entry.get("generated_at"),
+    }
+
+
+def _journal_path(config: Path, config_payload: Mapping[str, Any]) -> Path | None:
+    raw_path = config_payload.get("journal_path")
+    if not raw_path:
+        return None
+    return _resolve_config_path(config, Path(str(raw_path)))
+
+
+def _latest_cycle_entry(journal_path: Path, sleeve_id: str) -> dict[str, Any]:
+    try:
+        lines = journal_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for raw in reversed(lines):
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if str(entry.get("sleeve_id") or "") != sleeve_id:
+            continue
+        if entry.get("source") not in {"runtime-run-once", "runtime-run-multi-once"}:
+            continue
+        if entry.get("snapshot_status") is None:
+            continue
+        return entry
+    return {}
 
 
 def _send_notification(*, title: str, message_path: Path) -> None:
@@ -177,6 +748,8 @@ def _format_report(
     execution = framework.get("execution", {}) or {}
     snapshot_quality = _snapshot_quality(payload)
     warnings = payload.get("warnings") or []
+    report_source = payload.get("report_source", {}) or {}
+    order_runtime_status = payload.get("order_runtime_status", {}) or {}
 
     current_by_symbol = {
         item.get("symbol"): item
@@ -200,6 +773,7 @@ def _format_report(
     lines = [
         f"[{sleeve_id}] 운용 현황",
         f"기준: {now}",
+        f"소스: {_report_source_label(report_source)}",
         f"데이터: {snapshot_quality.get('status', 'unknown')} "
         f"({snapshot_quality.get('collected_symbol_count', '?')}/{snapshot_quality.get('requested_symbol_count', '?')})",
         "",
@@ -208,6 +782,7 @@ def _format_report(
         f"- 현금: {_money(cash, currency)} {currency}",
         f"- 주식 평가액: {_money(exposure, currency)} {currency} ({_pct(exposure_pct)})",
         f"- 주문 후보: {execution.get('order_count', 0)}건",
+        f"- 미체결 티켓: {_open_ticket_count(order_runtime_status)}건",
         f"- 활성 인사이트: {engine_status.get('framework', {}).get('active_insight_count', '-')}",
         "",
         "손익",
@@ -259,12 +834,22 @@ def _format_report(
         else:
             lines.extend(order_lines)
 
+    open_ticket_lines = _open_ticket_lines(order_runtime_status, symbol_names, currency, layout=layout)
+    if open_ticket_lines:
+        lines.extend(["", "미체결 주문"])
+        if layout == "table":
+            lines.extend(_markdown_code_block(open_ticket_lines))
+        else:
+            lines.extend(open_ticket_lines)
+
     blend_lines = _portfolio_blend_lines(framework)
     if blend_lines:
         lines.extend(["", "Portfolio Blend"])
         lines.extend(f"- {line}" for line in blend_lines)
 
     attention = _attention_lines(snapshot_quality, execution, risk, warnings)
+    if order_runtime_status.get("needs_attention"):
+        attention.append("Order runtime needs_attention=true")
     if attention:
         lines.extend(["", "확인 필요"])
         lines.extend(f"- {line}" for line in attention)
@@ -313,6 +898,79 @@ def _holding_mobile_lines(
         if risk_note:
             lines.append(f"  {risk_note}")
     return lines
+
+
+def _report_source_label(report_source: Mapping[str, Any]) -> str:
+    mode = str(report_source.get("mode") or "unknown")
+    if mode == "recompute":
+        return "recompute 새 계산"
+    if mode == "latest-target":
+        updated_at = report_source.get("framework_state_updated_at") or report_source.get("order_batch_generated_at")
+        suffix = f" ({updated_at})" if updated_at else ""
+        return f"latest live-cycle target{suffix}"
+    if mode == "fast-current":
+        return "fast current account/order state"
+    return mode
+
+
+def _open_ticket_count(order_runtime_status: Mapping[str, Any]) -> int:
+    value = order_runtime_status.get("open_ticket_count")
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    return len(order_runtime_status.get("open_tickets", []) or [])
+
+
+def _open_ticket_lines(
+    order_runtime_status: Mapping[str, Any],
+    symbol_names: Mapping[str, str],
+    currency: str,
+    *,
+    layout: str = "mobile",
+) -> list[str]:
+    tickets = [ticket for ticket in order_runtime_status.get("open_tickets", []) or [] if isinstance(ticket, Mapping)]
+    if not tickets:
+        return []
+    rows: list[list[str]] = []
+    lines: list[str] = []
+    for ticket in tickets[:8]:
+        symbol = str(ticket.get("symbol") or "")
+        side = _side_label(ticket.get("side"))
+        quantity = int(ticket.get("remaining_quantity") or ticket.get("quantity") or 0)
+        status = str(ticket.get("status") or "-")
+        limit_price = ticket.get("limit_price")
+        broker_order_id = ticket.get("broker_order_id") or "-"
+        if layout == "table":
+            rows.append(
+                [
+                    _format_symbol(symbol, symbol_names),
+                    side,
+                    f"{quantity}주",
+                    _money(limit_price, currency),
+                    status,
+                    str(broker_order_id),
+                ]
+            )
+        else:
+            lines.append(
+                f"- {_mobile_symbol_label(symbol, symbol_names)} {side} {quantity}주 "
+                f"limit {_money(limit_price, currency)} / {status} / {broker_order_id}"
+            )
+    if layout != "table":
+        if len(tickets) > 8:
+            lines.append(f"- 외 {len(tickets) - 8}건")
+        return lines
+    table = _format_table(
+        ["종목", "방향", "잔량", "지정가", "상태", "주문번호"],
+        rows,
+        max_widths=[22, 4, 5, 10, 10, 18],
+        right_align={2, 3},
+    )
+    if len(tickets) > 8:
+        table.append(f"외 {len(tickets) - 8}건")
+    return table
 
 
 def _snapshot_quality(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -392,10 +1050,12 @@ def _target_by_symbol(
     for plan in order_sizing.get("plans", []) or []:
         symbol = plan.get("symbol")
         if symbol:
+            risk_status = plan.get("risk_status")
+            risk_reason = plan.get("risk_reason")
             targets[symbol] = {
                 "target_quantity": plan.get("target_quantity"),
-                "risk_status": "pending_risk",
-                "risk_reason": plan.get("reason", ""),
+                "risk_status": risk_status if risk_status is not None else "pending_risk",
+                "risk_reason": risk_reason if risk_reason is not None else plan.get("reason", ""),
             }
     for decision in risk.get("decisions", []) or []:
         symbol = decision.get("symbol")
@@ -622,7 +1282,7 @@ def _attention_lines(
 def _risk_note(target_item: Mapping[str, Any]) -> str:
     status = str(target_item.get("risk_status") or "")
     reason = str(target_item.get("risk_reason") or "")
-    if status in {"", "hold", "approved"} and reason in {"", "no_delta"}:
+    if status in {"", "hold", "approved", "latest_target", "latest_candidate"} and reason in {"", "no_delta"}:
         return ""
     return f"리스크 {status}:{_friendly_risk_reason(reason, target_item.get('risk_metadata') or {})}"
 

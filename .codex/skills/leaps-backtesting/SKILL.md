@@ -64,6 +64,16 @@ py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_wor
 Use `--source kis-cache` only for short cache/integration smokes where cached
 history is known to exist.
 
+Runtime backtest reports include a `timings` block. Use it to separate
+`config_bootstrap_ms`, daily `history_feed_build_ms` or minute `feed_load_ms`,
+`daily_warmup_ms`, `framework_replay_ms`, `report_generation_ms`, and
+`total_ms`.
+
+FinanceDataReader daily history is cache-first by default under
+`data/runtime/cache/finance-datareader/daily`. Delete that ignored cache
+directory to rebuild from scratch, or pass `--refresh-history` to force a fresh
+download for the requested date ranges.
+
 ## Runtime Minute Backtest
 
 Use this when debugging daily alpha or portfolio cadence on minute cycles:
@@ -106,6 +116,46 @@ requests before writing one standard replay CSV.
 If the downloader returns `empty` or `partial`, report data availability rather
 than a backtest CLI limitation.
 
+## Minute Cache
+
+For KRX research universes, prefer a rolling minute cache over ad hoc one-off
+feeds:
+
+```powershell
+py -3 -m leaps_quant_engine.cli minute-cache-build configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --cache-root data/replay/minute-cache `
+  --start 2026-04-16 `
+  --end 2026-05-15 `
+  --provider yfinance `
+  --max-symbols 200 `
+  --overwrite `
+  --summary-only
+```
+
+The cache writes per-day `YYYY-MM-DD.csv.gz` files under
+`data/replay/minute-cache/<universe-id>/`. KRX yfinance requests use universe
+metadata: KOSPI symbols map to `.KS`, KOSDAQ symbols map to `.KQ`, while replay
+rows stay normalized as `KRX:<ticker>`.
+
+Export cached bars to a standard minute feed:
+
+```powershell
+py -3 -m leaps_quant_engine.cli minute-cache-export configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --cache-root data/replay/minute-cache `
+  --output data/replay/leaps_krx_20260416_20260515_minute.csv `
+  --start 2026-04-16T09:00:00 `
+  --end 2026-05-15T15:30:00 `
+  --summary-only
+```
+
+`runtime-backtest-minute` can read the cache directly with
+`--minute-cache-root`; it loads cache day files directly and preserves the
+standard sorted `DataSlice` replay shape without an intermediate feed file.
+Missing weekdays are reported as `missing_weekday_cache_day`; KRX holidays can
+appear there until a full exchange calendar is attached.
+
 ## Warmup Rule
 
 Always separate indicator warmup from evaluation. For a short test such as
@@ -114,6 +164,19 @@ Always separate indicator warmup from evaluation. For a short test such as
 Cold daily momentum, SMA, ATR, volatility, or liquidity indicators can make a
 strategy look inactive even when the model would have produced signals after
 warmup.
+
+## Opening Gap Proxy
+
+Daily runtime/framework backtests attach a `daily_ohlc_proxy` opening context
+to daily `Bar.metadata`. When a previous close exists, models can read
+`previous_close`, `opening_gap_pct`, `open_to_close_return_pct`,
+`open_to_low_drawdown_pct`, `open_to_high_runup_pct`, and `gap_filled`.
+
+Treat these as long-horizon daily OHLC proxies for overnight/opening behavior,
+not as proof that the model saw historical pre-open order-book data.
+
+Alpha models read the proxy through `context.metadata(symbol)` or
+`context.metadata_value(symbol, "opening_gap_pct")`.
 
 ## Debug Options
 
@@ -178,6 +241,32 @@ Replay with `--fundamentals-root`, `--fundamentals-market`, and repeated
 `--fundamental-name` flags.
 
 Missing PER/PBR for ETFs is normal. Models should skip or degrade gracefully.
+
+## Opening / Extended Session Replay
+
+When debugging KRX opening or after-hours behavior, build a session-tagged KIS
+minute cache instead of mixing those rows into daily indicators:
+
+```powershell
+py -3 -m leaps_quant_engine.cli minute-cache-build configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --cache-root data/replay/minute-cache `
+  --start 2026-05-15 `
+  --end 2026-05-15 `
+  --provider kis-cache `
+  --include-extended-hours `
+  --refresh-provider-cache `
+  --summary-only
+```
+
+`--include-extended-hours` writes session metadata columns and, for date-only
+KRX ranges, normalizes the day to `08:30-18:00`. Replay feeds preserve
+`market_session_phase`, `is_regular_market_open`, `is_orderable_session`, and
+`is_extended_market_hours` in `Bar.metadata`.
+
+Treat this as opening/execution context. Daily-confirmed indicators should still
+warm up from daily history and should not update from pre-open or after-hours
+minute rows.
 
 ## Multi-Market Rule
 

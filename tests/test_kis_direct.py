@@ -151,9 +151,12 @@ class _FakeSession:
                             "ovrs_excg_cd": "NASD",
                             "crcy_cd": "USD",
                             "cblc_qty13": "2",
-                            "ord_psbl_qty1": "2",
+                            "ccld_qty_smtl1": "4",
+                            "ord_psbl_qty1": "4",
+                            "thdt_buy_ccld_qty1": "2",
+                            "thdt_sll_ccld_qty1": "0",
                             "avg_unpr3": "570.25",
-                            "frcr_evlu_amt2": "1144.00",
+                            "frcr_evlu_amt2": "2288.00",
                         }
                     ],
                     "output3": {
@@ -309,6 +312,39 @@ def test_direct_kis_daily_history_uses_local_file_cache(tmp_path):
     assert session.get_calls == []
 
 
+def test_direct_kis_quote_retries_rate_limit_response(tmp_path, monkeypatch):
+    class _RateLimitThenSuccessSession(_FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.quote_attempts = 0
+
+        def get(self, url, *, headers=None, params=None, timeout=None):
+            if url.endswith("/uapi/domestic-stock/v1/quotations/inquire-price"):
+                self.quote_attempts += 1
+                if self.quote_attempts == 1:
+                    self.get_calls.append(
+                        {"url": url, "headers": dict(headers or {}), "params": dict(params or {})}
+                    )
+                    return _FakeResponse(
+                        {
+                            "rt_cd": "1",
+                            "msg_cd": "EGW00201",
+                            "msg1": "초당 거래건수를 초과하였습니다.",
+                        }
+                    )
+            return super().get(url, headers=headers, params=params, timeout=timeout)
+
+    monkeypatch.setattr("leaps_quant_engine.adapters.kis_direct.time.sleep", lambda seconds: None)
+    _TOKEN_CACHE.clear()
+    session = _RateLimitThenSuccessSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation("get_stock_price", {"market": "domestic", "symbol": "005930"})
+
+    assert session.quote_attempts == 2
+    assert result["last_price"] == 289500
+
+
 def test_direct_kis_limit_order_rejects_zero_price(tmp_path):
     _TOKEN_CACHE.clear()
     client = KISDirectClient(settings=_settings(), session=_FakeSession(), cache_dir=tmp_path)
@@ -444,6 +480,12 @@ def test_direct_kis_overseas_balance_uses_present_balance_endpoint(tmp_path):
     assert balance["buying_power"]["orderable_foreign_amount"] == 123.45
     assert holdings["holdings"][0]["symbol"] == "SMH"
     assert holdings["holdings"][0]["market"] == "US"
+    assert holdings["holdings"][0]["holding_quantity"] == 4
+    assert holdings["holdings"][0]["current_quantity"] == 4
+    assert holdings["holdings"][0]["settled_quantity"] == 2
+    assert holdings["holdings"][0]["orderable_quantity"] == 4
+    assert holdings["holdings"][0]["today_buy_quantity"] == 2
+    assert holdings["holdings"][0]["today_sell_quantity"] == 0
 
 
 def test_direct_kis_overseas_execution_history_uses_ccnl_endpoint(tmp_path):

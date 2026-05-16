@@ -106,6 +106,11 @@ class StandardExecutionModel:
     max_slice_notional: float | None = None
     max_slices: int | None = None
     tag_prefix: str = ""
+    urgency: str = ""
+    max_order_age_seconds: float | None = None
+    price_drift_bps: float | None = None
+    min_replace_interval_seconds: float | None = None
+    max_replacements: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_type", _coerce_order_type(self.order_type))
@@ -117,6 +122,14 @@ class StandardExecutionModel:
             raise ValueError("max_slice_notional must be positive when provided.")
         if self.max_slices is not None and self.max_slices <= 0:
             raise ValueError("max_slices must be positive when provided.")
+        if self.max_order_age_seconds is not None and self.max_order_age_seconds <= 0:
+            raise ValueError("max_order_age_seconds must be positive when provided.")
+        if self.price_drift_bps is not None and self.price_drift_bps < 0:
+            raise ValueError("price_drift_bps must be non-negative when provided.")
+        if self.min_replace_interval_seconds is not None and self.min_replace_interval_seconds < 0:
+            raise ValueError("min_replace_interval_seconds must be non-negative when provided.")
+        if self.max_replacements is not None and self.max_replacements < 0:
+            raise ValueError("max_replacements must be non-negative when provided.")
 
     def create_orders(
         self,
@@ -172,7 +185,8 @@ class StandardExecutionModel:
                             "slice_index": index,
                             "slice_count": slice_count,
                             "limit_offset_bps": self.limit_offset_bps,
-                        },
+                        }
+                        | _execution_policy_metadata(self),
                     )
                 )
         return orders
@@ -260,6 +274,22 @@ def _split_quantity(
         chunks.append(chunk)
         remaining -= chunk
     return tuple(chunks)
+
+
+def _execution_policy_metadata(model: StandardExecutionModel) -> dict[str, Any]:
+    policy: dict[str, Any] = {}
+    urgency = str(model.urgency or "").strip()
+    if urgency:
+        policy["urgency"] = urgency
+    if model.max_order_age_seconds is not None:
+        policy["max_order_age_seconds"] = float(model.max_order_age_seconds)
+    if model.price_drift_bps is not None:
+        policy["price_drift_bps"] = float(model.price_drift_bps)
+    if model.min_replace_interval_seconds is not None:
+        policy["min_replace_interval_seconds"] = float(model.min_replace_interval_seconds)
+    if model.max_replacements is not None:
+        policy["max_replacements"] = int(model.max_replacements)
+    return {"execution_policy": policy} if policy else {}
 
 
 def _tag(prefix: str, tag: str) -> str:

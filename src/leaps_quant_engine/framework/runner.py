@@ -18,6 +18,7 @@ from leaps_quant_engine.framework.portfolio_construction import (
 )
 from leaps_quant_engine.framework.portfolio_blend import PortfolioBlendEngine
 from leaps_quant_engine.framework.order_sizing import OrderSizingBatch, OrderSizingContext, OrderSizingEngine
+from leaps_quant_engine.framework.portfolio_target_resolver import PortfolioTargetResolver
 from leaps_quant_engine.framework.state import FrameworkRunnerState
 from leaps_quant_engine.framework.risk import (
     BasicRiskManagementModel,
@@ -30,7 +31,7 @@ from leaps_quant_engine.models import DataSlice, OrderIntent, PortfolioTarget, S
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.fundamentals import FundamentalSnapshot
 from leaps_quant_engine.runtime_state import ModelStateEvent, RuntimeModelStateView, RuntimeStateStore, StatePatch
-from leaps_quant_engine.snapshots import IndicatorSnapshot
+from leaps_quant_engine.snapshots import IndicatorSnapshot, SnapshotQualityStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +191,7 @@ class FrameworkRunner:
     insight_manager: InsightManager = None  # type: ignore[assignment]
     portfolio_model: PortfolioConstructionModel = None  # type: ignore[assignment]
     portfolio_engine: PortfolioConstructionEngine = None  # type: ignore[assignment]
+    portfolio_target_resolver: PortfolioTargetResolver = None  # type: ignore[assignment]
     portfolio_blend_engine: PortfolioBlendEngine | None = None
     risk_model: RiskManagementModel = None  # type: ignore[assignment]
     order_sizing_engine: OrderSizingEngine = None  # type: ignore[assignment]
@@ -207,6 +209,8 @@ class FrameworkRunner:
             self.portfolio_model = EqualWeightPortfolioConstructionModel()
         if self.portfolio_engine is None:
             self.portfolio_engine = PortfolioConstructionEngine(model=self.portfolio_model)
+        if self.portfolio_target_resolver is None:
+            self.portfolio_target_resolver = PortfolioTargetResolver()
         if self.risk_model is None:
             self.risk_model = BasicRiskManagementModel()
         if self.order_sizing_engine is None:
@@ -268,24 +272,46 @@ class FrameworkRunner:
         )
 
         started = time.perf_counter()
-        insight_batch = self.alpha_runtime.run(context, symbols_by_alpha=alpha_symbols_by_model)
+        invalid_snapshot = _snapshot_quality_invalid(context)
+        if invalid_snapshot:
+            insight_batch = InsightBatch(
+                sleeve_id=context.sleeve_id,
+                universe_id=context.universe_id,
+                source_snapshot_id=context.source_snapshot_id,
+                generated_at=context.as_of,
+                alpha_ids=self.alpha_runtime.active_alpha_ids(),
+                insights=(),
+                metadata={
+                    "ran_alpha_ids": [],
+                    "skipped_alpha_ids": list(self.alpha_runtime.active_alpha_ids()),
+                    "cadence_by_alpha": {},
+                    "state_patch_count": 0,
+                    "skipped_reason": "snapshot_quality_invalid",
+                    "data_quality_rejected_insight_count": 0,
+                },
+            )
+        else:
+            insight_batch = self.alpha_runtime.run(context, symbols_by_alpha=alpha_symbols_by_model)
         alpha_ms = _elapsed_ms(started)
         stage_decisions: dict[str, Any] = {
             "alpha": dict(insight_batch.metadata),
         }
 
         started = time.perf_counter()
-        manager_update = self.insight_manager.ingest(insight_batch, as_of=context.as_of)
-        active_insights = self.insight_manager.active(context.as_of, sleeve_id=self.sleeve_id)
+        if invalid_snapshot:
+            manager_update = self.insight_manager.expire(context.as_of)
+            suppressed_active_insights = self.insight_manager.active(context.as_of, sleeve_id=self.sleeve_id)
+            active_insights = ()
+        else:
+            manager_update = self.insight_manager.ingest(insight_batch, as_of=context.as_of)
+            suppressed_active_insights = ()
+            active_insights = self.insight_manager.active(context.as_of, sleeve_id=self.sleeve_id)
         insight_manager_ms = _elapsed_ms(started)
+        if invalid_snapshot:
+            stage_decisions["alpha"]["data_quality_suppressed_active_insight_count"] = len(suppressed_active_insights)
 
         started = time.perf_counter()
         portfolio_cadence = normalize_cadence(self.portfolio_engine.rebalance_policy.cadence)
-        portfolio_should_run = self._last_portfolio_target_batch is None or cadence_due(
-            portfolio_cadence,
-            data.time,
-            self._last_portfolio_run_at,
-        )
         portfolio_context = PortfolioConstructionContext(
             sleeve_id=self.sleeve_id,
             data=data,
@@ -294,17 +320,38 @@ class FrameworkRunner:
             managed_symbols=self.insight_manager.tracked_symbols(self.sleeve_id),
             model_state=self._model_state_view(),
         )
-        if portfolio_should_run:
+        if invalid_snapshot:
+            portfolio_should_run = False
+            portfolio_target_batch = PortfolioTargetBatch(
+                sleeve_id=self.sleeve_id,
+                generated_at=data.time,
+                targets=(),
+                model_name=type(self.portfolio_model).__name__,
+                reason="snapshot_quality_invalid",
+                metadata={"portfolio_skipped_reason": "snapshot_quality_invalid"},
+            )
+        else:
+            portfolio_should_run = self._last_portfolio_target_batch is None or cadence_due(
+                portfolio_cadence,
+                data.time,
+                self._last_portfolio_run_at,
+            )
+        if not invalid_snapshot and portfolio_should_run:
             raw_portfolio_target_batch = self.portfolio_engine.create_targets(portfolio_context)
-            portfolio_target_batch = self._apply_portfolio_blend(
+            resolved_portfolio_target_batch = self._resolve_portfolio_targets(
                 portfolio_context,
                 raw_portfolio_target_batch,
+                previous_batch=self._last_portfolio_target_batch,
+            )
+            portfolio_target_batch = self._apply_portfolio_blend(
+                portfolio_context,
+                resolved_portfolio_target_batch,
                 previous_batch=self._last_portfolio_target_batch,
                 market_session=market_session,
             )
             self._last_portfolio_target_batch = portfolio_target_batch
             self._last_portfolio_run_at = data.time
-        else:
+        elif not invalid_snapshot:
             reused_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
             portfolio_target_batch = self._advance_portfolio_blend(
                 portfolio_context,
@@ -324,6 +371,7 @@ class FrameworkRunner:
                 else None
             ),
             "portfolio_blend": dict(portfolio_target_batch.metadata.get("portfolio_blend") or {}),
+            "target_resolution": dict(portfolio_target_batch.metadata.get("portfolio_target_resolution") or {}),
         }
 
         started = time.perf_counter()
@@ -443,6 +491,27 @@ class FrameworkRunner:
             metadata=decision.metadata,
         )
 
+    def _resolve_portfolio_targets(
+        self,
+        context: PortfolioConstructionContext,
+        raw_batch: PortfolioTargetBatch,
+        *,
+        previous_batch: PortfolioTargetBatch | None,
+    ) -> PortfolioTargetBatch:
+        decision = self.portfolio_target_resolver.resolve(
+            context,
+            raw_batch,
+            previous_batch=previous_batch,
+        )
+        return self.portfolio_engine.build_target_batch_from_targets(
+            context,
+            raw_batch,
+            decision.targets,
+            reason=decision.reason or raw_batch.reason,
+            state_patches=raw_batch.state_patches,
+            metadata=decision.metadata,
+        )
+
     def _advance_portfolio_blend(
         self,
         context: PortfolioConstructionContext,
@@ -484,6 +553,13 @@ class FrameworkRunner:
 
 def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000
+
+
+def _snapshot_quality_invalid(context: SnapshotContext) -> bool:
+    return (
+        context.quality_report is not None
+        and context.quality_report.status is SnapshotQualityStatus.INVALID
+    )
 
 
 def _reuse_portfolio_target_batch(batch: PortfolioTargetBatch, generated_at: datetime) -> PortfolioTargetBatch:

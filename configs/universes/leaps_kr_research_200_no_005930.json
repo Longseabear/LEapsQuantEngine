@@ -1,5 +1,5 @@
 {
-  "id": "leaps-kr-research-200",
+  "id": "leaps-kr-research-200-no-005930",
   "market": "KRX",
   "tags": [
     "research",
@@ -7,20 +7,11 @@
     "leaps",
     "kospi-growth",
     "turnover-desc-top-200",
-    "candidate"
+    "candidate",
+    "operator-exclusion",
+    "exclude-005930"
   ],
   "symbols": [
-    {
-      "ticker": "005930",
-      "market": "KRX",
-      "asset_type": "stock",
-      "country": "KR",
-      "name": "삼성전자",
-      "market_segment": "KOSPI",
-      "market_id": "STK",
-      "market_cap_snapshot": 1730498467968000,
-      "sector": "technology"
-    },
     {
       "ticker": "000660",
       "market": "KRX",
@@ -2025,66 +2016,6 @@
       "market_segment": "KOSDAQ",
       "market_id": "KSQ",
       "market_cap_snapshot": 40192549328
-    },
-    {
-      "ticker": "069500",
-      "market": "KRX",
-      "asset_type": "etf",
-      "country": "KR",
-      "name": "KODEX 200",
-      "market_segment": "KOSPI",
-      "market_id": "ETF",
-      "krw_safety_role": "benchmark"
-    },
-    {
-      "ticker": "488770",
-      "market": "KRX",
-      "asset_type": "etf",
-      "country": "KR",
-      "name": "KODEX Money Market Active",
-      "market_segment": "KOSPI",
-      "market_id": "ETF",
-      "krw_safety_role": "cash_like"
-    },
-    {
-      "ticker": "423160",
-      "market": "KRX",
-      "asset_type": "etf",
-      "country": "KR",
-      "name": "KODEX KOFR Active",
-      "market_segment": "KOSPI",
-      "market_id": "ETF",
-      "krw_safety_role": "cash_like"
-    },
-    {
-      "ticker": "459580",
-      "market": "KRX",
-      "asset_type": "etf",
-      "country": "KR",
-      "name": "KODEX CD Rate Active",
-      "market_segment": "KOSPI",
-      "market_id": "ETF",
-      "krw_safety_role": "cash_like"
-    },
-    {
-      "ticker": "114800",
-      "market": "KRX",
-      "asset_type": "etf",
-      "country": "KR",
-      "name": "KODEX Inverse",
-      "market_segment": "KOSPI",
-      "market_id": "ETF",
-      "krw_safety_role": "inverse"
-    },
-    {
-      "ticker": "091160",
-      "market": "KRX",
-      "asset_type": "etf",
-      "country": "KR",
-      "name": "KODEX Semiconductor",
-      "market_segment": "KOSPI",
-      "market_id": "ETF",
-      "krw_safety_role": "sector_beta"
     }
   ],
   "indicators": [
@@ -2200,6 +2131,10 @@
   "metadata": {
     "source_universe": "configs/universes/benchmark_kor_200.json",
     "source_listing": "FinanceDataReader StockListing(KRX)",
-    "notes": "Expanded LEaps KRW research universe. 60-day ROC remains optional so live warmup can still pass when KIS cache has shorter lookback."
+    "notes": "Expanded LEaps KRW research universe. 60-day ROC remains optional so live warmup can still pass when KIS cache has shorter lookback.",
+    "operator_excluded_symbols": [
+      "KRX:005930"
+    ],
+    "operator_exclusion_reason": "Samsung Electronics is managed manually outside the LEaps sleeve."
   }
 }

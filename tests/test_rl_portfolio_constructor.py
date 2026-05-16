@@ -105,6 +105,142 @@ def test_rl_portfolio_constructor_can_zero_held_symbol_missing_from_complete_tar
     assert by_symbol[held_missing.key].tag == "rl:ppo:no_longer_in_target_portfolio"
 
 
+def test_rl_portfolio_constructor_holds_missing_symbol_until_exit_confirmation():
+    selected = Symbol("005930", "KRX")
+    held_missing = Symbol("034020", "KRX")
+    now = datetime(2026, 1, 2)
+    portfolio = Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000})
+    portfolio.holdings[held_missing.key] = type(
+        "HoldingLike",
+        (),
+        {"symbol": held_missing, "quantity": 6, "average_price": 133_100},
+    )()
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_path="missing.zip",
+        allocation_mode="rl_weights",
+        fallback_gross_exposure=0.8,
+        max_position_pct=0.9,
+        emit_zero_for_missing_held_targets=True,
+        missing_target_exit_confirmation_cycles=3,
+    )
+    state_view = RuntimeModelStateView(store=InMemoryRuntimeStateStore(), default_sleeve_id="LEaps")
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                selected.key: Bar(selected, now, 280_000, 280_000, 280_000, 280_000, 1000),
+                held_missing.key: Bar(held_missing, now, 119_300, 119_300, 119_300, 119_300, 1000),
+            },
+        ),
+        portfolio=portfolio,
+        active_insights=(_up_insight(selected, now, momentum=0.2),),
+        managed_symbols=(held_missing,),
+        model_state=state_view,
+    )
+
+    targets = model.create_targets(context)
+    patches = model.state_patches(context=context, targets=targets)
+
+    by_symbol = {target.symbol.key: target for target in targets}
+    assert by_symbol[held_missing.key].target_percent > 0.0
+    assert by_symbol[held_missing.key].tag == "rl:ppo:missing_target_hold:1/3"
+    membership = [patch for patch in patches if patch.key.namespace == "target_membership"]
+    assert {patch.key.symbol_key: patch.value["missing_count"] for patch in membership} == {
+        selected.key: 0,
+        held_missing.key: 1,
+    }
+
+
+def test_rl_portfolio_constructor_exits_after_missing_confirmation_count():
+    selected = Symbol("005930", "KRX")
+    held_missing = Symbol("034020", "KRX")
+    now = datetime(2026, 1, 2)
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store=store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="rl-portfolio-constructor",
+                    namespace="target_membership",
+                    symbol_key=held_missing.key,
+                ),
+                value={"missing_count": 2},
+                generated_at=now,
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000})
+    portfolio.holdings[held_missing.key] = type(
+        "HoldingLike",
+        (),
+        {"symbol": held_missing, "quantity": 6, "average_price": 133_100},
+    )()
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_path="missing.zip",
+        allocation_mode="rl_weights",
+        fallback_gross_exposure=0.8,
+        max_position_pct=0.9,
+        emit_zero_for_missing_held_targets=True,
+        missing_target_exit_confirmation_cycles=3,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                selected.key: Bar(selected, now, 280_000, 280_000, 280_000, 280_000, 1000),
+                held_missing.key: Bar(held_missing, now, 119_300, 119_300, 119_300, 119_300, 1000),
+            },
+        ),
+        portfolio=portfolio,
+        active_insights=(_up_insight(selected, now, momentum=0.2),),
+        managed_symbols=(held_missing,),
+        model_state=state_view,
+    )
+
+    targets = model.create_targets(context)
+
+    by_symbol = {target.symbol.key: target for target in targets}
+    assert by_symbol[held_missing.key].target_percent == 0.0
+    assert by_symbol[held_missing.key].tag == "rl:ppo:no_longer_in_target_portfolio"
+
+
+def test_rl_portfolio_constructor_ignores_implausible_active_momentum_insight():
+    valid = Symbol("009150", "KRX")
+    invalid = Symbol("011930", "KRX")
+    now = datetime(2026, 5, 15, 12, 15)
+    model = ReinforcementLearningPortfolioConstructionModel(
+        policy_path="missing.zip",
+        exposure_levels=(0.0, 0.5),
+        fallback_action=1,
+        max_position_pct=1.0,
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                valid.key: Bar(valid, now, 100, 100, 100, 100, 1000),
+                invalid.key: Bar(invalid, now, 100, 100, 100, 100, 1000),
+            },
+        ),
+        portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+        active_insights=(
+            _up_insight(invalid, now, momentum=9.0),
+            _up_insight(valid, now, momentum=0.2),
+        ),
+        managed_symbols=(),
+    )
+
+    targets = model.create_targets(context)
+
+    assert {target.symbol.key for target in targets} == {valid.key}
+    assert targets[0].target_percent == pytest.approx(0.5)
+
+
 def test_rl_portfolio_constructor_complete_target_mode_does_not_flatten_without_actionable_insights():
     held = Symbol("034020", "KRX")
     now = datetime(2026, 1, 2)

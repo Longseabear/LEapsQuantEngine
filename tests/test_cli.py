@@ -206,6 +206,7 @@ def generate(context):
             alpha_version=VERSION,
             weight=1.0,
             reason="selected_input",
+            metadata={"opening_gap_pct": context.metadata_value(symbol_key, "opening_gap_pct")},
         )
         for symbol_key in context.symbol_keys
     ]
@@ -294,10 +295,13 @@ class SecondSymbolSelectionModel:
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["runtime"]["runtime_id"] == "runtime-backtest-test"
+    assert {"config_bootstrap_ms", "framework_backtest_ms", "report_generation_ms", "total_ms"} <= set(payload["timings"])
+    assert "history_feed_build_ms" in payload["timings"]
     assert payload["alpha"]["input_selections"] == {"selected-alpha": "second-only"}
     assert "orders" not in payload
     assert payload["insights"]["cycle_count"] == 2
     assert payload["insights"]["cycles"][0]["new_insights"][0]["symbol"] == "KRX:000660"
+    assert payload["insights"]["cycles"][1]["new_insights"][0]["metadata"]["opening_gap_pct"] == 0.0
     assert "cycles" in payload["selection"]
     assert payload["selection"]["last_live_symbols"] == ["KRX:000660"]
     assert payload["final_quantity"] == {"KRX:000660": 5}
@@ -416,11 +420,46 @@ def generate(context):
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["source"] == "minute-feed"
+    assert {"config_bootstrap_ms", "feed_load_ms", "daily_warmup_ms", "framework_replay_ms", "report_generation_ms", "total_ms"} <= set(payload["timings"])
     assert payload["minute_backtest"]["minute_data_slice_count"] == 2
     assert payload["minute_backtest"]["daily_warmup_bar_count"] == 1
     assert payload["insights"]["cycle_count"] == 2
     assert payload["insights"]["cycles"][0]["new_insights"][0]["metadata"]["daily_close"] == 100.0
     assert payload["final_quantity"] == {"KRX:005930": 20}
+
+    cache_dir = tmp_path / "minute-cache" / "runtime-minute-universe"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "2026-05-01.csv").write_text(minute_feed.read_text(encoding="utf-8"), encoding="utf-8")
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--minute-cache-root",
+            str(tmp_path / "minute-cache"),
+            "--start",
+            "2026-05-01T09:00:00",
+            "--end",
+            "2026-05-01T09:01:00",
+            "--warmup-start",
+            "2026-04-01",
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--summary-only",
+            "--include-insights",
+        ]
+    )
+
+    assert exit_code == 0
+    cache_payload = json.loads(capsys.readouterr().out)
+    assert cache_payload["source"] == "minute-cache"
+    assert cache_payload["minute_cache"]["row_count"] == 2
+    assert cache_payload["minute_backtest"]["minute_feed"] is None
+    assert cache_payload["minute_backtest"]["minute_data_slice_count"] == 2
+    assert cache_payload["final_quantity"] == {"KRX:005930": 20}
 
 
 def test_cli_download_us_minute_feed_from_runtime_universe(monkeypatch, tmp_path, capsys):
@@ -509,6 +548,221 @@ def test_cli_download_us_minute_feed_from_runtime_universe(monkeypatch, tmp_path
     assert rows[0] == "symbol,time,open,high,low,close,volume"
     assert "US:SPY,2026-05-01T09:30:00,100,101,99,100.5,1000" in rows
     assert "US:QQQ,2026-05-01T09:30:00,100,101,99,100.5,1000" in rows
+
+
+def test_cli_minute_cache_build_and_export_for_krx_runtime_universe(monkeypatch, tmp_path, capsys):
+    universe_path = tmp_path / "krx_universe.json"
+    universe_path.write_text(
+        json.dumps(
+            {
+                "id": "krx-minute-universe",
+                "market": "KRX",
+                "symbols": [
+                    {"ticker": "005930", "market": "KRX", "market_segment": "KOSPI", "market_id": "STK"},
+                    {"ticker": "050890", "market": "KRX", "market_segment": "KOSDAQ", "market_id": "KSQ"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "krx-minute-runtime",
+                "mode": "backtest",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "cash": 1000,
+                        "universe": {"coarse_path": str(universe_path), "active": {"max_symbols": 2}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeProvider:
+        provider_name = "yfinance"
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def download(self, symbol, *, start, end, interval):
+            return [
+                Bar(
+                    Symbol(symbol.ticker, symbol.market),
+                    cli.datetime(2026, 5, 15, 9, 0),
+                    100,
+                    101,
+                    99,
+                    100.5,
+                    1000,
+                    resolution="minute",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "YFinanceMinuteBarProvider", FakeProvider)
+    cache_root = tmp_path / "minute-cache"
+
+    exit_code = main(
+        [
+            "minute-cache-build",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--cache-root",
+            str(cache_root),
+            "--start",
+            "2026-05-15",
+            "--end",
+            "2026-05-15",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    build_payload = json.loads(capsys.readouterr().out)
+    assert build_payload["status"] == "ok"
+    assert build_payload["row_count"] == 2
+    assert build_payload["runtime_backtest_minute_command"][:4] == [
+        "runtime-backtest-minute",
+        str(config_path),
+        "--sleeve-id",
+        "LEaps",
+    ]
+
+    output = tmp_path / "export.csv"
+    exit_code = main(
+        [
+            "minute-cache-export",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--cache-root",
+            str(cache_root),
+            "--output",
+            str(output),
+            "--start",
+            "2026-05-15T09:00:00",
+            "--end",
+            "2026-05-15T09:00:00",
+            "--symbol",
+            "KRX:005930",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    export_payload = json.loads(capsys.readouterr().out)
+    assert export_payload["status"] == "ok"
+    assert export_payload["row_count"] == 1
+    assert output.read_text(encoding="utf-8").splitlines()[1].startswith("KRX:005930,2026-05-15T09:00:00")
+
+
+def test_cli_minute_cache_build_supports_kis_extended_session_metadata(monkeypatch, tmp_path, capsys):
+    universe_path = tmp_path / "krx_universe.json"
+    universe_path.write_text(
+        json.dumps(
+            {
+                "id": "krx-opening-universe",
+                "market": "KRX",
+                "symbols": [{"ticker": "005930", "market": "KRX"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "krx-opening-runtime",
+                "mode": "backtest",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "cash": 1000,
+                        "universe": {"coarse_path": str(universe_path), "active": {"max_symbols": 1}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKISProvider:
+        last_instance = None
+
+        def __init__(self):
+            self.calls = []
+            FakeKISProvider.last_instance = self
+
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+        def get_cached_minute_history(
+            self,
+            symbol,
+            *,
+            trade_date,
+            start_time,
+            end_time,
+            interval_minutes,
+            refresh,
+        ):
+            self.calls.append((start_time, end_time, interval_minutes, refresh))
+            return [
+                Bar(
+                    symbol,
+                    cli.datetime(2026, 5, 15, 8, 50),
+                    100,
+                    101,
+                    99,
+                    100,
+                    1000,
+                    resolution="minute",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "KISCachedMarketDataProvider", FakeKISProvider)
+
+    exit_code = main(
+        [
+            "minute-cache-build",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--cache-root",
+            str(tmp_path / "minute-cache"),
+            "--start",
+            "2026-05-15",
+            "--end",
+            "2026-05-15",
+            "--provider",
+            "kis-cache",
+            "--include-extended-hours",
+            "--refresh-provider-cache",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["provider"] == "kis-cache"
+    assert payload["include_extended_hours"] is True
+    assert payload["include_session_metadata"] is True
+    assert FakeKISProvider.last_instance.calls == [("08:30:00", "18:00:00", 1, True)]
+    cache_file = tmp_path / "minute-cache" / "krx-opening-universe" / "2026-05-15.csv.gz"
+    import gzip
+
+    with gzip.open(cache_file, "rt", encoding="utf-8") as handle:
+        rows = handle.read().splitlines()
+    assert "market_session_phase" in rows[0]
+    assert "regular_open_auction" in rows[1]
 
 
 def test_cli_leaps_runtime_backtest_uses_kr_research_universe_and_krw_cash(monkeypatch, capsys):
@@ -1281,6 +1535,35 @@ def test_cli_virtual_account_reconcile_reports_broker_vs_virtual(monkeypatch, tm
             filled_at=cli.datetime(2026, 5, 9, 9, 1),
         )
     )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "order-runtime" / "leaps.jsonl")
+    coordination = OrderCoordinator().coordinate(
+        (
+            OrderIntentBatch(
+                sleeve_id="LEaps",
+                generated_at=cli.datetime(2026, 5, 9, 9, 0),
+                order_intents=(
+                    OrderIntent(
+                        sleeve_id="LEaps",
+                        symbol=Symbol("005930", "KRX"),
+                        side=OrderSide.BUY,
+                        quantity=2,
+                        reference_price=100,
+                    ),
+                ),
+                batch_id="batch-1",
+            ),
+        ),
+        generated_at=cli.datetime(2026, 5, 9, 9, 0),
+    )
+    order_store.record_tickets(coordination.tickets)
+    order_store.record_event(
+        coordination.tickets[0].event(
+            OrderEventType.FILLED,
+            occurred_at=cli.datetime(2026, 5, 9, 9, 1),
+            quantity=2,
+            fill_price=100,
+        )
+    )
 
     class FakeAccountClient:
         def get_holdings(self, *, market="domestic"):
@@ -1308,6 +1591,70 @@ def test_cli_virtual_account_reconcile_reports_broker_vs_virtual(monkeypatch, tm
     assert payload["status"] == "needs_reconciliation"
     assert payload["rows"][0]["broker_quantity"] == 3
     assert payload["rows"][0]["virtual_quantity"] == 2
+    assert payload["order_runtime_filled_positions"] == [{"symbol": "005930", "market": "KRX", "quantity": 2}]
+
+
+def test_cli_virtual_account_ignore_fill_marks_fill_non_actionable(tmp_path, capsys):
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "test",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "cash": 1000,
+                        "universe": {"coarse_path": "universe.json"},
+                        "portfolio": {"account_store_path": "accounts/leaps.json"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = VirtualSleeveAccountStore(tmp_path / "accounts" / "leaps.json", default_cash_by_sleeve={"LEaps": 1000})
+    store.record_broker_fill(
+        VirtualFillEvent(
+            fill_id="fill-1",
+            order_id="manual-order",
+            symbol=Symbol("005930", "KRX"),
+            side=OrderSide.SELL,
+            quantity=1,
+            fill_price=100,
+            filled_at=cli.datetime(2026, 5, 14, 15, 10),
+        )
+    )
+
+    exit_code = main(
+        [
+            "virtual-account-ignore-fill",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--fill-id",
+            "fill-1",
+            "--reason",
+            "manual position outside engine",
+            "--ignored-by",
+            "test-operator",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ignored"]["fill_id"] == "fill-1"
+    assert payload["ignored"]["ignored_by"] == "test-operator"
+    assert payload["allocation_status"]["status"] == "ignored"
+    assert payload["unallocated_fill_count"] == 0
+
+
+def test_default_reconcile_date_uses_market_local_date_for_overseas():
+    now = cli.datetime(2026, 5, 13, 2, 30, tzinfo=cli.timezone(cli.timedelta(hours=9)))
+
+    assert cli._default_reconcile_date("overseas", now=now) == "20260512"
+    assert cli._default_reconcile_date("domestic", now=now) == "20260513"
 
 
 def test_cli_virtual_account_transfer_cash_moves_between_sleeves(tmp_path, capsys):

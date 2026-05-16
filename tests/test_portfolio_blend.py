@@ -12,6 +12,8 @@ from leaps_quant_engine.framework import (
     PortfolioConstructionContext,
     PortfolioConstructionEngine,
     PortfolioTargetBatch,
+    PortfolioTargetResolutionPolicy,
+    PortfolioTargetResolver,
     RebalancePolicy,
 )
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
@@ -103,6 +105,16 @@ def _batch(symbol: Symbol, as_of: datetime, target_percent: float, tag: str = "m
     )
 
 
+def _batch_many(as_of: datetime, targets: tuple[PortfolioAllocationTarget, ...]) -> PortfolioTargetBatch:
+    return PortfolioTargetBatch(
+        sleeve_id="blend-sleeve",
+        generated_at=as_of,
+        targets=targets,
+        model_name="Static",
+        reason="portfolio_construction",
+    )
+
+
 def test_portfolio_blend_seeds_then_advances_transition_from_runtime_state():
     symbol = Symbol("005930", "KRX")
     store = InMemoryRuntimeStateStore()
@@ -142,6 +154,81 @@ def test_portfolio_blend_seeds_then_advances_transition_from_runtime_state():
     assert halfway.metadata["portfolio_blend"]["progress"] == pytest.approx(0.5)
 
 
+def test_target_resolver_zero_missing_targets_bypass_blend_as_exits():
+    old_symbol = Symbol("005930", "KRX")
+    new_symbol = Symbol("000660", "KRX")
+    store = InMemoryRuntimeStateStore()
+    resolver = PortfolioTargetResolver(PortfolioTargetResolutionPolicy(mode="complete"))
+    blend = PortfolioBlendEngine(
+        PortfolioBlendPolicy(
+            enabled=True,
+            duration_minutes=60,
+            target_drift_threshold_pct=0.01,
+            clock="wall_time",
+        )
+    )
+    first_time = datetime(2026, 5, 15, 9, 0)
+    old_batch = _batch(old_symbol, first_time, 0.40)
+    first = blend.apply(_context(old_symbol, first_time, store), old_batch)
+    store.apply_patches(first.state_patches, applied_at=first_time)
+
+    second_time = datetime(2026, 5, 15, 9, 5)
+    raw_new = _batch(new_symbol, second_time, 0.60)
+    resolved = resolver.resolve(
+        _context(new_symbol, second_time, store),
+        raw_new,
+        previous_batch=old_batch,
+    )
+    assert {target.symbol.key: target.target_percent for target in resolved.targets} == {
+        new_symbol.key: pytest.approx(0.60),
+        old_symbol.key: pytest.approx(0.0),
+    }
+    assert resolved.metadata["portfolio_target_resolution"]["zeroed_symbols"] == [old_symbol.key]
+
+    blended = blend.apply(
+        _context(new_symbol, second_time, store),
+        _batch_many(second_time, resolved.targets),
+        previous_batch=old_batch,
+    )
+    assert {target.symbol.key: target.target_percent for target in blended.targets} == {
+        old_symbol.key: pytest.approx(0.0),
+        new_symbol.key: pytest.approx(0.0),
+    }
+    assert blended.metadata["portfolio_blend"]["bypassed_symbols"] == [old_symbol.key]
+
+
+def test_target_resolver_patch_mode_carries_forward_missing_old_targets():
+    old_symbol = Symbol("005930", "KRX")
+    new_symbol = Symbol("000660", "KRX")
+    as_of = datetime(2026, 5, 15, 9, 0)
+    resolver = PortfolioTargetResolver(PortfolioTargetResolutionPolicy(mode="patch"))
+    resolved = resolver.resolve(
+        _context(new_symbol, as_of, InMemoryRuntimeStateStore()),
+        _batch(new_symbol, as_of, 0.60),
+        previous_batch=_batch(old_symbol, as_of, 0.40),
+    )
+
+    assert {target.symbol.key: target.target_percent for target in resolved.targets} == {
+        new_symbol.key: pytest.approx(0.60),
+        old_symbol.key: pytest.approx(0.40),
+    }
+    assert resolved.metadata["portfolio_target_resolution"]["carried_symbols"] == [old_symbol.key]
+
+
+def test_target_resolver_complete_mode_does_not_flatten_empty_raw_batch_by_default():
+    old_symbol = Symbol("005930", "KRX")
+    as_of = datetime(2026, 5, 15, 9, 0)
+    resolver = PortfolioTargetResolver(PortfolioTargetResolutionPolicy(mode="complete"))
+    resolved = resolver.resolve(
+        _context(old_symbol, as_of, InMemoryRuntimeStateStore()),
+        _batch_many(as_of, ()),
+        previous_batch=_batch(old_symbol, as_of, 0.40),
+    )
+
+    assert resolved.targets == ()
+    assert resolved.metadata["portfolio_target_resolution"]["status"] == "empty_no_action"
+
+
 def test_portfolio_blend_bypasses_explicit_flat_exit_targets():
     symbol = Symbol("005930", "KRX")
     store = InMemoryRuntimeStateStore()
@@ -166,6 +253,81 @@ def test_portfolio_blend_bypasses_explicit_flat_exit_targets():
 
     assert decision.targets[0].target_percent == 0.0
     assert decision.metadata["portfolio_blend"]["bypassed_symbols"] == [symbol.key]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "rl:ppo:no_longer_in_target_portfolio",
+        "portfolio_target_resolver:missing_target_zero",
+    ],
+)
+def test_portfolio_blend_bypasses_engine_exit_target_tags(tag: str):
+    symbol = Symbol("005930", "KRX")
+    store = InMemoryRuntimeStateStore()
+    engine = PortfolioBlendEngine(
+        PortfolioBlendPolicy(
+            enabled=True,
+            duration_minutes=60,
+            target_drift_threshold_pct=0.01,
+            clock="wall_time",
+        )
+    )
+    first_time = datetime(2026, 5, 15, 9, 0)
+    first = engine.apply(_context(symbol, first_time, store), _batch(symbol, first_time, 0.50))
+    store.apply_patches(first.state_patches, applied_at=first_time)
+
+    exit_time = datetime(2026, 5, 15, 9, 5)
+    decision = engine.apply(
+        _context(symbol, exit_time, store),
+        _batch(symbol, exit_time, 0.0, tag=tag),
+        previous_batch=_batch(symbol, first_time, 0.50),
+    )
+
+    assert decision.targets[0].target_percent == 0.0
+    assert decision.metadata["portfolio_blend"]["bypassed_symbols"] == [symbol.key]
+
+
+def test_portfolio_blend_retarget_keeps_original_deadline():
+    symbol = Symbol("005930", "KRX")
+    store = InMemoryRuntimeStateStore()
+    engine = PortfolioBlendEngine(
+        PortfolioBlendPolicy(
+            enabled=True,
+            duration_minutes=60,
+            target_drift_threshold_pct=0.01,
+            clock="wall_time",
+        )
+    )
+    seed_time = datetime(2026, 5, 15, 9, 0)
+    seed = engine.apply(_context(symbol, seed_time, store), _batch(symbol, seed_time, 0.20))
+    store.apply_patches(seed.state_patches, applied_at=seed_time)
+
+    start_time = datetime(2026, 5, 15, 9, 5)
+    started = engine.apply(
+        _context(symbol, start_time, store),
+        _batch(symbol, start_time, 0.80),
+        previous_batch=_batch(symbol, seed_time, 0.20),
+    )
+    store.apply_patches(started.state_patches, applied_at=start_time)
+
+    retarget_time = datetime(2026, 5, 15, 9, 35)
+    retargeted = engine.apply(
+        _context(symbol, retarget_time, store),
+        _batch(symbol, retarget_time, 0.10),
+        previous_batch=_batch(symbol, start_time, 0.80),
+    )
+
+    blend = retargeted.metadata["portfolio_blend"]
+    transition = blend["active_transition"]
+    assert blend["status"] == "retargeted"
+    assert blend["started_at"] == start_time.isoformat()
+    assert blend["elapsed_minutes"] == pytest.approx(30.0)
+    assert blend["progress"] == pytest.approx(0.5)
+    assert transition["started_at"] == start_time.isoformat()
+    assert transition["duration_minutes"] == 60
+    assert transition["reason"] == "retarget_during_active_blend"
+    assert retargeted.targets[0].target_percent == pytest.approx(0.30)
 
 
 def test_framework_runner_advances_active_blend_between_portfolio_rebalance_runs():
@@ -233,12 +395,16 @@ def test_runtime_config_parses_portfolio_blend_policy():
                 "universe": {"coarse_path": "configs/universes/leaps_kr_research_core.json"},
                 "portfolio": {
                     "model": "examples/portfolio_models/equal_weight.py",
+                    "target_resolution": {
+                        "mode": "patch",
+                        "zero_missing_tag": "resolver:zero",
+                        "zero_missing_when_raw_empty": True,
+                    },
                     "blend": {
                         "enabled": True,
                         "duration_minutes": 300,
                         "target_drift_threshold_pct": 0.05,
                         "clock": "regular_session",
-                        "missing_target_behavior": "zero",
                         "bypass_tag_tokens": ["stop", "urgent"],
                     },
                 },
@@ -250,10 +416,12 @@ def test_runtime_config_parses_portfolio_blend_policy():
     blend = config.sleeve("blend-sleeve").portfolio.blend
 
     assert config.sleeve("blend-sleeve").portfolio.model == ModuleReference("examples/portfolio_models/equal_weight.py")
+    assert config.sleeve("blend-sleeve").portfolio.target_resolution.mode == "patch"
+    assert config.sleeve("blend-sleeve").portfolio.target_resolution.zero_missing_tag == "resolver:zero"
+    assert config.sleeve("blend-sleeve").portfolio.target_resolution.zero_missing_when_raw_empty is True
     assert blend.enabled is True
     assert blend.duration_minutes == 300
     assert blend.target_drift_threshold_pct == 0.05
     assert blend.clock == "regular_session"
-    assert blend.missing_target_behavior == "zero"
     assert blend.bypass_target_tag_tokens == ("stop", "urgent")
     assert config.to_dict()["sleeves"][0]["portfolio"]["blend"]["enabled"] is True

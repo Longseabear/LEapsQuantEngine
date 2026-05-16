@@ -110,6 +110,18 @@ Always keep cancellation and replacement LEAN-style:
   execution model should explicitly request a more aggressive policy instead
   of relying on core engine heuristics.
 
+## Virtual Account Reconciliation Discipline
+
+- Unknown broker fills are not strategy state. They remain raw broker-fill
+  history until an operator explicitly allocates them to a sleeve.
+- If a fill belongs to manual activity outside the engine, record that as an
+  explicit ignore decision rather than deleting the fill or forcing it into a
+  sleeve. The ignored fill should stop `needs_attention` without changing
+  holdings or cash.
+- Never make reconciliation guess sleeve ownership from current broker
+  holdings alone. Use order ownership, broker order aliases, explicit fill
+  allocation, cash transfer, or explicit ignore records.
+
 ## Reporting Contract
 
 When reporting an engine change, include:

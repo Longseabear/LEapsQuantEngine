@@ -47,7 +47,7 @@ def test_market_data_snapshot_engine_collects_updates_and_publishes_indicator_sn
             "id": "minute-smoke",
             "market": "KRX",
             "symbols": ["005930"],
-            "indicators": [{"name": "sma_2_close", "type": "sma", "period": 2}],
+            "indicators": [{"name": "sma_2_close", "type": "sma", "period": 2, "resolution": "live"}],
         }
     )
     symbol = Symbol("005930", "KRX")

@@ -651,6 +651,19 @@ class KISDirectClient:
             symbol = str(row.get("pdno") or row.get("ovrs_pdno") or row.get("std_pdno") or "").strip()
             if not symbol:
                 continue
+            settled_quantity = _to_int(row.get("cblc_qty13", row.get("ovrs_cblc_qty", "0")), "cblc_qty13")
+            orderable_quantity = _to_int(row.get("ord_psbl_qty1", row.get("ord_psbl_qty", settled_quantity)), "ord_psbl_qty1")
+            if row.get("ccld_qty_smtl1") not in (None, ""):
+                current_quantity = _to_int(row.get("ccld_qty_smtl1"), "ccld_qty_smtl1")
+                quantity_source = "ccld_qty_smtl1"
+            elif row.get("ord_psbl_qty1", row.get("ord_psbl_qty")) not in (None, ""):
+                current_quantity = orderable_quantity
+                quantity_source = "ord_psbl_qty1"
+            else:
+                current_quantity = settled_quantity
+                quantity_source = "cblc_qty13"
+            today_buy_quantity = _to_int(row.get("thdt_buy_ccld_qty1", "0"), "thdt_buy_ccld_qty1")
+            today_sell_quantity = _to_int(row.get("thdt_sll_ccld_qty1", "0"), "thdt_sll_ccld_qty1")
             holdings.append(
                 {
                     "symbol": symbol,
@@ -658,8 +671,13 @@ class KISDirectClient:
                     "name": str(row.get("prdt_name", "")).strip(),
                     "exchange": str(row.get("ovrs_excg_cd", "")).strip(),
                     "currency": str(row.get("crcy_cd") or row.get("buy_crcy_cd") or row.get("tr_crcy_cd") or "").strip(),
-                    "holding_quantity": _to_int(row.get("cblc_qty13", row.get("ovrs_cblc_qty", "0")), "cblc_qty13"),
-                    "orderable_quantity": _to_int(row.get("ord_psbl_qty1", row.get("ord_psbl_qty", "0")), "ord_psbl_qty1"),
+                    "holding_quantity": current_quantity,
+                    "current_quantity": current_quantity,
+                    "settled_quantity": settled_quantity,
+                    "orderable_quantity": orderable_quantity,
+                    "today_buy_quantity": today_buy_quantity,
+                    "today_sell_quantity": today_sell_quantity,
+                    "quantity_source": quantity_source,
                     "average_purchase_price": _to_float(row.get("avg_unpr3", row.get("pchs_avg_pric", "0")), "avg_unpr3"),
                     "purchase_amount": _to_float(
                         row.get("pchs_rmnd_wcrc_amt", row.get("frcr_pchs_amt", row.get("frcr_pchs_amt1", "0"))),
@@ -1054,18 +1072,26 @@ class KISDirectClient:
         params: Mapping[str, Any],
         label: str,
     ) -> dict[str, Any]:
-        self._wait_for_turn()
-        headers = self._headers(tr_id=tr_id)
-        try:
-            response = self.session.get(
-                f"{self.settings.base_url.rstrip('/')}{path}",
-                headers=headers,
-                params=dict(params),
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise KISDirectClientError(f"Failed to request {label} due to a network error.") from exc
-        return self._checked_payload(response, label=label)
+        for attempt in range(4):
+            self._wait_for_turn()
+            headers = self._headers(tr_id=tr_id)
+            try:
+                response = self.session.get(
+                    f"{self.settings.base_url.rstrip('/')}{path}",
+                    headers=headers,
+                    params=dict(params),
+                    timeout=10,
+                )
+            except requests.RequestException as exc:
+                raise KISDirectClientError(f"Failed to request {label} due to a network error.") from exc
+            try:
+                return self._checked_payload(response, label=label)
+            except KISDirectClientError as exc:
+                if attempt < 3 and _is_kis_rate_limit_error(str(exc)):
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        raise KISDirectClientError(f"{label} request failed after rate-limit retries.")
 
     def _post_json(
         self,
@@ -1543,6 +1569,10 @@ def _looks_like_domestic_reference_price(
         and change == 0
         and abs(change_rate) < 0.000001
     )
+
+
+def _is_kis_rate_limit_error(text: str) -> bool:
+    return "EGW00201" in text or "초당 거래건수" in text
 
 
 def _required_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:

@@ -7,9 +7,9 @@ from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.universe.loader import load_universe_definition, parse_universe_definition
 
 
-def _bar(symbol: Symbol, day: int, close: float, volume: int = 10) -> Bar:
+def _bar(symbol: Symbol, day: int, close: float, volume: int = 10, resolution: str = "daily") -> Bar:
     time = datetime(2026, 5, 1) + timedelta(days=day)
-    return Bar(symbol, time, close, close, close, close, volume)
+    return Bar(symbol, time, close, close, close, close, volume, resolution=resolution)
 
 
 def test_load_universe_definition_from_file():
@@ -23,6 +23,12 @@ def test_load_universe_definition_from_file():
         "momentum_2_close",
         "dollar_volume_2",
     ]
+
+
+def test_us_live_smoke_universe_uses_live_indicator_resolution():
+    universe = load_universe_definition("configs/universes/us_live_smoke.json")
+
+    assert {indicator.resolution for indicator in universe.indicators} == {"live"}
 
 
 def test_parse_universe_definition_accepts_symbol_metadata_for_mixed_exchanges():
@@ -63,6 +69,19 @@ def test_parse_universe_definition_accepts_optional_indicator_readiness():
     assert universe.indicators[1].required_for_warmup is False
     assert universe.indicators[2].readiness == "optional"
     assert universe.indicators[2].required_for_warmup is False
+
+
+def test_parse_universe_definition_defaults_indicators_to_confirmed_daily_resolution():
+    universe = parse_universe_definition(
+        {
+            "id": "test",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "sma_3_close", "type": "sma", "period": 3}],
+        }
+    )
+
+    assert universe.indicators[0].resolution == "daily"
 
 
 def test_indicator_engine_registers_universe_and_updates_only_active_symbols():

@@ -142,6 +142,37 @@ def test_sliced_execution_model_splits_large_delta_into_child_orders():
     assert all(order.order_type is OrderType.MARKET for order in batch.order_intents)
 
 
+def test_execution_model_can_emit_order_lifecycle_policy_metadata():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+
+    batch = ExecutionEngine(
+        model=LimitExecutionModel(
+            urgency="exit",
+            max_order_age_seconds=120,
+            price_drift_bps=50,
+            min_replace_interval_seconds=30,
+            max_replacements=2,
+        )
+    ).execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=Portfolio(cash=1_000),
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 3, "entry"),),
+        )
+    )
+
+    assert batch.order_intents[0].metadata["execution_policy"] == {
+        "urgency": "exit",
+        "max_order_age_seconds": 120.0,
+        "price_drift_bps": 50.0,
+        "min_replace_interval_seconds": 30.0,
+        "max_replacements": 2,
+    }
+
+
 class _ContextAwareExecutionModel:
     def create_orders(self, sleeve_id, portfolio, data, targets, execution_context=None):
         assert execution_context is not None

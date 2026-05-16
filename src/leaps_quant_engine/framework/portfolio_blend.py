@@ -33,6 +33,8 @@ DEFAULT_BYPASS_TAG_TOKENS = (
     "operator",
     "force",
     "risk",
+    "no_longer_in_target_portfolio",
+    "missing_target_zero",
 )
 
 
@@ -42,7 +44,6 @@ class PortfolioBlendPolicy:
     duration_minutes: float = 0.0
     target_drift_threshold_pct: float = 0.0
     clock: str = "orderable_session"
-    missing_target_behavior: str = "drop"
     bypass_target_tag_tokens: tuple[str, ...] = DEFAULT_BYPASS_TAG_TOKENS
     model_id: str = DEFAULT_PORTFOLIO_BLEND_MODEL_ID
 
@@ -54,9 +55,6 @@ class PortfolioBlendPolicy:
         clock = str(self.clock or "orderable_session").strip().lower()
         if clock not in {"wall_time", "orderable_session", "regular_session"}:
             raise ValueError(f"Unsupported portfolio blend clock: {self.clock}")
-        missing = str(self.missing_target_behavior or "drop").strip().lower()
-        if missing not in {"drop", "zero"}:
-            raise ValueError("portfolio blend missing_target_behavior must be 'drop' or 'zero'.")
         model_id = str(self.model_id or DEFAULT_PORTFOLIO_BLEND_MODEL_ID).strip()
         if not model_id:
             raise ValueError("portfolio blend model_id cannot be empty.")
@@ -66,7 +64,6 @@ class PortfolioBlendPolicy:
             if str(token).strip()
         )
         object.__setattr__(self, "clock", clock)
-        object.__setattr__(self, "missing_target_behavior", missing)
         object.__setattr__(self, "bypass_target_tag_tokens", tokens)
         object.__setattr__(self, "model_id", model_id)
 
@@ -80,7 +77,6 @@ class PortfolioBlendPolicy:
             "duration_minutes": self.duration_minutes,
             "target_drift_threshold_pct": self.target_drift_threshold_pct,
             "clock": self.clock,
-            "missing_target_behavior": self.missing_target_behavior,
             "bypass_target_tag_tokens": list(self.bypass_target_tag_tokens),
             "model_id": self.model_id,
         }
@@ -201,23 +197,45 @@ class PortfolioBlendEngine:
 
         target_set = _TargetSet.from_batches(raw_batch, previous_batch)
         raw_weights, raw_tags = _weights_and_tags(raw_batch.targets)
-        previous_weights, previous_tags = self._previous_weights(context.model_state, previous_batch)
-        desired_weights, desired_tags = self._desired_weights(previous_weights, previous_tags, raw_weights, raw_tags)
+        previous_weights, _previous_tags = self._previous_weights(context.model_state, previous_batch)
+        desired_weights, desired_tags = dict(raw_weights), dict(raw_tags)
         bypass_symbols = self._bypass_symbols(raw_batch.targets)
 
         active = self._active_transition(context.model_state, previous_batch)
+        if _target_resolution_status(raw_batch) == "empty_no_action":
+            if active is not None:
+                active = active.advance(context.data.time, market_session=market_session)
+                return self._decision_from_transition(
+                    raw_batch,
+                    active,
+                    target_set=target_set,
+                    raw_weights=raw_weights,
+                    raw_tags=raw_tags,
+                    bypass_symbols=bypass_symbols,
+                    status_when_active="advancing",
+                )
+            return PortfolioBlendDecision(
+                targets=raw_batch.targets,
+                reason=raw_batch.reason,
+                metadata=self._metadata(
+                    raw_batch,
+                    status="no_action",
+                    target_drift=0.0,
+                    state_store_attached=context.model_state.store is not None,
+                    target_count=len(raw_batch.targets),
+                    bypass_symbols=bypass_symbols,
+                ),
+            )
         if active is not None:
             active = active.advance(context.data.time, market_session=market_session)
             retarget_drift = _target_drift(active.to_weights, desired_weights)
             if retarget_drift >= self.policy.target_drift_threshold_pct:
-                active = self._new_transition(
-                    context,
-                    from_weights=active.weights_at_progress(),
+                active = self._retarget_active_transition(
+                    active,
                     to_weights=desired_weights,
                     to_tags=desired_tags,
                     source_batch_id=raw_batch.batch_id,
                     target_drift=retarget_drift,
-                    reason="retarget_during_active_blend",
                 )
                 return self._active_decision(
                     raw_batch,
@@ -491,6 +509,25 @@ class PortfolioBlendEngine:
             target_drift=target_drift,
         )
 
+    def _retarget_active_transition(
+        self,
+        transition: PortfolioBlendTransition,
+        *,
+        to_weights: Mapping[str, float],
+        to_tags: Mapping[str, str],
+        source_batch_id: str,
+        target_drift: float,
+    ) -> PortfolioBlendTransition:
+        return replace(
+            transition,
+            from_weights=transition.weights_at_progress(),
+            to_weights=to_weights,
+            to_tags=to_tags,
+            source_batch_id=source_batch_id,
+            reason="retarget_during_active_blend",
+            target_drift=target_drift,
+        )
+
     def _previous_weights(
         self,
         state: RuntimeModelStateView,
@@ -515,22 +552,6 @@ class PortfolioBlendEngine:
         if isinstance(payload, Mapping):
             return PortfolioBlendTransition.from_dict(payload)
         return None
-
-    def _desired_weights(
-        self,
-        previous_weights: Mapping[str, float],
-        previous_tags: Mapping[str, str],
-        raw_weights: Mapping[str, float],
-        raw_tags: Mapping[str, str],
-    ) -> tuple[dict[str, float], dict[str, str]]:
-        desired_weights = dict(raw_weights)
-        desired_tags = dict(raw_tags)
-        if self.policy.missing_target_behavior == "zero":
-            for symbol_key, weight in previous_weights.items():
-                if symbol_key not in desired_weights and abs(weight) > 1e-12:
-                    desired_weights[symbol_key] = 0.0
-                    desired_tags[symbol_key] = previous_tags.get(symbol_key, "portfolio_blend:missing_target_zero")
-        return desired_weights, desired_tags
 
     def _bypass_symbols(self, targets: tuple[PortfolioAllocationTarget, ...]) -> set[str]:
         tokens = self.policy.bypass_target_tag_tokens
@@ -740,6 +761,13 @@ def _portfolio_blend_metadata(batch: PortfolioTargetBatch | None) -> dict[str, A
         return {}
     value = dict(batch.metadata).get("portfolio_blend")
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _target_resolution_status(batch: PortfolioTargetBatch) -> str:
+    value = dict(batch.metadata).get("portfolio_target_resolution")
+    if not isinstance(value, Mapping):
+        return ""
+    return str(value.get("status") or "").strip()
 
 
 def _target_drift(first: Mapping[str, float], second: Mapping[str, float]) -> float:

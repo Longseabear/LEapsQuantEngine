@@ -5,7 +5,8 @@ from datetime import datetime
 from uuid import uuid4
 
 from leaps_quant_engine.indicators.factory import create_indicator
-from leaps_quant_engine.indicators.registry import IndicatorRegistry
+from leaps_quant_engine.indicators.registry import IndicatorRegistry, IndicatorUpdateReport
+from leaps_quant_engine.history import get_daily_history
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue, SnapshotQualityReport
@@ -17,6 +18,7 @@ class IndicatorEngine:
     registries_by_sleeve: dict[str, IndicatorRegistry] = field(default_factory=dict)
     active_symbols_by_sleeve: dict[str, set[str]] = field(default_factory=dict)
     sleeves_by_symbol: dict[str, set[str]] = field(default_factory=dict)
+    latest_bar_metadata_by_sleeve: dict[str, dict[str, dict[str, object]]] = field(default_factory=dict)
 
     def register_universe(self, sleeve_id: str, universe: UniverseDefinition) -> None:
         registry = self.registries_by_sleeve.setdefault(sleeve_id, IndicatorRegistry())
@@ -49,10 +51,10 @@ class IndicatorEngine:
             self.sleeves_by_symbol.setdefault(symbol_key, set()).add(sleeve_id)
         self.active_symbols_by_sleeve[sleeve_id] = next_keys
 
-    def warm_up(self, sleeve_id: str, bars: list[Bar]) -> None:
+    def warm_up(self, sleeve_id: str, bars: list[Bar]) -> IndicatorUpdateReport:
         registry = self._registry(sleeve_id)
         active_symbols = self.active_symbols_by_sleeve.get(sleeve_id, set())
-        registry.update_many([bar for bar in bars if bar.symbol.key in active_symbols])
+        return registry.update_many([bar for bar in bars if bar.symbol.key in active_symbols])
 
     def warm_up_from_provider(
         self,
@@ -64,13 +66,24 @@ class IndicatorEngine:
     ) -> None:
         bars: list[Bar] = []
         for symbol in self.symbols_for_sleeve(sleeve_id):
-            bars.extend(provider.get_history(symbol, start=start, end=end))
+            bars.extend(get_daily_history(provider, symbol, start=start, end=end))
         self.warm_up(sleeve_id, bars)
 
-    def on_data(self, data: DataSlice) -> None:
+    def on_data(self, data: DataSlice) -> IndicatorUpdateReport:
+        report = IndicatorUpdateReport()
+        for sleeve_report in self.on_data_by_sleeve(data).values():
+            report = report.combine(sleeve_report)
+        return report
+
+    def on_data_by_sleeve(self, data: DataSlice) -> dict[str, IndicatorUpdateReport]:
+        reports: dict[str, IndicatorUpdateReport] = {}
         for bar in data.bars.values():
             for sleeve_id in self.sleeves_by_symbol.get(bar.symbol.key, set()):
-                self._registry(sleeve_id).update(bar)
+                self.latest_bar_metadata_by_sleeve.setdefault(sleeve_id, {})[bar.symbol.key] = dict(bar.metadata)
+                reports[sleeve_id] = reports.get(sleeve_id, IndicatorUpdateReport()).combine(
+                    self._registry(sleeve_id).update(bar)
+                )
+        return reports
 
     def update_from_provider(self, provider: MarketDataProvider) -> DataSlice:
         bars: dict[str, Bar] = {}
@@ -156,6 +169,10 @@ class IndicatorEngine:
             symbols=tuple(symbol.key for symbol in symbols),
             values=values,
             quality_report=quality_report,
+            symbol_metadata={
+                symbol.key: dict(self.latest_bar_metadata_by_sleeve.get(sleeve_id, {}).get(symbol.key, {}))
+                for symbol in symbols
+            },
         )
 
     def symbols_for_sleeve(self, sleeve_id: str) -> list[Symbol]:

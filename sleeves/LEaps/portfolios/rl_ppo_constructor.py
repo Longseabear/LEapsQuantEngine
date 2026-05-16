@@ -27,4 +27,5 @@ def create_portfolio_model(params: Mapping[str, Any] | None = None) -> Reinforce
         emit_zero_for_missing_held_targets=bool(values.get("emit_zero_for_missing_held_targets", False)),
         target_smoothing_alpha=float(values.get("target_smoothing_alpha", 1.0)),
         target_drift_threshold_pct=float(values.get("target_drift_threshold_pct", 0.0)),
+        missing_target_exit_confirmation_cycles=int(values.get("missing_target_exit_confirmation_cycles", 1)),
     )

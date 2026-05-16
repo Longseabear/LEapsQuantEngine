@@ -85,6 +85,15 @@ KIS historical operation
 
 Daily OHLCV and replay/minute bars should prefer cache-first reads. `refresh=true` should be explicit.
 
+KIS daily-history normalization must stamp daily rows as `resolution="daily"`.
+Recent KIS rows can contain broker/reference artifacts such as zero-volume
+current-day rows or adjusted-price discontinuities. The adapter quarantines the
+conservative high-risk case where a zero-volume daily row jumps by a split-like
+multiple from the previous close. That prevents confirmed daily indicators from
+absorbing a clearly invalid current-day/reference row. More nuanced corporate
+action adjustment belongs in a dedicated history repair layer, not in alpha or
+portfolio models.
+
 ## KIS Throughput Strategy
 
 Do not design universe or alpha around polling hundreds of symbols live.
@@ -107,6 +116,18 @@ Use KIS for:
 - title-level domestic/overseas news snapshots for operator or agent context
 - account/holdings/orders/fills
 - historical KIS data when it is specifically required
+
+For overseas holdings, KIS present-balance rows carry multiple quantity views.
+The adapter must keep them explicit:
+
+- `settled_quantity`: base/settled quantity such as `cblc_qty13`
+- `current_quantity`: current executed/settlement quantity such as `ccld_qty_smtl1`
+- `orderable_quantity`: broker orderable quantity such as `ord_psbl_qty1`
+
+Engine reconciliation compares virtual sleeve holdings to `current_quantity`.
+Operator reports may still show `settled_quantity` when matching an app or
+settlement-view screen. Do not mix a settled quantity with a current evaluation
+amount in the same normalized holding row.
 
 Avoid KIS for:
 

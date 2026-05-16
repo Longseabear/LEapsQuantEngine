@@ -31,9 +31,9 @@ runtime-run-multi-once configs/runtime/live_multi_sleeve.json
   --sleeve-id LEaps --sleeve-id us_etf_rotation
 ```
 
-Portfolio reports are still sleeve-scoped and read-only. They may run a
-single-sleeve `runtime-run-once` for the selected sleeve to build a current vs
-target view, but they must not be mistaken for the live submit loop.
+Portfolio reports are still sleeve-scoped and read-only. The default operator
+mode is `latest-target`, which reads the latest live-cycle artifacts instead of
+running a fresh model cycle. Use `recompute` only for explicit diagnostics.
 
 Use the repo helper:
 
@@ -42,15 +42,27 @@ py -3 tools/leaps_portfolio_report.py --config configs/runtime/live_multi_sleeve
 ```
 
 This is read-only. It builds a current-vs-target quantity report for one sleeve
-and sends it through `notify-user-message` when `--notify` is present.
-The default message layout is mobile-first stacked text. Use `--layout table`
-only for temporary desktop diagnostics.
+from stored live-cycle state and sends it through `notify-user-message` when
+`--notify` is present. The default message layout is mobile-first stacked text.
+Use `--layout table` only for temporary desktop diagnostics.
+
+Report modes:
+
+- `--mode latest-target`: default. Reads virtual account, order runtime status,
+  framework-state, cycle journal, and latest candidate-order artifact. It must
+  not collect market data, run alpha, or create fresh order intents.
+- `--mode fast-current`: account/order state only. Use when the operator asks
+  for actual current holdings, cash, or open tickets without target context.
+- `--mode recompute`: diagnostic. Runs `runtime-run-once` and recomputes the
+  single-sleeve framework path.
 
 The report must include:
 
 - snapshot quality and coverage
+- report source/mode
 - cash, equity, gross exposure, and exposure percentage
 - order candidate count for this cycle
+- open ticket count and open-ticket detail when present
 - per-symbol current quantity, target quantity, and delta
 - risk status/reason for rejected or clamped targets
 - portfolio blend status/progress when

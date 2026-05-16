@@ -23,22 +23,26 @@
     {
       "name": "close",
       "type": "close",
-      "period": 1
+      "period": 1,
+      "resolution": "live"
     },
     {
       "name": "volume",
       "type": "volume",
-      "period": 1
+      "period": 1,
+      "resolution": "live"
     },
     {
       "name": "dollar_volume_1",
       "type": "dollar_volume",
-      "period": 1
+      "period": 1,
+      "resolution": "live"
     },
     {
       "name": "vwap_1",
       "type": "vwap",
-      "period": 1
+      "period": 1,
+      "resolution": "live"
     }
   ]
 }

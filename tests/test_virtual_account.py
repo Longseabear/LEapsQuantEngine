@@ -360,6 +360,59 @@ def test_virtual_sleeve_account_allocates_one_broker_fill_across_sleeves(tmp_pat
     assert store.ownership_for_order("broker-order-1") is None
 
 
+def test_virtual_sleeve_account_can_ignore_operator_owned_broker_fill(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
+    fill = VirtualFillEvent(
+        fill_id="manual-sell-fill",
+        order_id="manual-order",
+        broker_order_id="manual-order",
+        symbol=Symbol("005930", "KRX"),
+        side=OrderSide.SELL,
+        quantity=2,
+        fill_price=70_000,
+        filled_at=datetime(2026, 5, 14, 15, 10),
+    )
+    assert store.record_broker_fill(fill) is True
+
+    ignored = store.ignore_broker_fill(
+        fill.fill_id,
+        reason="manual position outside engine sleeve",
+        ignored_by="operator",
+        ignored_at=datetime(2026, 5, 14, 15, 11),
+    )
+    statuses = store.fill_allocation_statuses()
+    report = store.reconciliation_report([], include_fills=True)
+
+    assert ignored.fill_id == fill.fill_id
+    assert statuses[0].status == "ignored"
+    assert statuses[0].remaining_quantity == 0
+    assert report.unallocated_fill_count == 0
+    payload = report.to_dict()
+    assert payload["unallocated_fills"] == []
+    assert payload["ignored_fills"][0]["fill_id"] == fill.fill_id
+
+
+def test_virtual_sleeve_account_rejects_allocating_ignored_broker_fill(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
+    fill = VirtualFillEvent(
+        fill_id="manual-sell-fill",
+        order_id="manual-order",
+        symbol=Symbol("005930", "KRX"),
+        side=OrderSide.SELL,
+        quantity=2,
+        fill_price=70_000,
+        filled_at=datetime(2026, 5, 14, 15, 10),
+    )
+    store.record_broker_fill(fill)
+    store.ignore_broker_fill(fill.fill_id, reason="manual")
+
+    with pytest.raises(ValueError, match="ignored broker fill"):
+        store.apply_fill_allocations(
+            fill,
+            (FillAllocation(fill_id=fill.fill_id, sleeve_id="LEaps", quantity=2),),
+        )
+
+
 def test_virtual_sleeve_account_allows_partial_fill_allocation(tmp_path):
     store = VirtualSleeveAccountStore(tmp_path / "accounts.json", default_cash_by_sleeve={"LEaps": 1_000_000})
     symbol = Symbol("005930", "KRX")
@@ -534,6 +587,49 @@ def test_virtual_sleeve_account_reconciliation_compares_broker_and_virtual_posit
     payload = report.to_dict()
     assert payload["rows"][0]["status"] == "mismatch"
     assert payload["unallocated_fills"][0]["remaining_quantity"] == 2
+
+
+def test_virtual_sleeve_account_reconciliation_prefers_current_broker_quantity(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json", default_cash_by_sleeve={"us_etf_rotation": 10_000})
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="fill-smh-1",
+            order_id="order-smh-1",
+            symbol=Symbol("SMH", "US"),
+            side=OrderSide.BUY,
+            quantity=3,
+            fill_price=570.0,
+            sleeve_id="us_etf_rotation",
+            filled_at=datetime(2026, 5, 15, 10, 0),
+        )
+    )
+
+    report = store.reconciliation_report(
+        {
+            "holdings": [
+                {
+                    "symbol": "SMH",
+                    "market": "US",
+                    "holding_quantity": 2,
+                    "current_quantity": 4,
+                    "settled_quantity": 2,
+                    "orderable_quantity": 4,
+                    "quantity_source": "ccld_qty_smtl1",
+                    "average_purchase_price": 566.8588,
+                }
+            ]
+        },
+        include_fills=False,
+    )
+
+    assert report.status == "needs_reconciliation"
+    assert report.rows[0].broker_quantity == 4
+    assert report.rows[0].virtual_quantity == 3
+    assert report.rows[0].difference == -1
+    payload = report.to_dict()
+    assert payload["rows"][0]["broker_quantity_source"] == "ccld_qty_smtl1"
+    assert payload["rows"][0]["broker_settled_quantity"] == 2
+    assert payload["rows"][0]["broker_orderable_quantity"] == 4
 
 
 def test_virtual_sleeve_account_is_not_used_by_backtest_portfolio(tmp_path):

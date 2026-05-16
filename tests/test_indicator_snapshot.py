@@ -9,7 +9,7 @@ from leaps_quant_engine.universe.loader import parse_universe_definition
 
 def _bar(symbol: Symbol, minute: int, close: float) -> Bar:
     time = datetime(2026, 5, 7, 9, 0) + timedelta(minutes=minute)
-    return Bar(symbol, time, close, close, close, close, 100)
+    return Bar(symbol, time, close, close, close, close, 100, resolution="daily")
 
 
 def _engine_with_sma() -> tuple[IndicatorEngine, Symbol]:
@@ -51,6 +51,38 @@ def test_indicator_snapshot_values_are_read_only():
 
     with pytest.raises(TypeError):
         snapshot.values[symbol.key]["sma_2_close"] = snapshot.values[symbol.key]["sma_2_close"]
+
+
+def test_indicator_snapshot_exposes_latest_bar_metadata_to_alpha_context():
+    from leaps_quant_engine.alpha import SnapshotContext
+
+    engine, symbol = _engine_with_sma()
+    engine.on_data(
+        DataSlice(
+            time=datetime(2026, 5, 7, 9, 0),
+            bars={
+                symbol.key: Bar(
+                    symbol,
+                    datetime(2026, 5, 7, 9, 0),
+                    110,
+                    120,
+                    98,
+                    115,
+                    100,
+                    resolution="daily",
+                    metadata={
+                        "opening_context_source": "daily_ohlc_proxy",
+                        "opening_gap_pct": 0.1,
+                    },
+                )
+            },
+        )
+    )
+
+    context = SnapshotContext.from_indicator_snapshot(engine.snapshot("swing-kor"))
+
+    assert context.metadata(symbol)["opening_context_source"] == "daily_ohlc_proxy"
+    assert context.metadata_value(symbol.key, "opening_gap_pct") == pytest.approx(0.1)
 
 
 def test_indicator_snapshot_store_keeps_pending_until_swap():

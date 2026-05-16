@@ -83,3 +83,38 @@ def test_order_runtime_status_combines_tickets_portfolio_and_unallocated_fills(t
     assert payload["sleeves"][0]["portfolio"]["cash"] == 930_000
     assert payload["sleeves"][0]["portfolio"]["holdings"][0]["quantity"] == 1
     assert payload["sleeves"][0]["pending_buy_notional"] == 140_000
+
+
+def test_order_runtime_status_does_not_need_attention_for_ignored_broker_fill(tmp_path):
+    account_store_path = tmp_path / "accounts.json"
+    order_store_path = tmp_path / "orders.jsonl"
+    account_store = VirtualSleeveAccountStore(account_store_path, default_cash_by_sleeve={"LEaps": 1_000_000})
+    fill = VirtualFillEvent(
+        fill_id="manual-fill",
+        order_id="manual-order",
+        symbol=Symbol("005930", "KRX"),
+        side=OrderSide.SELL,
+        quantity=2,
+        fill_price=70_000,
+        filled_at=datetime(2026, 5, 14, 15, 10),
+    )
+    account_store.record_broker_fill(fill)
+    account_store.ignore_broker_fill(fill.fill_id, reason="operator owned manual exit")
+    order_store_path.write_text("", encoding="utf-8")
+    order_store = FileOrderRuntimeStateStore(order_store_path)
+
+    report = build_order_runtime_status(
+        runtime_id="test-runtime",
+        sleeve_ids=("LEaps",),
+        order_state_store=order_store,
+        account_store=account_store,
+        order_store_path=order_store_path,
+        account_store_path=account_store_path,
+        generated_at=datetime(2026, 5, 14, 15, 11),
+    )
+    payload = report.to_dict(include_details=True)
+
+    assert payload["needs_attention"] is False
+    assert payload["virtual_account"]["unallocated_fill_count"] == 0
+    assert payload["virtual_account"]["ignored_fill_count"] == 1
+    assert payload["virtual_account"]["allocation_status_counts"] == {"ignored": 1}

@@ -99,3 +99,18 @@ def test_indicator_registry_does_not_advance_daily_indicator_from_live_bar():
 
     assert ready["sma_2_close"] == pytest.approx(15)
     assert registry.ready_values(symbol)["sma_2_close"] == pytest.approx(15)
+
+
+@pytest.mark.parametrize("resolution", ["quote", "live", "minute", "any", "unknown"])
+def test_indicator_registry_blocks_non_daily_resolution_for_confirmed_daily_indicator(resolution: str):
+    symbol = Symbol("005930", "KRX")
+    registry = IndicatorRegistry()
+    registry.add(symbol, SimpleMovingAverage(2), resolution="daily")
+
+    registry.update(_bar(symbol, 0, 10, resolution="daily"))
+    registry.update(_bar(symbol, 1, 20, resolution="daily"))
+    report = registry.update(_bar(symbol, 2, 1_000, resolution=resolution))
+
+    assert report.updated_count == 0
+    assert report.resolution_mismatch_count == 1
+    assert registry.ready_values(symbol)["sma_2_close"] == pytest.approx(15)

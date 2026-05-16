@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
 
 from leaps_quant_engine.snapshots.freshness import SnapshotQualityReport
 
@@ -30,10 +30,12 @@ class IndicatorSnapshot:
     values: Mapping[str, Mapping[str, IndicatorValue]]
     source_snapshot_id: str | None = None
     quality_report: SnapshotQualityReport | None = None
+    symbol_metadata: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbols", tuple(self.symbols))
         object.__setattr__(self, "values", _freeze_values(self.values))
+        object.__setattr__(self, "symbol_metadata", _freeze_metadata(self.symbol_metadata))
 
     def value(self, symbol_key: str, name: str, *, ready_only: bool = True) -> float | None:
         indicator_value = self.values.get(symbol_key, {}).get(name)
@@ -49,6 +51,12 @@ class IndicatorSnapshot:
             for name, indicator_value in self.values.get(symbol_key, {}).items()
             if indicator_value.is_ready and indicator_value.value is not None
         }
+
+    def metadata(self, symbol_key: str) -> Mapping[str, Any]:
+        return self.symbol_metadata.get(symbol_key, MappingProxyType({}))
+
+    def metadata_value(self, symbol_key: str, name: str, default: Any = None) -> Any:
+        return self.symbol_metadata.get(symbol_key, {}).get(name, default)
 
 
 @dataclass(slots=True)
@@ -90,5 +98,15 @@ def _freeze_values(
     frozen_symbols = {
         symbol_key: MappingProxyType(dict(indicator_values))
         for symbol_key, indicator_values in values.items()
+    }
+    return MappingProxyType(frozen_symbols)
+
+
+def _freeze_metadata(
+    metadata: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Mapping[str, Any]]:
+    frozen_symbols = {
+        symbol_key: MappingProxyType(dict(symbol_metadata))
+        for symbol_key, symbol_metadata in metadata.items()
     }
     return MappingProxyType(frozen_symbols)

@@ -164,6 +164,31 @@ class FillAllocation:
 
 
 @dataclass(frozen=True, slots=True)
+class IgnoredBrokerFill:
+    fill_id: str
+    ignored_at: datetime
+    reason: str = ""
+    ignored_by: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fill_id": self.fill_id,
+            "ignored_at": self.ignored_at.isoformat(),
+            "reason": self.reason,
+            "ignored_by": self.ignored_by,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "IgnoredBrokerFill":
+        return cls(
+            fill_id=str(payload["fill_id"]),
+            ignored_at=datetime.fromisoformat(str(payload["ignored_at"])),
+            reason=str(payload.get("reason") or ""),
+            ignored_by=str(payload.get("ignored_by") or ""),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AccountCashSnapshot:
     account_id: str
     cash_balance: float
@@ -330,13 +355,18 @@ class FillAllocationStatus:
     fill: VirtualFillEvent
     allocated_quantity: int
     allocations: tuple[FillAllocation, ...] = ()
+    ignored: IgnoredBrokerFill | None = None
 
     @property
     def remaining_quantity(self) -> int:
+        if self.ignored is not None:
+            return 0
         return self.fill.quantity - self.allocated_quantity
 
     @property
     def status(self) -> str:
+        if self.ignored is not None:
+            return "ignored"
         if self.allocated_quantity <= 0:
             return "unallocated"
         if self.remaining_quantity > 0:
@@ -356,6 +386,7 @@ class FillAllocationStatus:
             "remaining_quantity": self.remaining_quantity,
             "status": self.status,
             "allocations": [allocation.to_dict() for allocation in self.allocations],
+            "ignored": self.ignored.to_dict() if self.ignored is not None else None,
         }
 
 
@@ -365,6 +396,10 @@ class PositionReconciliationRow:
     broker_quantity: int
     virtual_quantity: int
     broker_average_price: float | None = None
+    broker_quantity_source: str | None = None
+    broker_current_quantity: int | None = None
+    broker_settled_quantity: int | None = None
+    broker_orderable_quantity: int | None = None
 
     @property
     def difference(self) -> int:
@@ -382,6 +417,10 @@ class PositionReconciliationRow:
             "virtual_quantity": self.virtual_quantity,
             "difference": self.difference,
             "broker_average_price": self.broker_average_price,
+            "broker_quantity_source": self.broker_quantity_source,
+            "broker_current_quantity": self.broker_current_quantity,
+            "broker_settled_quantity": self.broker_settled_quantity,
+            "broker_orderable_quantity": self.broker_orderable_quantity,
             "status": self.status,
         }
 
@@ -397,7 +436,11 @@ class VirtualAccountReconciliationReport:
 
     @property
     def unallocated_fill_count(self) -> int:
-        return sum(1 for status in self.allocation_statuses if status.remaining_quantity > 0)
+        return sum(
+            1
+            for status in self.allocation_statuses
+            if status.remaining_quantity > 0 and status.status != "ignored"
+        )
 
     @property
     def status(self) -> str:
@@ -415,6 +458,13 @@ class VirtualAccountReconciliationReport:
                 status.to_dict()
                 for status in self.allocation_statuses
                 if status.remaining_quantity > 0
+            ]
+            if include_fills
+            else [],
+            "ignored_fills": [
+                status.to_dict()
+                for status in self.allocation_statuses
+                if status.status == "ignored"
             ]
             if include_fills
             else [],
@@ -745,6 +795,8 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         state = self._load_state()
         if fill.fill_id in state["fills"]:
             raise ValueError("fill was already applied directly and cannot be allocated.")
+        if fill.fill_id in state["ignored_broker_fills"]:
+            raise ValueError("ignored broker fill cannot be allocated.")
         existing_allocated_quantity = sum(
             int(raw.get("quantity") or 0)
             for raw in state["fill_allocations"].values()
@@ -799,6 +851,36 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         self._write_state(state)
         return True
 
+    def ignore_broker_fill(
+        self,
+        fill_id: str,
+        *,
+        reason: str = "",
+        ignored_by: str = "",
+        ignored_at: datetime | None = None,
+    ) -> IgnoredBrokerFill:
+        state = self._load_state()
+        if fill_id not in state["broker_fills"]:
+            raise ValueError(f"broker fill not found: {fill_id}")
+        if fill_id in state["fills"]:
+            raise ValueError("fill was already applied to a sleeve portfolio.")
+        allocated_quantity = sum(
+            int(raw.get("quantity") or 0)
+            for raw in state["fill_allocations"].values()
+            if raw.get("fill_id") == fill_id
+        )
+        if allocated_quantity:
+            raise ValueError("partially or fully allocated broker fill cannot be ignored.")
+        record = IgnoredBrokerFill(
+            fill_id=fill_id,
+            ignored_at=ignored_at or datetime.now().astimezone(),
+            reason=reason,
+            ignored_by=ignored_by,
+        )
+        state["ignored_broker_fills"][fill_id] = record.to_dict()
+        self._write_state(state)
+        return record
+
     def broker_fill(self, fill_id: str) -> VirtualFillEvent | None:
         state = self._load_state()
         payload = state["broker_fills"].get(fill_id)
@@ -815,6 +897,10 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         for raw in state["fill_allocations"].values():
             allocation = FillAllocation.from_dict(raw)
             allocations_by_fill.setdefault(allocation.fill_id, []).append(allocation)
+        ignored_by_fill = {
+            fill_id: IgnoredBrokerFill.from_dict(raw)
+            for fill_id, raw in state["ignored_broker_fills"].items()
+        }
         statuses: list[FillAllocationStatus] = []
         for raw in state["broker_fills"].values():
             fill = VirtualFillEvent.from_dict(raw)
@@ -832,6 +918,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                     fill=fill,
                     allocated_quantity=allocated_quantity,
                     allocations=allocations,
+                    ignored=ignored_by_fill.get(fill.fill_id),
                 )
             )
         return tuple(sorted(statuses, key=lambda status: (status.fill.filled_at, status.fill.fill_id)))
@@ -854,6 +941,10 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                     broker_quantity=int(broker_positions.get(symbol_key, {}).get("quantity") or 0),
                     virtual_quantity=int(virtual_positions.get(symbol_key, 0)),
                     broker_average_price=broker_positions.get(symbol_key, {}).get("average_price"),
+                    broker_quantity_source=broker_positions.get(symbol_key, {}).get("quantity_source"),
+                    broker_current_quantity=broker_positions.get(symbol_key, {}).get("current_quantity"),
+                    broker_settled_quantity=broker_positions.get(symbol_key, {}).get("settled_quantity"),
+                    broker_orderable_quantity=broker_positions.get(symbol_key, {}).get("orderable_quantity"),
                 )
             )
         statuses = self.fill_allocation_statuses() if include_fills else ()
@@ -925,6 +1016,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                 "fills": {},
                 "broker_fills": {},
                 "fill_allocations": {},
+                "ignored_broker_fills": {},
                 "account_cash_snapshots": {},
                 "cash_transfers": {},
                 "position_states": {},
@@ -939,6 +1031,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         payload.setdefault("fills", {})
         payload.setdefault("broker_fills", {})
         payload.setdefault("fill_allocations", {})
+        payload.setdefault("ignored_broker_fills", {})
         payload.setdefault("account_cash_snapshots", {})
         payload.setdefault("cash_transfers", {})
         payload.setdefault("position_states", {})
@@ -1126,12 +1219,25 @@ def _broker_positions_from_holdings(payload: dict[str, Any] | list[dict[str, Any
         if not ticker:
             continue
         symbol = Symbol(ticker=ticker, market=str(row.get("market") or "KRX"))
+        quantity, quantity_source = _broker_position_quantity(row)
         positions[symbol.key] = {
             "symbol": _symbol_to_dict(symbol),
-            "quantity": int(float(str(row.get("holding_quantity") or row.get("quantity") or 0).replace(",", ""))),
+            "quantity": quantity,
             "average_price": _float_or_none(row.get("average_purchase_price") or row.get("average_price")),
+            "quantity_source": quantity_source,
+            "current_quantity": _int_or_none(row.get("current_quantity")),
+            "settled_quantity": _int_or_none(row.get("settled_quantity")),
+            "orderable_quantity": _int_or_none(row.get("orderable_quantity")),
         }
     return positions
+
+
+def _broker_position_quantity(row: dict[str, Any]) -> tuple[int, str]:
+    for key in ("current_quantity", "holding_quantity", "quantity"):
+        quantity = _int_or_none(row.get(key))
+        if quantity is not None:
+            return quantity, str(row.get("quantity_source") or key)
+    return 0, "missing"
 
 
 def _currency_code(currency: str) -> str:
@@ -1197,6 +1303,15 @@ def _float_or_none(value: Any) -> float | None:
     if not text:
         return None
     return float(text)
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if not text:
+        return None
+    return int(float(text))
 
 
 def _broker_order_aliases(broker_order_id: str) -> tuple[str, ...]:

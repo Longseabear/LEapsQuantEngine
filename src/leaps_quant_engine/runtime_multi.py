@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from leaps_quant_engine.framework import FileFrameworkRunnerStateStore
-from leaps_quant_engine.indicators import IndicatorEngine
+from leaps_quant_engine.indicators import IndicatorEngine, IndicatorUpdateReport
 from leaps_quant_engine.market_data_snapshot import MarketDataSnapshot, MarketDataSnapshotEngine
 from leaps_quant_engine.models import Bar, Symbol
 from leaps_quant_engine.runtime_bootstrap import (
@@ -161,6 +161,7 @@ def run_multi_sleeve_once(
         universe_id_by_sleeve={runtime.sleeve_id: runtime.active_result.active_universe.id for runtime in runtimes},
         quality_report_by_sleeve=quality_by_sleeve,
     )
+    indicator_update_reports = dict(snapshot_engine.last_indicator_update_report_by_sleeve)
     indicator_update_ms = (time.perf_counter() - update_started) * 1000
 
     reports: list[RuntimeRunOnceReport] = []
@@ -175,6 +176,7 @@ def run_multi_sleeve_once(
             indicator_snapshot=indicator_snapshot,
             quality_report=quality_by_sleeve[runtime.sleeve_id],
             collection_report=collection.report,
+            indicator_update_report=indicator_update_reports.get(runtime.sleeve_id, IndicatorUpdateReport()),
             indicator_update_ms=indicator_update_ms,
             started_at=started_at,
             completed_at=completed_at,
@@ -267,6 +269,7 @@ def _worker_report_for_runtime(
     indicator_snapshot,
     quality_report: SnapshotQualityReport,
     collection_report,
+    indicator_update_report: IndicatorUpdateReport,
     indicator_update_ms: float,
     started_at: datetime,
     completed_at: datetime,
@@ -293,6 +296,8 @@ def _worker_report_for_runtime(
         failed_symbol_count=failed_count,
         indicator_count_per_symbol=len(runtime.active_result.active_universe.indicators),
         indicator_updates_estimated=updated_count * len(runtime.active_result.active_universe.indicators),
+        indicator_update_count=indicator_update_report.updated_count,
+        indicator_resolution_mismatch_count=indicator_update_report.resolution_mismatch_count,
         market_snapshot_id=collection_snapshot.snapshot_id,
         indicator_snapshot_id=indicator_snapshot.snapshot_id,
         snapshot_as_of=indicator_snapshot.as_of.isoformat(),

@@ -18,6 +18,7 @@ MIN_PULLBACK_DEPTH = 0.015
 MAX_NORMALIZED_VOLATILITY = 0.17
 MAX_REBREAK_DISTANCE = 0.05
 MIN_REBREAK_MOMENTUM_5 = 0.015
+MAX_PLAUSIBLE_DAILY_FEATURE_ABS = 3.0
 
 
 def generate(context: SnapshotContext) -> list[Insight]:
@@ -49,6 +50,8 @@ def generate(context: SnapshotContext) -> list[Insight]:
             continue
 
         trend_strength = (close / slow_average) - 1.0
+        if _has_implausible_daily_feature(momentum_20, momentum_5 or 0.0, trend_strength):
+            continue
         if trend_strength <= 0.0 or fast_average < slow_average or momentum_20 < MIN_TREND_MOMENTUM:
             continue
 
@@ -197,3 +200,7 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
+
+
+def _has_implausible_daily_feature(*values: float | None) -> bool:
+    return any(value is not None and abs(value) > MAX_PLAUSIBLE_DAILY_FEATURE_ABS for value in values)

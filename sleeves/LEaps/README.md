@@ -11,16 +11,19 @@ Initial layout:
 sleeves/LEaps/
   alphas/
     kospi_conviction.py
+    krx_etf_safety.py
     us_stability_hedge.py
     momentum.py
     volatility_trailing_stop.py
     etf_rotation.py
   selections/
     stock_momentum.py
+    krx_etf_safety.py
     etf_rotation.py
     operational_symbols.py
   portfolios/
     equal_weight.py
+    research_adaptive_allocator.py
     rl_ppo_constructor.py
   risks/
     kospi_growth_us_hedge.py
@@ -45,6 +48,7 @@ Selection models can be wired with workspace-relative `module.py:ClassName` refe
   "active": {
     "selection_models": [
       "selections/stock_momentum.py:StockMomentumSelectionModel",
+      "selections/krx_etf_safety.py:KrxEtfSafetySelectionModel",
       "selections/etf_rotation.py:EtfRotationSelectionModel",
       "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
     ]
@@ -53,6 +57,7 @@ Selection models can be wired with workspace-relative `module.py:ClassName` refe
 "alpha": {
   "input_selections": {
     "leaps-kospi-conviction": "leaps-stock-momentum",
+    "leaps-krx-etf-safety": "leaps-krx-etf-safety",
     "leaps-us-stability-hedge": "leaps-etf-rotation",
     "leaps-volatility-trailing-stop": "leaps-operational-symbols",
   }
@@ -78,7 +83,14 @@ py -3 -m leaps_quant_engine.cli sleeve-portfolio-set configs/runtime/leaps_works
 
 After changing active alpha modules or the portfolio model, send the emitted `reload_sleeve` command to apply the new config at a runtime boundary.
 
-The active LEaps research config now uses `portfolios/rl_ppo_constructor.py`,
+The active `live_multi_sleeve` LEaps profile now uses
+`portfolios/research_adaptive_allocator.py` with a separate KRX ETF safety
+bucket. Stock momentum and pullback insights still form the growth book, while
+`leaps-krx-etf-safety` can reserve target weight for KRX cash-like ETFs,
+KODEX 200, and the 1x inverse ETF when the KODEX 200 regime deteriorates.
+Those ETF insights are explicitly excluded from the stock top-k ranking.
+
+The smoke/research RL config remains available via `portfolios/rl_ppo_constructor.py`,
 which wraps a Stable-Baselines3 PPO policy ensemble. In the active
 `allocation_mode=rl_weights` profile, PPO directly emits a top-k asset weight
 vector plus a cash weight. The runtime maps those weights onto the ranked active
@@ -124,6 +136,24 @@ target_smoothing_alpha = 1.0
 target_drift_threshold_pct = 0.035
 ```
 
+Expanded-universe candidate:
+
+```text
+config = configs/runtime/leaps_workspace_kr200_candidate.json
+universe = configs/universes/leaps_kr_research_200.json
+symbols = KRX turnover top 200, FDR names attached
+active max symbols = 60
+top_k = 12
+training cash = 17,329,806 KRW
+policy ensemble = seeds 941, 947
+target_smoothing_alpha = 0.6
+target_drift_threshold_pct = 0.05
+```
+
+The candidate is intentionally kept separate from the live config. It expands
+the opportunity set for KRX momentum, but should be promoted only after the
+operator accepts the higher turnover and broader small/mid-cap exposure.
+
 The earlier gross-exposure controller remains available for comparison and
 fallback, but it is no longer the active LEaps runtime mode.
 
@@ -132,6 +162,14 @@ the `target_anchor` namespace. It does not delay large target changes; it only
 reuses the previous target when the new target is within 3.5 percentage points,
 which suppresses small rank/noise churn while keeping explicit FLAT/DOWN stop
 exits immediate.
+
+Engine target resolution now runs before portfolio blend. LEaps treats portfolio
+output as a complete desired target set: symbols present in the previous target
+snapshot but missing from the new valid target set are resolved to explicit 0%
+targets, then the blend layer fades them out over the configured transition
+window unless the target is tagged as an urgent exit. Empty raw target batches
+remain no-action by default; explicit 0% targets are required when a model wants
+to close everything.
 
 Alpha v0.2 notes:
 
@@ -142,6 +180,11 @@ Alpha v0.2 notes:
 - `leaps-kospi-pullback-reversion` is active as the timing alpha for strong KRX
   stocks. It looks for healthy pullbacks or shallow rebreaks inside an existing
   uptrend.
+- `leaps-krx-etf-safety` is active in `live_multi_sleeve` and the KR200
+  candidate config. It reads KODEX 200 daily indicators as the local market
+  proxy and emits target-bucket ETF insights for cash-like KRX ETFs, KODEX 200,
+  or KODEX Inverse. The portfolio model consumes these as a separate safety
+  bucket instead of mixing them into stock ranking.
 - `leaps-us-stability-hedge` is kept as a research module, but it is not active
   in the current LEaps live profile. US ETF rotation/stability is handled by the
   separate `us_etf_rotation` sleeve.
@@ -151,7 +194,12 @@ Alpha v0.2 notes:
   in the `trailing_stop` namespace; it does not read or write virtual account
   files directly.
 - `risks/kospi_growth_us_hedge.py` currently applies the KRW growth budget and
-  regime exposure cap for this KRX-only LEaps profile.
+  regime exposure cap for this KRX-only LEaps profile. It also has an
+  intraday KODEX 200 guard for minute/live cycles: before 09:40 it freezes new
+  stock entries, then it freezes or risk-off clamps KRW exposure when KODEX 200
+  is weak versus the prior daily reference or rolls over from the session high.
+  Defensive KRX ETF targets are exempt from the entry freeze so cash-like and
+  inverse ETF protection can still be approved.
 
 Execution v0.2 notes:
 

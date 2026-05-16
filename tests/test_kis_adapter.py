@@ -128,6 +128,7 @@ def test_kis_provider_normalizes_daily_history_rows():
     assert bars[0].time == datetime(2026, 5, 7)
     assert bars[0].open == 69000.0
     assert bars[0].close == 70000.0
+    assert bars[0].resolution == "daily"
     assert provider.client.calls[0][1]["start_date"] == "20260501"
     assert provider.client.calls[0][1]["end_date"] == "20260507"
 
@@ -285,6 +286,7 @@ def test_cached_kis_provider_loads_domestic_minute_history_from_cache_tool():
     ]
     assert bars[0].close == 69950.0
     assert bars[1].volume == 100
+    assert {bar.resolution for bar in bars} == {"minute"}
     assert provider.client.calls[0] == (
         "get_or_cache_domestic_minute_bars",
         {
@@ -296,3 +298,36 @@ def test_cached_kis_provider_loads_domestic_minute_history_from_cache_tool():
             "refresh": True,
         },
     )
+
+
+def test_cached_kis_provider_quarantines_zero_volume_adjusted_price_discontinuity():
+    class DiscontinuousHistoryClient(FakeMarketDataEngineClient):
+        def call_tool(self, tool, arguments=None):
+            self.calls.append((tool, arguments))
+            return {
+                "rows": [
+                    {
+                        "stck_bsop_date": "20260514",
+                        "stck_oprc": "3995",
+                        "stck_hgpr": "3995",
+                        "stck_lwpr": "3995",
+                        "stck_clpr": "3995",
+                        "acml_vol": "1000",
+                    },
+                    {
+                        "stck_bsop_date": "20260515",
+                        "stck_oprc": "39950",
+                        "stck_hgpr": "39950",
+                        "stck_lwpr": "39950",
+                        "stck_clpr": "39950",
+                        "acml_vol": "0",
+                    },
+                ]
+            }
+
+    provider = KISCachedMarketDataProvider(client=DiscontinuousHistoryClient())
+
+    bars = provider.get_cached_daily_history(Symbol("005930", "KRX"))
+
+    assert [bar.time for bar in bars] == [datetime(2026, 5, 14)]
+    assert bars[0].close == 3995

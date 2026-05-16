@@ -26,6 +26,8 @@ RL_MAX_NORMALIZED_VOLATILITY = 0.18
 RL_EXTREME_NORMALIZED_VOLATILITY = 0.24
 RL_HIGH_VOL_MOMENTUM_EXCEPTION = 0.45
 RL_VOLATILITY_SCORE_PENALTY = 0.75
+RL_MAX_PLAUSIBLE_FEATURE_ABS = 3.0
+RL_MAX_PLAUSIBLE_SCORE_ABS = 3.0
 RL_MIN_TRAINING_HISTORY_BARS = 252
 RL_HISTORY_KEEP_RATIO = 0.80
 
@@ -136,12 +138,16 @@ class ReinforcementLearningPortfolioConstructionModel:
     target_drift_threshold_pct: float = 0.0
     target_anchor_model_id: str = "rl-portfolio-constructor"
     target_anchor_namespace: str = "target_anchor"
+    target_membership_namespace: str = "target_membership"
+    missing_target_exit_confirmation_cycles: int = 1
 
     def __post_init__(self) -> None:
         if not 0.0 < self.target_smoothing_alpha <= 1.0:
             raise ValueError("target_smoothing_alpha must be greater than 0 and at most 1.")
         if self.target_drift_threshold_pct < 0:
             raise ValueError("target_drift_threshold_pct cannot be negative.")
+        if self.missing_target_exit_confirmation_cycles < 1:
+            raise ValueError("missing_target_exit_confirmation_cycles must be at least 1.")
 
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
         actionable_by_currency: dict[str, list] = {}
@@ -215,25 +221,28 @@ class ReinforcementLearningPortfolioConstructionModel:
         context: PortfolioConstructionContext,
         targets: tuple[PortfolioAllocationTarget, ...],
     ) -> tuple[StatePatch, ...]:
-        if not self._target_smoothing_enabled():
-            return ()
-        return tuple(
-            StatePatch(
-                key=context.model_state.key(
-                    model_id=self.target_anchor_model_id,
-                    namespace=self.target_anchor_namespace,
-                    symbol_key=target.symbol.key,
-                ),
-                value={
-                    "target_percent": target.target_percent,
-                    "tag": target.tag,
-                    "updated_at": context.data.time.isoformat(),
-                },
-                reason="portfolio_target_anchor",
-                generated_at=context.data.time,
+        patches: list[StatePatch] = []
+        if self._target_smoothing_enabled():
+            patches.extend(
+                StatePatch(
+                    key=context.model_state.key(
+                        model_id=self.target_anchor_model_id,
+                        namespace=self.target_anchor_namespace,
+                        symbol_key=target.symbol.key,
+                    ),
+                    value={
+                        "target_percent": target.target_percent,
+                        "tag": target.tag,
+                        "updated_at": context.data.time.isoformat(),
+                    },
+                    reason="portfolio_target_anchor",
+                    generated_at=context.data.time,
+                )
+                for target in targets
             )
-            for target in targets
-        )
+        if self.missing_target_exit_confirmation_cycles > 1:
+            patches.extend(self._target_membership_patches(context, targets))
+        return tuple(patches)
 
     def _add_missing_held_zero_targets(
         self,
@@ -251,11 +260,84 @@ class ReinforcementLearningPortfolioConstructionModel:
                 continue
             if context.portfolio.quantity(symbol) == 0:
                 continue
+            missing_count = self._missing_target_count(context, symbol.key) + 1
+            if missing_count < self.missing_target_exit_confirmation_cycles:
+                hold_percent = self._current_position_percent(context, symbol)
+                if hold_percent <= 0:
+                    continue
+                targets[symbol.key] = PortfolioAllocationTarget(
+                    symbol=symbol,
+                    target_percent=hold_percent,
+                    tag=(
+                        f"rl:{self.model_name}:missing_target_hold:"
+                        f"{missing_count}/{self.missing_target_exit_confirmation_cycles}"
+                    ),
+                )
+                continue
             targets[symbol.key] = PortfolioAllocationTarget(
                 symbol=symbol,
                 target_percent=0.0,
                 tag=f"rl:{self.model_name}:no_longer_in_target_portfolio",
             )
+
+    def _target_membership_patches(
+        self,
+        context: PortfolioConstructionContext,
+        targets: tuple[PortfolioAllocationTarget, ...],
+    ) -> tuple[StatePatch, ...]:
+        return tuple(
+            StatePatch(
+                key=context.model_state.key(
+                    model_id=self.target_anchor_model_id,
+                    namespace=self.target_membership_namespace,
+                    symbol_key=target.symbol.key,
+                ),
+                value={
+                    "missing_count": self._target_missing_count_from_tag(target),
+                    "tag": target.tag,
+                    "updated_at": context.data.time.isoformat(),
+                },
+                reason="portfolio_target_membership",
+                generated_at=context.data.time,
+            )
+            for target in targets
+        )
+
+    def _target_missing_count_from_tag(self, target: PortfolioAllocationTarget) -> int:
+        tag = target.tag or ""
+        if "no_longer_in_target_portfolio" in tag:
+            return self.missing_target_exit_confirmation_cycles
+        marker = ":missing_target_hold:"
+        if marker not in tag:
+            return 0
+        suffix = tag.rsplit(marker, 1)[-1]
+        count_text = suffix.split("/", 1)[0]
+        try:
+            return max(0, int(count_text))
+        except ValueError:
+            return 1
+
+    def _missing_target_count(self, context: PortfolioConstructionContext, symbol_key: str) -> int:
+        record = context.model_state.get(
+            model_id=self.target_anchor_model_id,
+            namespace=self.target_membership_namespace,
+            symbol_key=symbol_key,
+        )
+        if record is None:
+            return 0
+        try:
+            return max(0, int(record.value.get("missing_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _current_position_percent(self, context: PortfolioConstructionContext, symbol: Symbol) -> float:
+        target_value = context.target_value_for_symbol(symbol)
+        if target_value <= 0:
+            return 0.0
+        return _clamp_target_percent(
+            context.portfolio.position_value(symbol, context.data) / target_value,
+            long_only=self.long_only,
+        )
 
     def _smooth_targets(
         self,
@@ -717,10 +799,26 @@ def _latest_up_insights(context: PortfolioConstructionContext) -> tuple[Any, ...
     for insight in context.active_insights:
         if insight.direction.value != "up":
             continue
+        if not _is_plausible_actionable_insight(insight):
+            continue
         previous = latest.get(insight.symbol_key)
         if previous is None or insight.generated_at > previous.generated_at:
             latest[insight.symbol_key] = insight
     return tuple(latest.values())
+
+
+def _is_plausible_actionable_insight(insight: Any) -> bool:
+    metadata = getattr(insight, "metadata", {}) or {}
+    for key in ("momentum", "momentum_5", "momentum_60", "trend_strength"):
+        value = _safe_float(metadata.get(key))
+        if value is None:
+            continue
+        if not math.isfinite(value) or abs(value) > RL_MAX_PLAUSIBLE_FEATURE_ABS:
+            return False
+    score = _safe_float(getattr(insight, "score", None))
+    if score is not None and (not math.isfinite(score) or abs(score) > RL_MAX_PLAUSIBLE_SCORE_ABS):
+        return False
+    return True
 
 
 def _latest_non_up_symbol_keys(insights: tuple[Any, ...]) -> set[str]:

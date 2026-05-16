@@ -9,6 +9,8 @@ param(
     [string]$ScheduleMode = "phase",
     [ValidateSet("auto", "domestic", "overseas")]
     [string]$MarketScope = "auto",
+    [ValidateSet("latest-target", "fast-current", "recompute")]
+    [string]$ReportMode = "latest-target",
     [string]$StatePath = "",
     [int]$FailureRetrySeconds = 300,
     [int]$IdleLogEverySeconds = 1800
@@ -173,7 +175,7 @@ function Invoke-PortfolioReport {
     $started = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-LoopLog "report start phase=$PhaseName label=$PhaseLabel"
 
-    $output = & py -3 tools/leaps_portfolio_report.py --config $Config --sleeve-id $SleeveId --account-store $AccountStore --title $reportTitle --notify 2>&1
+    $output = & py -3 tools/leaps_portfolio_report.py --config $Config --sleeve-id $SleeveId --account-store $AccountStore --title $reportTitle --mode $ReportMode --notify 2>&1
     $exitCode = $LASTEXITCODE
     $lines = @($output | ForEach-Object { [string]$_ })
     if ($exitCode -eq 0) {
@@ -193,7 +195,7 @@ $marketTimeZone = Get-MarketTimeZone -Scope $resolvedMarketScope
 $phases = Get-ReportPhases -Scope $resolvedMarketScope
 $phaseDescription = ($phases | ForEach-Object { "$($_.name)=$($_.start)-$($_.end)" }) -join ","
 
-Write-LoopLog "portfolio report loop started config=$Config sleeve=$SleeveId schedule_mode=$ScheduleMode interval=${IntervalSeconds}s market_scope=$resolvedMarketScope timezone=$($marketTimeZone.Id) state=$StatePath phases=$phaseDescription"
+Write-LoopLog "portfolio report loop started config=$Config sleeve=$SleeveId mode=$ReportMode schedule_mode=$ScheduleMode interval=${IntervalSeconds}s market_scope=$resolvedMarketScope timezone=$($marketTimeZone.Id) state=$StatePath phases=$phaseDescription"
 
 $lastIdleLogAt = [datetime]::MinValue
 $lastLoggedSentKey = ""

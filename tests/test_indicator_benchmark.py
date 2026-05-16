@@ -38,6 +38,7 @@ def _bar(symbol: Symbol, day: int, close: float | None = None) -> Bar:
         low=value - 2,
         close=value,
         volume=1000 + day,
+        resolution="daily",
     )
 
 

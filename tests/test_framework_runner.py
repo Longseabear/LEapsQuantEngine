@@ -12,7 +12,7 @@ from leaps_quant_engine.framework import (
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, ModelStateKey, StatePatch
-from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
+from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue, SnapshotQualityReport, SnapshotQualityStatus
 
 
 class OneShotAlpha:
@@ -99,6 +99,30 @@ def _snapshot(as_of: datetime, symbol: Symbol) -> IndicatorSnapshot:
                 "close": IndicatorValue("close", 100.0, True, 1, as_of),
             }
         },
+    )
+
+
+def _invalid_snapshot(as_of: datetime, symbol: Symbol) -> IndicatorSnapshot:
+    snapshot = _snapshot(as_of, symbol)
+    return IndicatorSnapshot(
+        snapshot_id=snapshot.snapshot_id,
+        sleeve_id=snapshot.sleeve_id,
+        universe_id=snapshot.universe_id,
+        as_of=snapshot.as_of,
+        created_at=snapshot.created_at,
+        symbols=snapshot.symbols,
+        source_snapshot_id=snapshot.source_snapshot_id,
+        values=snapshot.values,
+        quality_report=SnapshotQualityReport(
+            status=SnapshotQualityStatus.INVALID,
+            complete_ratio=0.0,
+            age_seconds=0.0,
+            collection_seconds=0.0,
+            requested_symbol_count=1,
+            collected_symbol_count=0,
+            failed_symbol_count=1,
+            reasons=("no_symbols_collected",),
+        ),
     )
 
 
@@ -248,6 +272,50 @@ def test_framework_runner_expires_insight_and_keeps_current_holding_without_exit
     assert second.insight_manager_update.expired_count == 1
     assert second.portfolio_targets == ()
     assert second.order_intents == ()
+
+
+def test_framework_runner_suppresses_active_insights_when_snapshot_is_invalid():
+    symbol = Symbol("NVDA", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 9, 31)
+    insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=first_time,
+        expires_at=datetime(2026, 5, 9, 10, 0),
+        source_snapshot_id="market-0930",
+        alpha_id="one-shot",
+        alpha_version="1.0",
+        weight=0.5,
+    )
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(insight),)),
+        portfolio_model=EqualWeightPortfolioConstructionModel(),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+
+    first = runner.run_once(
+        indicator_snapshot=_snapshot(first_time, symbol),
+        data=_slice(first_time, symbol),
+        portfolio=Portfolio(cash=1_000),
+    )
+    second = runner.run_once(
+        indicator_snapshot=_invalid_snapshot(second_time, symbol),
+        data=_slice(second_time, symbol),
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    assert first.active_insight_count == 1
+    assert second.new_insight_batch.insight_count == 0
+    assert second.active_insight_count == 0
+    assert second.insight_manager_update.cancelled_count == 0
+    assert second.portfolio_target_batch.target_count == 0
+    assert second.order_intents == ()
+    assert second.stage_decisions["alpha"]["skipped_reason"] == "snapshot_quality_invalid"
+    assert second.stage_decisions["alpha"]["data_quality_suppressed_active_insight_count"] == 1
+    assert runner.export_state(as_of=second_time).active_insights == (insight,)
 
 
 def test_framework_runner_reuses_portfolio_targets_until_rebalance_cadence_due():

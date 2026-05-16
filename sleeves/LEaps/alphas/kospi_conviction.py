@@ -23,6 +23,7 @@ MAX_HEALTHY_PULLBACK = 0.14
 MIN_HEALTHY_PULLBACK = 0.012
 MAX_REBREAK_DISTANCE = 0.04
 MIN_REBREAK_MOMENTUM_5 = 0.015
+MAX_PLAUSIBLE_DAILY_FEATURE_ABS = 3.0
 SECTOR_BY_SYMBOL_KEY = {
     "KRX:005930": "technology",
     "KRX:000660": "technology",
@@ -81,6 +82,8 @@ def generate(context: SnapshotContext) -> list[Insight]:
             continue
         acceleration = momentum_5 or 0.0
         intermediate_momentum = momentum_60 if momentum_60 is not None else momentum_20
+        if _has_implausible_daily_feature(momentum_20, acceleration, intermediate_momentum, trend_strength):
+            continue
         recency_weighted_momentum = (
             (momentum_20 * 0.50)
             + (acceleration * 0.30)
@@ -284,3 +287,7 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
+
+
+def _has_implausible_daily_feature(*values: float | None) -> bool:
+    return any(value is not None and abs(value) > MAX_PLAUSIBLE_DAILY_FEATURE_ABS for value in values)

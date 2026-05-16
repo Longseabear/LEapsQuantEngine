@@ -61,7 +61,7 @@
       "alpha": {
         "modules": [
           {
-            "ref": "alphas/etf_rotation.py",
+            "ref": "alphas/daa_pullback.py",
             "enabled": true
           },
           {
@@ -70,7 +70,7 @@
           }
         ],
         "input_selections": {
-          "us_etf_rotation": "us_etf_rotation",
+          "us_etf_rotation_daa_pullback": "us_etf_rotation",
           "us_etf_rotation-volatility-trailing-stop": "us_etf_rotation-operational-symbols"
         }
       },
@@ -83,16 +83,16 @@
           ],
           "metadata_path": "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.json",
           "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
-          "fallback_action": 3,
-          "top_k": 8,
-          "model_name": "attention_ppo",
+          "fallback_action": 4,
+          "top_k": 3,
+          "model_name": "daa_pullback_c18",
           "weight_temperature": 0.50,
           "min_position_pct": 0.0,
           "min_signal_action": 1,
-          "allocation_mode": "rl_weights",
-          "fallback_gross_exposure": 0.90,
+          "allocation_mode": "risk_softmax",
+          "fallback_gross_exposure": 0.75,
           "max_portfolio_pct": 1.0,
-          "max_position_pct": 0.35,
+          "max_position_pct": 0.30,
           "long_only": true
         },
         "rebalance": {
@@ -106,19 +106,21 @@
           "reused_target_churn_lot_fraction": 0.5,
           "reused_target_churn_equity_bps": 10.0
         },
+        "target_resolution": {
+          "mode": "patch"
+        },
         "blend": {
           "enabled": true,
           "duration_minutes": 300,
           "target_drift_threshold_pct": 0.08,
-          "clock": "orderable_session",
-          "missing_target_behavior": "drop"
+          "clock": "orderable_session"
         }
       },
       "risk": {
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 0.35,
+          "max_position_pct": 0.30,
           "max_total_exposure_pct": 0.98,
           "cash_buffer_pct": 0.02,
           "require_fresh_for_entries": true,

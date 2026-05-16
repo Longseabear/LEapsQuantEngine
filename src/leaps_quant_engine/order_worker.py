@@ -343,6 +343,12 @@ class ExecutionHistoryReconcileWorker:
             try:
                 holdings = self.account_client.get_holdings(market=market)
                 reconciliation = self.account_store.reconciliation_report(holdings).to_dict()
+                if reconciliation.get("status") != "matched":
+                    errors.append(
+                        "holdings_reconciliation_needs_attention:"
+                        f"mismatch_count={reconciliation.get('mismatch_count', 0)}:"
+                        f"unallocated_fill_count={reconciliation.get('unallocated_fill_count', 0)}"
+                    )
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"holdings_reconciliation_failed: {exc}")
 
@@ -391,9 +397,12 @@ class ExecutionHistoryReconcileWorker:
             return
         if _matches_existing_order_event_fill(fill, snapshot.fill_events):
             return
-        ticket = _matching_open_ticket_for_fill(fill, snapshot.open_tickets)
+        ticket = _matching_ticket_for_fill(fill, snapshot.tickets)
         if ticket is None:
-            return
+            ticket = _synthetic_reconcile_ticket_for_fill(fill)
+            if ticket is None:
+                return
+            self.order_state_store.record_tickets((ticket,), recorded_at=fill.filled_at)
         event_type = (
             OrderEventType.FILLED
             if fill.quantity >= ticket.remaining_quantity
@@ -436,7 +445,7 @@ def _matches_existing_order_event_fill(fill: VirtualFillEvent, events: Iterable[
     return False
 
 
-def _matching_open_ticket_for_fill(fill: VirtualFillEvent, tickets: Iterable[OrderTicket]) -> OrderTicket | None:
+def _matching_ticket_for_fill(fill: VirtualFillEvent, tickets: Iterable[OrderTicket]) -> OrderTicket | None:
     fill_aliases = _broker_order_aliases(fill.broker_order_id or fill.order_id)
     for ticket in tickets:
         if ticket.symbol != fill.symbol or ticket.side is not fill.side:
@@ -447,6 +456,31 @@ def _matching_open_ticket_for_fill(fill: VirtualFillEvent, tickets: Iterable[Ord
         if fill.order_id and fill.order_id == ticket.order_intent_id:
             return ticket
     return None
+
+
+def _synthetic_reconcile_ticket_for_fill(fill: VirtualFillEvent) -> OrderTicket | None:
+    if not fill.sleeve_id:
+        return None
+    order_ref = fill.broker_order_id or fill.order_id or fill.fill_id
+    order_intent_id = f"reconcile:{fill.fill_id}"
+    return OrderTicket(
+        ticket_id=f"ticket:{order_intent_id}",
+        order_intent_id=order_intent_id,
+        batch_id="execution-history-reconcile",
+        sleeve_id=fill.sleeve_id,
+        symbol=fill.symbol,
+        side=fill.side,
+        quantity=fill.quantity,
+        reference_price=fill.fill_price,
+        limit_price=fill.fill_price,
+        tag="execution_history_reconcile:synthetic_ticket",
+        created_at=fill.filled_at,
+        broker_order_id=str(order_ref),
+        metadata={
+            "synthetic_reconciliation_ticket": True,
+            "fill_id": fill.fill_id,
+        },
+    )
 
 
 def _broker_order_aliases(broker_order_id: str) -> set[str]:

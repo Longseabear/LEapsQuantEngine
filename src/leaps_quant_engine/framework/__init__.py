@@ -15,6 +15,11 @@ from leaps_quant_engine.framework.portfolio_blend import (
     PortfolioBlendPolicy,
     PortfolioBlendTransition,
 )
+from leaps_quant_engine.framework.portfolio_target_resolver import (
+    PortfolioTargetResolutionDecision,
+    PortfolioTargetResolutionPolicy,
+    PortfolioTargetResolver,
+)
 from leaps_quant_engine.framework.order_sizing import (
     OrderSizingBatch,
     OrderSizingContext,
@@ -57,6 +62,9 @@ __all__ = [
     "PortfolioBlendEngine",
     "PortfolioBlendPolicy",
     "PortfolioBlendTransition",
+    "PortfolioTargetResolutionDecision",
+    "PortfolioTargetResolutionPolicy",
+    "PortfolioTargetResolver",
     "PortfolioAllocationTarget",
     "PortfolioConstructionEngine",
     "PortfolioConstructionModelLoadError",

@@ -32,6 +32,8 @@ DEFAULT_PORTFOLIO_BLEND_BYPASS_TAG_TOKENS = (
     "operator",
     "force",
     "risk",
+    "no_longer_in_target_portfolio",
+    "missing_target_zero",
 )
 
 
@@ -254,12 +256,33 @@ class RebalancePolicyRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PortfolioTargetResolutionRuntimeConfig:
+    mode: str = "complete"
+    zero_missing_tag: str = "portfolio_target_resolver:missing_target_zero"
+    zero_missing_when_raw_empty: bool = False
+
+    def __post_init__(self) -> None:
+        mode = str(self.mode or "complete").strip().lower()
+        if mode not in {"complete", "patch", "raw"}:
+            raise ConfigurationValidationError("portfolio.target_resolution.mode must be 'complete', 'patch', or 'raw'.")
+        tag = str(self.zero_missing_tag or "portfolio_target_resolver:missing_target_zero").strip()
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "zero_missing_tag", tag)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "zero_missing_tag": self.zero_missing_tag,
+            "zero_missing_when_raw_empty": self.zero_missing_when_raw_empty,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PortfolioBlendRuntimeConfig:
     enabled: bool = False
     duration_minutes: float = 0.0
     target_drift_threshold_pct: float = 0.0
     clock: str = "orderable_session"
-    missing_target_behavior: str = "drop"
     bypass_target_tag_tokens: tuple[str, ...] = DEFAULT_PORTFOLIO_BLEND_BYPASS_TAG_TOKENS
 
     def __post_init__(self) -> None:
@@ -268,16 +291,12 @@ class PortfolioBlendRuntimeConfig:
         clock = str(self.clock or "orderable_session").strip().lower()
         if clock not in {"wall_time", "orderable_session", "regular_session"}:
             raise ConfigurationValidationError(f"Unsupported portfolio.blend.clock: {self.clock}")
-        missing = str(self.missing_target_behavior or "drop").strip().lower()
-        if missing not in {"drop", "zero"}:
-            raise ConfigurationValidationError("portfolio.blend.missing_target_behavior must be 'drop' or 'zero'.")
         tokens = tuple(
             str(token).strip().lower()
             for token in self.bypass_target_tag_tokens
             if str(token).strip()
         )
         object.__setattr__(self, "clock", clock)
-        object.__setattr__(self, "missing_target_behavior", missing)
         object.__setattr__(self, "bypass_target_tag_tokens", tokens)
 
     def to_dict(self) -> dict[str, Any]:
@@ -286,7 +305,6 @@ class PortfolioBlendRuntimeConfig:
             "duration_minutes": self.duration_minutes,
             "target_drift_threshold_pct": self.target_drift_threshold_pct,
             "clock": self.clock,
-            "missing_target_behavior": self.missing_target_behavior,
             "bypass_target_tag_tokens": list(self.bypass_target_tag_tokens),
         }
 
@@ -298,6 +316,7 @@ class PortfolioRuntimeConfig:
     )
     parameters: Mapping[str, Any] = field(default_factory=dict)
     rebalance: RebalancePolicyRuntimeConfig = field(default_factory=RebalancePolicyRuntimeConfig)
+    target_resolution: PortfolioTargetResolutionRuntimeConfig = field(default_factory=PortfolioTargetResolutionRuntimeConfig)
     blend: PortfolioBlendRuntimeConfig = field(default_factory=PortfolioBlendRuntimeConfig)
     account_store_path: Path | None = None
 
@@ -309,6 +328,7 @@ class PortfolioRuntimeConfig:
             "model": self.model.to_dict(),
             "parameters": dict(self.parameters),
             "rebalance": self.rebalance.to_dict(),
+            "target_resolution": self.target_resolution.to_dict(),
             "blend": self.blend.to_dict(),
             "account_store_path": _path_to_config_str(self.account_store_path),
         }
@@ -665,6 +685,9 @@ def _parse_portfolio_runtime_config(payload: Mapping[str, Any]) -> PortfolioRunt
         model=_parse_module_reference(raw_model),
         parameters=dict(_object(payload.get("parameters", payload.get("params")), default={})),
         rebalance=_parse_rebalance_policy_runtime_config(_object(payload.get("rebalance"), default={})),
+        target_resolution=_parse_portfolio_target_resolution_runtime_config(
+            _object(payload.get("target_resolution"), default={})
+        ),
         blend=_parse_portfolio_blend_runtime_config(_object(payload.get("blend"), default={})),
         account_store_path=_optional_path(payload.get("account_store_path", payload.get("virtual_account_path"))),
     )
@@ -700,6 +723,16 @@ def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> Rebala
     )
 
 
+def _parse_portfolio_target_resolution_runtime_config(payload: Mapping[str, Any]) -> PortfolioTargetResolutionRuntimeConfig:
+    return PortfolioTargetResolutionRuntimeConfig(
+        mode=str(payload.get("mode", "complete")).strip(),
+        zero_missing_tag=str(
+            payload.get("zero_missing_tag", payload.get("missing_target_zero_tag", "portfolio_target_resolver:missing_target_zero"))
+        ).strip(),
+        zero_missing_when_raw_empty=bool(payload.get("zero_missing_when_raw_empty", False)),
+    )
+
+
 def _parse_portfolio_blend_runtime_config(payload: Mapping[str, Any]) -> PortfolioBlendRuntimeConfig:
     raw_tokens = payload.get("bypass_target_tag_tokens", payload.get("bypass_tag_tokens"))
     if raw_tokens is None:
@@ -711,7 +744,6 @@ def _parse_portfolio_blend_runtime_config(payload: Mapping[str, Any]) -> Portfol
         duration_minutes=float(payload.get("duration_minutes", payload.get("duration_min", 0.0))),
         target_drift_threshold_pct=float(payload.get("target_drift_threshold_pct", 0.0)),
         clock=str(payload.get("clock", "orderable_session")).strip(),
-        missing_target_behavior=str(payload.get("missing_target_behavior", "drop")).strip(),
         bypass_target_tag_tokens=tokens,
     )
 

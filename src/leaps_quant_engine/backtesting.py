@@ -4,8 +4,10 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 import csv
+import gzip
 import json
 import math
+import time as perf_time
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -246,6 +248,7 @@ class FrameworkBacktestResult:
     indicator_snapshot_count: int
     start: datetime | None
     end: datetime | None
+    timings: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def insight_count(self) -> int:
@@ -293,6 +296,7 @@ class FrameworkBacktestResult:
             "model_state_patch_count": self.model_state_patch_count,
             "model_state_event_count": self.model_state_event_count,
             "framework_total_ms": self.framework_total_ms,
+            "timings": dict(self.timings),
             "final_cash": self.final_cash,
             "final_cash_by_currency": dict(self.final_cash_by_currency),
             "final_equity_by_currency": dict(self.final_equity_by_currency),
@@ -334,6 +338,7 @@ def build_replay_feed(
     start: datetime | None = None,
     end: datetime | None = None,
     refresh_history: bool = False,
+    include_opening_gap_context: bool = True,
 ) -> list[DataSlice]:
     bars_by_symbol = {
         symbol.key: get_daily_history(
@@ -345,6 +350,11 @@ def build_replay_feed(
         )
         for symbol in symbols
     }
+    if include_opening_gap_context:
+        bars_by_symbol = {
+            symbol_key: _with_opening_gap_context(series)
+            for symbol_key, series in bars_by_symbol.items()
+        }
     bars_by_time: dict[datetime, dict[str, Bar]] = {}
     for symbol_key, series in bars_by_symbol.items():
         for bar in series:
@@ -354,6 +364,35 @@ def build_replay_feed(
         for time in sorted(bars_by_time)
         if bars_by_time[time]
     ]
+
+
+def _with_opening_gap_context(series: list[Bar]) -> list[Bar]:
+    ordered = sorted(series, key=lambda bar: bar.time)
+    enriched: list[Bar] = []
+    previous_close: float | None = None
+    previous_time: datetime | None = None
+    for bar in ordered:
+        metadata = dict(bar.metadata)
+        metadata.setdefault("opening_context_source", "daily_ohlc_proxy")
+        metadata.setdefault("opening_context_available", False)
+        if previous_close is not None and previous_close > 0 and bar.open > 0:
+            metadata.update(
+                {
+                    "opening_context_available": True,
+                    "previous_close": previous_close,
+                    "previous_close_time": previous_time.isoformat() if previous_time is not None else "",
+                    "opening_gap_pct": (float(bar.open) / previous_close) - 1.0,
+                    "open_to_close_return_pct": (float(bar.close) / float(bar.open)) - 1.0,
+                    "open_to_low_drawdown_pct": (float(bar.low) / float(bar.open)) - 1.0,
+                    "open_to_high_runup_pct": (float(bar.high) / float(bar.open)) - 1.0,
+                    "gap_filled": float(bar.low) <= previous_close <= float(bar.high),
+                }
+            )
+        enriched.append(replace(bar, metadata=metadata))
+        if bar.close > 0:
+            previous_close = float(bar.close)
+            previous_time = bar.time
+    return enriched
 
 
 def build_minute_replay_feed_from_bars(
@@ -388,16 +427,41 @@ def load_minute_replay_feed(
     """Load a local minute replay feed from CSV, JSON, or JSONL."""
 
     source_path = Path(path)
-    rows = _load_minute_rows(source_path)
     universe_keys = set(universe.symbol_keys) if universe is not None else None
     market = getattr(universe, "market", default_market) if universe is not None else default_market
-    bars: list[Bar] = []
+    return _build_minute_replay_feed_from_rows(
+        _iter_minute_rows(source_path),
+        universe_keys=universe_keys,
+        default_market=market,
+        start=start,
+        end=end,
+    )
+
+
+def _build_minute_replay_feed_from_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    universe_keys: set[str] | None,
+    default_market: str,
+    start: datetime | None,
+    end: datetime | None,
+) -> list[DataSlice]:
+    bars_by_time: dict[datetime, dict[str, Bar]] = {}
     for row in rows:
-        bar = _minute_row_to_bar(row, default_market=market)
+        bar = _minute_row_to_bar(row, default_market=default_market)
         if universe_keys is not None and bar.symbol.key not in universe_keys:
             continue
-        bars.append(bar)
-    return build_minute_replay_feed_from_bars(bars, start=start, end=end)
+        if start is not None and bar.time < start:
+            continue
+        if end is not None and bar.time > end:
+            continue
+        minute_bar = replace(bar, resolution=DataResolution.MINUTE.value)
+        bars_by_time.setdefault(minute_bar.time, {})[minute_bar.symbol.key] = minute_bar
+    return [
+        DataSlice(time=time, bars=bars_by_time[time], resolution=DataResolution.MINUTE.value)
+        for time in sorted(bars_by_time)
+        if bars_by_time[time]
+    ]
 
 
 def warm_up_daily_indicators_for_backtest(
@@ -488,6 +552,7 @@ def run_framework_backtest(
     alpha_input_selections: Mapping[str, str] | None = None,
     fill_model: SimulatedFillModel | None = None,
 ) -> FrameworkBacktestResult:
+    feed_started = perf_time.perf_counter()
     feed = build_replay_feed(
         provider,
         list(universe.symbols),
@@ -495,6 +560,7 @@ def run_framework_backtest(
         end=end,
         refresh_history=refresh_history,
     )
+    feed_build_ms = _perf_elapsed_ms(feed_started)
     indicator_engine = indicator_engine or IndicatorEngine()
     if sleeve_id not in indicator_engine.registries_by_sleeve:
         indicator_engine.register_universe(sleeve_id, universe)
@@ -519,6 +585,7 @@ def run_framework_backtest(
     evaluated_start: datetime | None = None
     evaluated_end: datetime | None = None
 
+    replay_started = perf_time.perf_counter()
     for index, data in enumerate(feed, start=1):
         for bar in data.bars.values():
             last_prices[bar.symbol.key] = bar.close
@@ -594,6 +661,7 @@ def run_framework_backtest(
             tracker.record_fill_event(event)
             portfolio.apply_order_event(event)
         tracker.record_snapshot(data.time, portfolio.cash, dict(portfolio.cash_by_currency), portfolio.holdings, last_prices)
+    replay_ms = _perf_elapsed_ms(replay_started)
 
     return FrameworkBacktestResult(
         sleeve_id=sleeve_id,
@@ -620,6 +688,10 @@ def run_framework_backtest(
         indicator_snapshot_count=len(framework_cycles),
         start=evaluated_start or start,
         end=evaluated_end or end,
+        timings={
+            "history_feed_build_ms": feed_build_ms,
+            "framework_replay_wall_ms": replay_ms,
+        },
     )
 
 
@@ -644,6 +716,7 @@ def run_framework_replay(
     market_scope: str | None = None,
     warmup_data_slice_count: int = 0,
 ) -> FrameworkBacktestResult:
+    replay_started = perf_time.perf_counter()
     indicator_engine = indicator_engine or IndicatorEngine()
     if sleeve_id not in indicator_engine.registries_by_sleeve:
         indicator_engine.register_universe(sleeve_id, universe)
@@ -733,6 +806,7 @@ def run_framework_replay(
             tracker.record_fill_event(event)
             portfolio.apply_order_event(event)
         tracker.record_snapshot(data.time, portfolio.cash, dict(portfolio.cash_by_currency), portfolio.holdings, last_prices)
+    replay_ms = _perf_elapsed_ms(replay_started)
 
     return FrameworkBacktestResult(
         sleeve_id=sleeve_id,
@@ -759,6 +833,9 @@ def run_framework_replay(
         indicator_snapshot_count=len(framework_cycles),
         start=feed[0].time if feed else None,
         end=feed[-1].time if feed else None,
+        timings={
+            "framework_replay_wall_ms": replay_ms,
+        },
     )
 
 
@@ -1410,12 +1487,18 @@ def _fundamental_snapshot(
 
 
 def _load_minute_rows(path: Path) -> list[Mapping[str, Any]]:
+    return list(_iter_minute_rows(path))
+
+
+def _iter_minute_rows(path: Path):
     suffix = path.suffix.lower()
-    if suffix == ".csv":
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            return [dict(row) for row in csv.DictReader(handle)]
+    if suffix == ".csv" or path.name.lower().endswith(".csv.gz"):
+        opener = gzip.open if path.name.lower().endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                yield dict(row)
+        return
     if suffix == ".jsonl":
-        rows: list[Mapping[str, Any]] = []
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 text = line.strip()
@@ -1423,18 +1506,22 @@ def _load_minute_rows(path: Path) -> list[Mapping[str, Any]]:
                     item = json.loads(text)
                     if not isinstance(item, Mapping):
                         raise ValueError(f"Minute replay JSONL rows must be objects: {path}")
-                    rows.append(item)
-        return rows
+                    yield item
+        return
     if suffix == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(payload, Mapping):
             for key in ("bars", "rows", "candles", "data", "output", "output2"):
                 items = payload.get(key)
                 if isinstance(items, list):
-                    return [_ensure_row_mapping(item, path) for item in items]
+                    for item in items:
+                        yield _ensure_row_mapping(item, path)
+                    return
             raise ValueError(f"Minute replay JSON object must contain bars/rows/candles: {path}")
         if isinstance(payload, list):
-            return [_ensure_row_mapping(item, path) for item in payload]
+            for item in payload:
+                yield _ensure_row_mapping(item, path)
+            return
     raise ValueError(f"Unsupported minute replay feed format: {path}")
 
 
@@ -1447,15 +1534,17 @@ def _ensure_row_mapping(item: Any, path: Path) -> Mapping[str, Any]:
 def _minute_row_to_bar(row: Mapping[str, Any], *, default_market: str) -> Bar:
     symbol = _minute_row_symbol(row, default_market=default_market)
     close = _required_row_float(row, ("close", "close_price", "last_price", "stck_prpr", "stck_clpr"))
+    bar_time = _minute_row_time(row)
     return Bar(
         symbol=symbol,
-        time=_minute_row_time(row),
+        time=bar_time,
         open=_optional_row_float(row, ("open", "open_price", "stck_oprc"), default=close),
         high=_optional_row_float(row, ("high", "high_price", "stck_hgpr"), default=close),
         low=_optional_row_float(row, ("low", "low_price", "stck_lwpr"), default=close),
         close=close,
         volume=_optional_row_int(row, ("volume", "vol", "cntg_vol", "acml_vol"), default=0),
         resolution=DataResolution.MINUTE.value,
+        metadata=_minute_row_session_metadata(row, symbol=symbol),
     )
 
 
@@ -1498,6 +1587,34 @@ def _first_row_text(row: Mapping[str, Any], names: tuple[str, ...]) -> str:
     return ""
 
 
+def _minute_row_session_metadata(row: Mapping[str, Any], *, symbol: Symbol) -> dict[str, Any]:
+    phase = _first_row_text(row, ("market_session_phase", "session_phase", "session"))
+    scope = _first_row_text(row, ("market_session_scope", "market_scope")) or _minute_symbol_scope(symbol)
+    if not phase and not any(name in row for name in ("is_regular_market_open", "is_orderable_session", "is_extended_market_hours", "session_source")):
+        return {}
+    metadata: dict[str, Any] = {
+        "market_session_scope": scope,
+        "market_session_phase": phase,
+    }
+    for key in ("is_regular_market_open", "is_orderable_session", "is_extended_market_hours"):
+        if key in row and row[key] not in (None, ""):
+            metadata[key] = _row_bool(row[key])
+    source = _first_row_text(row, ("session_source",))
+    if source:
+        metadata["session_source"] = source
+    return metadata
+
+
+def _minute_symbol_scope(symbol: Symbol) -> str:
+    return "overseas" if symbol.market.upper() in {"US", "NAS", "NYS", "NYSE", "NASDAQ", "AMEX", "AMS"} else "domestic"
+
+
+def _row_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _required_row_float(row: Mapping[str, Any], names: tuple[str, ...]) -> float:
     for name in names:
         value = row.get(name)
@@ -1520,6 +1637,10 @@ def _optional_row_int(row: Mapping[str, Any], names: tuple[str, ...], *, default
         if value not in (None, ""):
             return int(float(value))
     return default
+
+
+def _perf_elapsed_ms(started: float) -> float:
+    return round((perf_time.perf_counter() - started) * 1000.0, 3)
 
 
 def _parse_datetime(value: str) -> datetime:

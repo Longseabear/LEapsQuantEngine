@@ -11,8 +11,10 @@ is:
 
 ```text
 own the strongest KRX trend leaders when the local regime is healthy,
+reserve a small KRX ETF safety layer when the market is healthy,
 avoid buying from stale/degraded data,
-cut exposure when stop pressure or volatility rises,
+cut stock exposure and rotate more weight into cash-like/inverse KRX ETFs when
+KODEX 200 shows shock or risk-off behavior,
 and let execution throttle order style by market session.
 ```
 
@@ -20,9 +22,14 @@ The current strategy is not a prose-only rule set. It is split across the
 pipeline:
 
 - `selections/stock_momentum.py` builds the KRX entry candidate set.
+- `selections/krx_etf_safety.py` keeps the domestic ETF safety candidates in
+  the live universe.
 - `alphas/kospi_conviction.py` emits KRX UP insights.
+- `alphas/krx_etf_safety.py` emits ETF safety-bucket insights from the KODEX
+  200 regime.
 - `alphas/volatility_trailing_stop.py` emits FLAT exit/reduction insights.
-- `portfolios/rl_ppo_constructor.py` wraps the RL target allocator.
+- `portfolios/research_adaptive_allocator.py` builds a complete target
+  portfolio with separate stock and ETF safety buckets.
 - `risks/kospi_growth_us_hedge.py` clamps exposure by currency, cash, snapshot
   quality, and market regime.
 - `executions/leaps_immediate.py` turns approved targets into session-aware
@@ -33,14 +40,51 @@ The live config currently routes:
 ```text
 leaps-stock-momentum      -> leaps-kospi-conviction
 leaps-stock-momentum      -> leaps-kospi-pullback-reversion
+leaps-krx-etf-safety      -> leaps-krx-etf-safety
 leaps-operational-symbols -> leaps-volatility-trailing-stop
-portfolio                 -> attention_ppo / rl_weights / top_k=8
-risk                      -> KRW regime exposure cap
+portfolio                 -> research_adaptive_allocator_v2 / top_k=8 / ETF safety bucket
+risk                      -> KRW exposure/cash/freshness clamp
 execution                 -> day limit orders with slicing
 ```
 
+There is also an expanded-universe research candidate:
+
+```text
+config                    -> configs/runtime/leaps_workspace_kr200_candidate.json
+universe                  -> leaps-kr-research-200 / KRX turnover top 200
+active max symbols        -> 60
+portfolio                 -> attention_ppo / rl_weights / top_k=12
+training cash             -> 17,329,806 KRW
+target smoothing          -> alpha 0.6 / drift threshold 5%
+```
+
+Keep this as a candidate until live promotion is explicitly chosen. The long
+OOS backtest improves materially, but the May 2026 short window still favors
+the compact 16-name profile.
+
 US ETF rotation is intentionally handled by the separate `us_etf_rotation`
 sleeve, not by this LEaps live profile.
+
+### KRX ETF Safety Bucket
+
+The safety bucket is not a second stock selector. It is a portfolio overlay fed
+by a separate alpha:
+
+```text
+KODEX 200 daily regime -> ETF safety insights -> portfolio ETF target bucket
+```
+
+Current ETF roles:
+
+- `KRX:488770`, `KRX:423160`, `KRX:459580`: cash-like parking layer.
+- `KRX:069500`: KODEX 200 market beta when the regime is healthy.
+- `KRX:114800`: 1x inverse hedge for shock/risk-off regimes.
+- Leveraged ETFs are intentionally not used as the safety bucket.
+
+The ETF alpha emits target percentages in insight metadata. The portfolio model
+then caps stock gross exposure from that metadata and adds ETF targets
+separately, so ETF safety signals cannot displace stock top-k rankings by
+accident.
 
 ## Strategy Details
 
@@ -139,12 +183,35 @@ is no previous state, the model initializes from current close and the
 This keeps trailing-stop memory replayable and prevents alpha code from reading
 virtual account files or order stores.
 
+### Research Adaptive Portfolio Constructor
+
+`portfolios/research_adaptive_allocator.py` is the current live LEaps
+constructor. It consumes active stock insights from KOSPI conviction and
+pullback/rebreak alpha, scores the stock candidates, and emits a complete target
+portfolio. With `enable_etf_safety_bucket=true`, it also consumes
+`leaps-krx-etf-safety` insights and appends ETF targets after the stock ranking
+step.
+
+Stock parameters remain the primary risk-shaping levers:
+
+```text
+top_k = 8
+gross_exposure = 95%
+neutral_gross_exposure = 72%
+weak_gross_exposure = 40%
+max_position_pct = 22%
+ETF safety bucket cap = 60%
+```
+
+Risk still clamps the final target quantities, but the model-level ETF split is
+where the strategic stock-vs-safety allocation is expressed.
+
 ### RL Portfolio Constructor
 
 `portfolios/rl_ppo_constructor.py` is a thin wrapper around the engine's
 `ReinforcementLearningPortfolioConstructionModel`.
 
-The active config uses:
+The smoke/research RL config uses:
 
 ```text
 model_name = attention_ppo
@@ -171,13 +238,13 @@ keeps the previous target when the new target is within the configured drift
 threshold. Explicit FLAT/DOWN or stop exits bypass the guard and remain 0%
 targets immediately.
 
-The current live model was preserved before the sector/pullback upgrade at:
+The former live RL model was preserved before the sector/pullback upgrade at:
 
 ```text
 data/model-bundles/LEaps/20260514_224051_pre_sector_pullback_upgrade
 ```
 
-The upgraded sector/pullback/target-anchor profile is bundled at:
+The upgraded sector/pullback/target-anchor RL profile is bundled at:
 
 ```text
 data/model-bundles/LEaps/20260514_230858_sector_pullback_target_anchor
@@ -351,13 +418,15 @@ entry selectors drop them.
 
 ## Portfolio Semantics
 
-The RL portfolio constructor is a target portfolio allocator. It is not an
-order placer.
+The portfolio constructor is a target portfolio allocator. It is not an order
+placer. This applies to both the current research-adaptive constructor and the
+RL constructor.
 
 The expected behavior is:
 
 - Active UP insights define the candidate set.
-- The RL model emits target weights over the top-k candidates plus cash.
+- The active portfolio model emits target weights over stock candidates plus
+  cash/ETF safety buckets.
 - Portfolio construction emits target percentages.
 - Order sizing converts percentages to quantities.
 - Risk clamps or rejects.
@@ -367,6 +436,12 @@ If a held symbol is absent from a new valid target set, the portfolio layer may
 emit a zero target tagged as no longer in the target portfolio. If no actionable
 insights exist at all, do not treat that as an implicit all-sell signal; wait
 for explicit FLAT/DOWN insights or a fresh valid target set.
+
+The engine target resolver runs before portfolio blend. In the live LEaps config
+`portfolio.target_resolution.mode=complete`, so old-only targets are converted
+to 0% before blend when the new raw target batch is non-empty. Empty raw batches
+remain no-action by default. A partial-patch portfolio model would need to opt
+into `mode=patch`; otherwise omitted targets are exits, not carry-forward.
 
 Small target changes may be suppressed by the target anchor drift guard. This is
 a portfolio policy, not an execution shortcut: the model still emits target

@@ -168,6 +168,17 @@ py -3 -m leaps_quant_engine.cli virtual-account-reconcile configs/runtime/live_m
 
 If this reports mismatches, do not live submit until ownership is assigned or
 the mismatch is explicitly accepted as another sleeve's responsibility.
+For a broker fill that was manual/operator activity and should not enter a
+strategy sleeve, keep the raw fill for audit but clear the work queue with an
+explicit ignore record:
+
+```powershell
+py -3 -m leaps_quant_engine.cli virtual-account-ignore-fill configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --market domestic `
+  --fill-id "<fill-id>" `
+  --reason "manual/operator fill outside LEaps strategy"
+```
 
 6. Generate a dry-run cycle artifact.
 

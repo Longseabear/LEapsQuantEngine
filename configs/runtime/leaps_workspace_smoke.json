@@ -121,7 +121,8 @@
           "long_only": true,
           "emit_zero_for_missing_held_targets": true,
           "target_smoothing_alpha": 1.0,
-          "target_drift_threshold_pct": 0.035
+          "target_drift_threshold_pct": 0.035,
+          "missing_target_exit_confirmation_cycles": 3
         },
         "rebalance": {
           "cash_reserve_pct": 0.0,
@@ -134,12 +135,14 @@
           "reused_target_churn_lot_fraction": 0.5,
           "reused_target_churn_equity_bps": 5.0
         },
+        "target_resolution": {
+          "mode": "complete"
+        },
         "blend": {
           "enabled": true,
           "duration_minutes": 300,
           "target_drift_threshold_pct": 0.08,
-          "clock": "orderable_session",
-          "missing_target_behavior": "drop"
+          "clock": "orderable_session"
         }
       },
       "risk": {

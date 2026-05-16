@@ -80,6 +80,7 @@ def test_indicator_engine_updates_30_plus_indicators_across_many_symbols():
                     low=close - 1.0,
                     close=close,
                     volume=1000 + base + day,
+                    resolution="daily",
                 )
             )
 

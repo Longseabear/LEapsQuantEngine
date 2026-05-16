@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 from types import ModuleType
 from typing import Any, Callable, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
 from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketDataEngineLiveQuoteProvider
@@ -24,6 +25,8 @@ from leaps_quant_engine.framework import (
     PortfolioBlendEngine,
     PortfolioBlendPolicy,
     PortfolioConstructionEngine,
+    PortfolioTargetResolutionPolicy,
+    PortfolioTargetResolver,
     PythonPortfolioConstructionModelLoader,
     PythonRiskManagementModelLoader,
     RebalancePolicy,
@@ -454,6 +457,7 @@ def bootstrap_sleeve_runtime(
     history_provider = deps.history_provider_factory()
     alpha_runtime = _build_alpha_runtime(snapshot, sleeve_config, deps.alpha_loader)
     portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
+    portfolio_target_resolver = _build_portfolio_target_resolver(sleeve_config)
     portfolio_blend_engine = _build_portfolio_blend_engine(sleeve_config)
     risk_model = _build_risk_model(snapshot, sleeve_config, deps.risk_model_loader)
     execution_engine = _build_execution_engine(snapshot, sleeve_config, deps.execution_model_loader)
@@ -479,6 +483,7 @@ def bootstrap_sleeve_runtime(
         sleeve_id=sleeve_config.sleeve_id,
         alpha_runtime=alpha_runtime,
         portfolio_engine=portfolio_engine,
+        portfolio_target_resolver=portfolio_target_resolver,
         portfolio_blend_engine=portfolio_blend_engine,
         risk_model=risk_model,
         execution_engine=execution_engine,
@@ -506,6 +511,7 @@ def bootstrap_sleeve_runtime(
             selection_base_universe,
             history_provider,
             sleeve_id=sleeve_config.sleeve_id,
+            end=_confirmed_daily_warmup_end(snapshot),
             refresh_history=sleeve_config.indicators.refresh_history,
             source=snapshot.config.market_data.history_source,
             policy=warmup_policy,
@@ -585,6 +591,24 @@ def _resolve_sleeve_config(snapshot: RuntimeConfigSnapshot, sleeve_id: str | Non
     return snapshot.config.sleeves[0]
 
 
+def _confirmed_daily_warmup_end(
+    snapshot: RuntimeConfigSnapshot,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    if snapshot.config.mode not in {"live", "paper"}:
+        return None
+    try:
+        runtime_timezone = ZoneInfo(snapshot.config.timezone)
+    except Exception:
+        runtime_timezone = timezone(timedelta(hours=9))
+    local_now = now or datetime.now(runtime_timezone)
+    if local_now.tzinfo is not None:
+        local_now = local_now.astimezone(runtime_timezone)
+    local_midnight = datetime(local_now.year, local_now.month, local_now.day)
+    return local_midnight - timedelta(days=1)
+
+
 def _build_alpha_runtime(
     snapshot: RuntimeConfigSnapshot,
     sleeve_config: SleeveRuntimeConfig,
@@ -621,6 +645,17 @@ def _build_portfolio_engine(
     )
 
 
+def _build_portfolio_target_resolver(sleeve_config: SleeveRuntimeConfig) -> PortfolioTargetResolver:
+    target_resolution = sleeve_config.portfolio.target_resolution
+    return PortfolioTargetResolver(
+        policy=PortfolioTargetResolutionPolicy(
+            mode=target_resolution.mode,
+            zero_missing_tag=target_resolution.zero_missing_tag,
+            zero_missing_when_raw_empty=target_resolution.zero_missing_when_raw_empty,
+        )
+    )
+
+
 def _build_portfolio_blend_engine(sleeve_config: SleeveRuntimeConfig) -> PortfolioBlendEngine | None:
     blend_config = sleeve_config.portfolio.blend
     if not blend_config.enabled:
@@ -631,7 +666,6 @@ def _build_portfolio_blend_engine(sleeve_config: SleeveRuntimeConfig) -> Portfol
             duration_minutes=blend_config.duration_minutes,
             target_drift_threshold_pct=blend_config.target_drift_threshold_pct,
             clock=blend_config.clock,
-            missing_target_behavior=blend_config.missing_target_behavior,
             bypass_target_tag_tokens=blend_config.bypass_target_tag_tokens,
         )
     )

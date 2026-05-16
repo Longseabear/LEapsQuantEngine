@@ -24,6 +24,10 @@ Portfolio models consume active insights and produce target allocations.
   currency bucket should be represented as explicit 0% allocation targets, not
   silent carry-forward. LEaps uses
   `emit_zero_for_missing_held_targets=true` for this behavior.
+- The engine-level `PortfolioTargetResolver` also treats LEaps as a complete
+  target portfolio by default. Omitted old targets are resolved to 0% before
+  portfolio blend, so model migrations can fade old-only symbols out instead of
+  accidentally carrying them forever.
 - When `portfolio.rebalance.cadence` skips a rebuild, the engine reuses the
   previous allocation target batch while `OrderSizingEngine` still recomputes
   current target quantities from the current portfolio, cash, and prices.

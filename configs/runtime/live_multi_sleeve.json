@@ -7,7 +7,7 @@
     "history_provider": "kis-cache",
     "source": "market-data-engine",
     "history_source": "kis-cache",
-    "rate_limit_per_second": 20
+    "rate_limit_per_second": 5
   },
   "broker_accounts": [
     {
@@ -46,20 +46,21 @@
       },
       "cash": 0,
       "cash_by_currency": {
-        "KRW": 10000000
+        "KRW": 13777806
       },
       "universe": {
-        "coarse_path": "configs/universes/leaps_kr_research_core.json",
+        "coarse_path": "configs/universes/leaps_kr_research_200.json",
         "fine": {
           "enabled": false,
           "refresh_seconds": 300,
           "max_age_seconds": 300
         },
         "active": {
-          "max_symbols": 24,
+          "max_symbols": 60,
           "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
           "selection_models": [
             "selections/stock_momentum.py:StockMomentumSelectionModel",
+            "selections/krx_etf_safety.py:KrxEtfSafetySelectionModel",
             "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
           ]
         }
@@ -81,6 +82,10 @@
             "enabled": true
           },
           {
+            "ref": "alphas/krx_etf_safety.py",
+            "enabled": true
+          },
+          {
             "ref": "alphas/volatility_trailing_stop.py",
             "enabled": true
           }
@@ -88,40 +93,35 @@
         "input_selections": {
           "leaps-kospi-pullback-reversion": "leaps-stock-momentum",
           "leaps-kospi-conviction": "leaps-stock-momentum",
+          "leaps-krx-etf-safety": "leaps-krx-etf-safety",
           "leaps-volatility-trailing-stop": "leaps-operational-symbols"
         }
       },
       "portfolio": {
-        "model": "portfolios/rl_ppo_constructor.py",
+        "model": "portfolios/research_adaptive_allocator.py",
         "parameters": {
-          "policy_path": null,
-          "policy_paths": [
-            "data/rl/kr_only_20260511/kr_top8_regime95_cash5m_s911/leaps_ppo_portfolio_allocator_seed913.zip",
-            "data/rl/kr_only_20260511/kr_top8_regime95_cash5m_s911/leaps_ppo_portfolio_allocator_seed917.zip"
-          ],
-          "metadata_path": "data/rl/kr_only_20260511/kr_top8_regime95_cash5m_s911/leaps_ppo_portfolio_allocator.json",
-          "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
-          "fallback_action": 3,
           "top_k": 8,
-          "model_name": "attention_ppo",
-          "weight_temperature": 0.3,
-          "min_position_pct": 0.0,
-          "min_signal_action": 1,
-          "allocation_mode": "rl_weights",
-          "turnover_penalty": 0.12,
-          "downside_penalty": 1.1,
-          "volatility_penalty": 0.45,
-          "drawdown_penalty": 0.95,
-          "underwater_penalty": 0.35,
-          "missed_upside_penalty": 0.08,
-          "concentration_penalty": 0.35,
-          "fallback_gross_exposure": 0.78,
-          "max_portfolio_pct": 1.0,
-          "max_position_pct": 0.26,
-          "long_only": true,
+          "gross_exposure": 0.95,
+          "neutral_gross_exposure": 0.72,
+          "weak_gross_exposure": 0.40,
+          "cash_bias": 0.0,
+          "max_position_pct": 0.22,
+          "min_position_pct": 0.012,
+          "score_temperature": 0.25,
+          "volatility_penalty": 0.65,
+          "drawdown_penalty": 0.25,
+          "recent_momentum_weight": 0.26,
+          "trend_weight": 0.12,
+          "multi_alpha_bonus": 0.08,
+          "max_normalized_volatility": 0.20,
+          "high_vol_momentum_exception": 0.45,
+          "hold_existing_buffer": 0.72,
           "emit_zero_for_missing_held_targets": true,
-          "target_smoothing_alpha": 1.0,
-          "target_drift_threshold_pct": 0.035
+          "long_only": true,
+          "enable_etf_safety_bucket": true,
+          "etf_safety_alpha_id": "leaps-krx-etf-safety",
+          "etf_safety_max_total_pct": 0.60,
+          "model_name": "research_adaptive_allocator_v2"
         },
         "rebalance": {
           "cash_reserve_pct": 0.0,
@@ -134,12 +134,14 @@
           "reused_target_churn_lot_fraction": 0.5,
           "reused_target_churn_equity_bps": 5.0
         },
+        "target_resolution": {
+          "mode": "complete"
+        },
         "blend": {
-          "enabled": true,
-          "duration_minutes": 300,
+          "enabled": false,
+          "duration_minutes": 60,
           "target_drift_threshold_pct": 0.08,
-          "clock": "orderable_session",
-          "missing_target_behavior": "drop"
+          "clock": "orderable_session"
         }
       },
       "risk": {
@@ -150,20 +152,41 @@
             "KRW": 0.26
           },
           "max_total_exposure_pct_by_currency": {
-            "KRW": 0.68
+            "KRW": 0.98
           },
           "cash_buffer_pct_by_currency": {
-            "KRW": 0.1
+            "KRW": 0.02
           },
           "regime_exposure_enabled": true,
           "regime_total_exposure_pct_by_currency": {
             "KRW": {
-              "risk_off": 0.35,
-              "neutral": 0.60,
-              "risk_on": 0.78,
-              "strong_risk_on": 0.95
+              "risk_off": 0.85,
+              "neutral": 0.90,
+              "risk_on": 0.95,
+              "strong_risk_on": 0.98
             }
           },
+          "intraday_market_guard_enabled": true,
+          "intraday_guard_symbol": "KRX:069500",
+          "intraday_guard_reference_alpha_id": "leaps-krx-etf-safety",
+          "intraday_entry_freeze_return_pct": -0.003,
+          "intraday_risk_off_return_pct": -0.02,
+          "intraday_entry_freeze_cap_pct_by_currency": {
+            "KRW": 0.55
+          },
+          "intraday_risk_off_cap_pct_by_currency": {
+            "KRW": 0.35
+          },
+          "intraday_guard_exempt_symbols": [
+            "KRX:488770",
+            "KRX:423160",
+            "KRX:459580",
+            "KRX:114800"
+          ],
+          "intraday_open_entry_freeze_until": "09:40",
+          "intraday_guard_high_drawdown_enabled": true,
+          "intraday_guard_high_entry_freeze_return_pct": -0.005,
+          "intraday_guard_high_risk_off_return_pct": -0.012,
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }
@@ -230,7 +253,7 @@
       "alpha": {
         "modules": [
           {
-            "ref": "alphas/etf_rotation.py",
+            "ref": "alphas/daa_pullback.py",
             "enabled": true
           },
           {
@@ -239,7 +262,7 @@
           }
         ],
         "input_selections": {
-          "us_etf_rotation": "us_etf_rotation",
+          "us_etf_rotation_daa_pullback": "us_etf_rotation",
           "us_etf_rotation-volatility-trailing-stop": "us_etf_rotation-operational-symbols"
         }
       },
@@ -252,16 +275,16 @@
           ],
           "metadata_path": "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.json",
           "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
-          "fallback_action": 3,
-          "top_k": 8,
-          "model_name": "attention_ppo",
+          "fallback_action": 4,
+          "top_k": 3,
+          "model_name": "daa_pullback_c18",
           "weight_temperature": 0.5,
           "min_position_pct": 0.0,
           "min_signal_action": 1,
-          "allocation_mode": "rl_weights",
-          "fallback_gross_exposure": 0.9,
+          "allocation_mode": "risk_softmax",
+          "fallback_gross_exposure": 0.75,
           "max_portfolio_pct": 1.0,
-          "max_position_pct": 0.35,
+          "max_position_pct": 0.30,
           "long_only": true
         },
         "rebalance": {
@@ -275,19 +298,21 @@
           "reused_target_churn_lot_fraction": 0.5,
           "reused_target_churn_equity_bps": 10.0
         },
+        "target_resolution": {
+          "mode": "patch"
+        },
         "blend": {
           "enabled": true,
           "duration_minutes": 300,
           "target_drift_threshold_pct": 0.08,
-          "clock": "orderable_session",
-          "missing_target_behavior": "drop"
+          "clock": "orderable_session"
         }
       },
       "risk": {
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 0.35,
+          "max_position_pct": 0.30,
           "max_total_exposure_pct": 0.98,
           "cash_buffer_pct": 0.02,
           "require_fresh_for_entries": true,

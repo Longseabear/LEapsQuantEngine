@@ -7,7 +7,7 @@ from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrator
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.order_worker import ExecutionHistoryReconcileWorker, OpenTicketPollWorker
 from leaps_quant_engine.orders import OrderCoordinator, OrderEventType, OrderTicketStatus
-from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
+from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
 
 def _batch(
@@ -395,6 +395,57 @@ def test_execution_history_reconcile_worker_closes_ticket_when_fill_was_already_
     assert order_store.snapshot().fill_events[-1].reason == "execution_history_reconcile_fill"
 
 
+def test_execution_history_reconcile_worker_records_synthetic_ticket_for_assigned_history_fill(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    fill_row = {
+        "order_id": "manual-broker-1",
+        "symbol": "005930",
+        "side": "buy",
+        "execution_quantity": "1",
+        "execution_price": "70000",
+        "execution_timestamp": "20260508T093000",
+    }
+    worker = ExecutionHistoryReconcileWorker(
+        account_client=FakeExecutionHistoryClient(
+            executions=[fill_row],
+            holdings={
+                "holdings": [
+                    {
+                        "symbol": "005930",
+                        "holding_quantity": 1,
+                        "average_purchase_price": 70_000,
+                    }
+                ]
+            },
+        ),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+
+    first = worker.reconcile_once(
+        start_date="20260508",
+        end_date="20260508",
+        assign_unknown_to_sleeve_id="LEaps",
+    )
+    second = worker.reconcile_once(
+        start_date="20260508",
+        end_date="20260508",
+        assign_unknown_to_sleeve_id="LEaps",
+    )
+
+    snapshot = order_store.snapshot()
+    assert first.imported_fill_count == 1
+    assert second.duplicate_fill_count == 1
+    assert len(snapshot.fill_events) == 1
+    assert snapshot.tickets[0].metadata["synthetic_reconciliation_ticket"] is True
+    assert snapshot.tickets[0].status is OrderTicketStatus.FILLED
+    assert account_store.current_portfolio("LEaps").quantity(Symbol("005930", "KRX")) == 1
+
+
 def test_execution_history_reconcile_worker_records_unknown_and_continues_past_bad_rows(tmp_path):
     account_store = VirtualSleeveAccountStore(
         tmp_path / "accounts.json",
@@ -435,6 +486,107 @@ def test_execution_history_reconcile_worker_records_unknown_and_continues_past_b
     assert report.rejected_executions[0]["execution"]["order_id"] == "bad-row"
     assert account_store.broker_fill("kis:domestic:manual-order:20260508T100000:1:120000") is not None
     assert account_store.current_portfolio("LEaps").holdings == {}
+
+
+def test_execution_history_reconcile_worker_warns_when_holdings_reconciliation_mismatches(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    account_store.apply_fill(
+        VirtualFillEvent(
+            fill_id="fill-1",
+            order_id="order-1",
+            symbol=Symbol("005930", "KRX"),
+            side=OrderSide.BUY,
+            quantity=2,
+            fill_price=70_000,
+            sleeve_id="LEaps",
+            filled_at=datetime(2026, 5, 9, 9, 32),
+        )
+    )
+    worker = ExecutionHistoryReconcileWorker(
+        account_client=FakeExecutionHistoryClient(
+            executions=[],
+            holdings={
+                "holdings": [
+                    {
+                        "symbol": "005930",
+                        "holding_quantity": 3,
+                        "average_purchase_price": 70_000,
+                    }
+                ]
+            },
+        ),
+        account_store=account_store,
+    )
+
+    report = worker.reconcile_once(start_date="20260508", end_date="20260508")
+
+    assert report.status == "warnings"
+    assert report.reconciliation["status"] == "needs_reconciliation"
+    assert report.errors == ("holdings_reconciliation_needs_attention:mismatch_count=1:unallocated_fill_count=0",)
+
+
+def test_execution_history_reconcile_worker_records_late_fill_for_expired_ticket(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    coordination = OrderCoordinator().coordinate(
+        (_batch(quantity=3),),
+        generated_at=datetime(2026, 5, 8, 9, 29),
+    )
+    ticket = coordination.tickets[0]
+    account_store.register_order_ticket(ticket, broker_order_id="001:00012345")
+    accepted = ticket.event(
+        OrderEventType.ACCEPTED,
+        occurred_at=datetime(2026, 5, 8, 9, 30),
+        broker_order_id="001:00012345",
+    )
+    expired = ticket.event(
+        OrderEventType.EXPIRED,
+        occurred_at=datetime(2026, 5, 9, 0, 1),
+        broker_order_id="001:00012345",
+        reason="day_order_expired",
+    )
+    order_store.record_tickets((ticket,))
+    order_store.record_events((*coordination.events, accepted, expired))
+    worker = ExecutionHistoryReconcileWorker(
+        account_client=FakeExecutionHistoryClient(
+            executions=[
+                {
+                    "order_id": "00012345",
+                    "symbol": "005930",
+                    "side": "buy",
+                    "execution_quantity": "3",
+                    "execution_price": "70000",
+                    "execution_timestamp": "20260508T093000",
+                    "source_granularity": "order_execution_summary",
+                }
+            ],
+            holdings={
+                "holdings": [
+                    {
+                        "symbol": "005930",
+                        "holding_quantity": 3,
+                        "average_purchase_price": 70_000,
+                    }
+                ]
+            },
+        ),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+
+    report = worker.reconcile_once(start_date="20260508", end_date="20260508")
+
+    assert report.imported_fill_count == 1
+    assert report.status == "ok"
+    assert account_store.current_portfolio("LEaps").quantity(Symbol("005930", "KRX")) == 3
+    assert order_store.snapshot().tickets[0].status is OrderTicketStatus.FILLED
+    assert order_store.snapshot().fill_events[-1].reason == "execution_history_reconcile_fill"
 
 
 def test_execution_history_reconcile_worker_skips_fill_already_applied_from_order_event(tmp_path):

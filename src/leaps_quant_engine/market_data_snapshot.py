@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Mapping
 from uuid import uuid4
 
-from leaps_quant_engine.indicators import IndicatorEngine
+from leaps_quant_engine.indicators import IndicatorEngine, IndicatorUpdateReport
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorSnapshotStore, SnapshotQualityReport
@@ -76,6 +76,8 @@ class MarketDataSnapshotEngine:
     indicator_engine: IndicatorEngine
     stores_by_sleeve: dict[str, IndicatorSnapshotStore] = field(default_factory=dict)
     source: str = "provider"
+    last_indicator_update_report: IndicatorUpdateReport = field(default_factory=IndicatorUpdateReport, init=False)
+    last_indicator_update_report_by_sleeve: dict[str, IndicatorUpdateReport] = field(default_factory=dict, init=False)
 
     def collect_once(self, symbols: list[Symbol] | None = None) -> MarketDataSnapshot:
         target_symbols = symbols or self.indicator_engine.active_symbols()
@@ -191,7 +193,11 @@ class MarketDataSnapshotEngine:
                 "publish_active": publish_active,
             },
         )
-        self.indicator_engine.on_data(snapshot.as_data_slice())
+        self.last_indicator_update_report_by_sleeve = self.indicator_engine.on_data_by_sleeve(snapshot.as_data_slice())
+        report = IndicatorUpdateReport()
+        for sleeve_report in self.last_indicator_update_report_by_sleeve.values():
+            report = report.combine(sleeve_report)
+        self.last_indicator_update_report = report
         target_sleeves = sleeve_ids or sorted(self.indicator_engine.registries_by_sleeve)
         indicator_snapshots: dict[str, IndicatorSnapshot] = {}
         for sleeve_id in target_sleeves:

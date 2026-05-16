@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
@@ -11,6 +11,7 @@ from leaps_quant_engine.models import Bar, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Holding, Portfolio, StaticPortfolioProvider
 from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, bootstrap_sleeve_runtime
 from leaps_quant_engine.runtime_bootstrap import _FallbackHistoryProvider
+from leaps_quant_engine.runtime_bootstrap import _confirmed_daily_warmup_end
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
@@ -45,6 +46,20 @@ class FailingHistoryProvider:
 
     def get_history(self, symbol, *, start=None, end=None):
         raise RuntimeError("primary unavailable")
+
+
+def test_live_runtime_preselect_warmup_ends_at_previous_confirmed_daily_bar():
+    snapshot = SimpleNamespace(config=SimpleNamespace(mode="live", timezone="Asia/Seoul"))
+
+    warmup_end = _confirmed_daily_warmup_end(snapshot, now=datetime(2026, 5, 15, 12, 30))
+
+    assert warmup_end.date() == date(2026, 5, 14)
+
+
+def test_backtest_runtime_preselect_warmup_keeps_default_end():
+    snapshot = SimpleNamespace(config=SimpleNamespace(mode="backtest", timezone="Asia/Seoul"))
+
+    assert _confirmed_daily_warmup_end(snapshot, now=datetime(2026, 5, 15, 12, 30)) is None
 
 
 class FakeAlphaModel:

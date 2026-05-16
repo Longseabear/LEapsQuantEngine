@@ -2,7 +2,7 @@ param(
     [string]$Config = "configs/runtime/live_multi_sleeve.json",
     [string[]]$SleeveIds = @("LEaps", "us_etf_rotation"),
     [int]$IntervalSeconds = 60,
-    [double]$DomesticMaxSubmitNotional = 7000000,
+    [double]$DomesticMaxSubmitNotional = 12000000,
     [double]$OverseasMaxSubmitNotional = 2500,
     [string]$OrderBatchOutput = "data/runtime/live-order-loop/multi_sleeve_candidate_orders.json",
     [string]$Journal = "data/cycle-journal/live_multi_sleeve.jsonl",

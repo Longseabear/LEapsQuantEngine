@@ -13,7 +13,7 @@ class IndicatorDefinition:
     period: int
     field: str = "close"
     parameters: dict[str, Any] | None = None
-    resolution: str = "any"
+    resolution: str = "daily"
     readiness: str = "required"
 
     def __post_init__(self) -> None:

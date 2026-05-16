@@ -69,15 +69,51 @@ Working rules:
   second, or tick bars.
 - `any` preserves old behavior for smoke tests and intentionally generic
   indicators.
+- Incoming bars stamped as `any`, `unknown`, or left blank do not update
+  confirmed daily indicators. Adapters must identify the stream before it
+  reaches the registry.
 
 Provider defaults:
 
 - daily history loaders stamp bars as `resolution="daily"`.
 - live market snapshots stamp provider bars as `resolution="live"` when the
   provider did not specify one.
+- snapshot worker reports expose `indicator_update_count` and
+  `indicator_resolution_mismatch_count` so operators can see when a live cycle
+  intentionally skipped confirmed daily indicator updates.
 
 This means a live snapshot cannot accidentally advance a confirmed daily
 momentum or SMA window.
+
+## Opening And Extended Sessions
+
+Opening-auction and extended-session rows are valid market context, but they are
+not confirmed daily bars. Minute replay/cache rows may carry:
+
+```text
+market_session_phase
+is_regular_market_open
+is_orderable_session
+is_extended_market_hours
+```
+
+Models can use these values to reason about expected open, gap risk, urgency,
+or execution sizing. The indicator registry still relies on `resolution`, so a
+pre-open minute row should remain `resolution="minute"` and must not advance
+daily SMA, momentum, ATR, or volatility indicators.
+
+The LEAN-like split is:
+
+- subscription/session controls decide whether extended data enters the engine
+- `Bar.metadata` says which session produced the row
+- alpha/execution models explicitly opt into using that context
+- confirmed daily indicators stay on daily/history data
+
+If snapshot quality is `invalid`, `FrameworkRunner` does not run alpha or
+portfolio construction for that cycle. Active insights are suppressed from that
+cycle's portfolio input, but the insight ledger is not cancelled solely because
+of a transient bad snapshot. This keeps contaminated current data out of new
+orders without erasing a valid previous daily thesis.
 
 ## Indicator Readiness
 
@@ -195,31 +231,53 @@ to fills, cash changes, and price/equity changes.
 
 ## Portfolio Blend
 
-Portfolio Blend is an optional operational transition layer after raw portfolio
-construction and before order sizing.
+Portfolio Blend is an optional operational transition layer after target
+resolution and before order sizing.
 
 It is meant for this situation:
 
 ```text
-old committed target snapshot -> new raw target snapshot
+old complete target snapshot -> new complete target snapshot
 ```
 
 It is not implemented as "run old Python model plus new Python model." The
 engine stores the previous committed target percentages, compares them to the
-current raw `PortfolioTargetBatch`, and linearly moves from the old weights to
-the new weights over `portfolio.blend.duration_minutes`.
+current resolved `PortfolioTargetBatch`, and linearly moves from the old weights
+to the new weights over `portfolio.blend.duration_minutes`.
+
+Target resolution happens first:
+
+```text
+portfolio model raw output
+  -> PortfolioTargetResolver
+  -> resolved complete target vector
+  -> PortfolioBlendEngine
+```
+
+Default `portfolio.target_resolution.mode="complete"` means an omitted old or
+held symbol is resolved to an explicit 0% target before blend when the new raw
+batch contains at least one target. That makes model migrations cross-fade
+naturally: old-only symbols fade out, new-only symbols fade in, and shared
+symbols move from old weight to new weight. An empty raw batch is treated as
+`empty_no_action` by default so a missing/expired insight set does not become an
+implicit all-sell signal; models that truly want all-cash should emit explicit
+0% targets or opt into `zero_missing_when_raw_empty=true`. Use `mode="patch"`
+only for a portfolio model that intentionally emits partial patches; in that
+mode omitted previous targets are carried forward before blend.
 
 Runtime config:
 
 ```json
 {
   "portfolio": {
+    "target_resolution": {
+      "mode": "complete"
+    },
     "blend": {
       "enabled": true,
       "duration_minutes": 300,
       "target_drift_threshold_pct": 0.08,
-      "clock": "orderable_session",
-      "missing_target_behavior": "drop"
+      "clock": "orderable_session"
     }
   }
 }
@@ -237,13 +295,14 @@ Working rules:
 - `FrameworkRunner` can advance an active blend on non-due portfolio cadence
   cycles without re-running the portfolio model.
 - Tags containing `:flat`, `:down`, `stop`, `urgent`, `manual`, `operator`,
-  `force`, or `risk` bypass the blend for that symbol. These exits should not
-  be slowed by an operational transition.
-- `missing_target_behavior="drop"` preserves the existing v0 meaning of an
-  omitted target: no new target is emitted. Models that want a smooth exit must
-  emit an explicit 0% target.
-- `missing_target_behavior="zero"` is available for complete-portfolio
-  allocators that want removed targets to fade toward 0%.
+  `force`, `risk`, `no_longer_in_target_portfolio`, or
+  `missing_target_zero` bypass the blend for that symbol. These exits should
+  not be slowed by an operational transition.
+- Retargeting during an active blend preserves the active transition clock. A
+  changed destination target can update `to_weights`, but the original
+  `started_at`, elapsed time, and deadline remain in force.
+- Portfolio Blend does not decide whether a missing target means carry-forward
+  or zero. That decision belongs to `PortfolioTargetResolver`.
 
 Order sizing still recomputes quantities from the blended percentages, current
 virtual account, current cash/equity, and current prices every cycle.

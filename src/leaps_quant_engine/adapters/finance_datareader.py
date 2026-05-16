@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 import io
+import json
 import math
+from pathlib import Path
 import re
 from typing import Any, Callable, Iterable, Mapping
 
@@ -138,11 +140,33 @@ NAVER_MARKET_SUM_COLUMNS: Mapping[str, tuple[str, ...]] = {
 class FinanceDataReaderMarketDataProvider(MarketDataProvider):
     """Daily historical provider for long-horizon backtests."""
 
+    cache_root: str | Path | None = Path("data/runtime/cache/finance-datareader/daily")
+    cache_enabled: bool = True
+
     def get_latest_bar(self, symbol: Symbol) -> Bar:
         history = self.get_history(symbol)
         if not history:
             raise MarketDataError(f"No FinanceDataReader bars for {symbol.key}")
         return history[-1]
+
+    def get_cached_daily_history(
+        self,
+        symbol: Symbol,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        refresh: bool = False,
+    ) -> list[Bar]:
+        if not self.cache_enabled or self.cache_root is None:
+            return self.get_history(symbol, start=start, end=end)
+        cache_path = _history_cache_path(self.cache_root, symbol, start=start, end=end)
+        if not refresh:
+            cached = _read_history_cache(cache_path, symbol)
+            if cached is not None:
+                return cached
+        bars = self.get_history(symbol, start=start, end=end)
+        _write_history_cache(cache_path, symbol, bars=bars, start=start, end=end)
+        return bars
 
     def get_history(
         self,
@@ -172,6 +196,96 @@ class FinanceDataReaderMarketDataProvider(MarketDataProvider):
                 )
             )
         return bars
+
+
+def _history_cache_path(
+    root: str | Path,
+    symbol: Symbol,
+    *,
+    start: datetime | None,
+    end: datetime | None,
+) -> Path:
+    safe_market = _safe_path_token(symbol.market.upper())
+    safe_ticker = _safe_path_token(symbol.ticker.upper())
+    start_key = _date_key(start)
+    end_key = _date_key(end)
+    return Path(root) / safe_market / safe_ticker / f"{start_key}_{end_key}.json"
+
+
+def _read_history_cache(path: Path, symbol: Symbol) -> list[Bar] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("schema_version") != "finance_datareader_daily_history.v1":
+        return None
+    bars_payload = payload.get("bars")
+    if not isinstance(bars_payload, list):
+        return None
+    bars: list[Bar] = []
+    try:
+        for row in bars_payload:
+            if not isinstance(row, Mapping):
+                return None
+            bars.append(
+                Bar(
+                    symbol=symbol,
+                    time=datetime.fromisoformat(str(row["time"])),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=int(float(row.get("volume") or 0)),
+                    resolution="daily",
+                )
+            )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return bars
+
+
+def _write_history_cache(
+    path: Path,
+    symbol: Symbol,
+    *,
+    bars: list[Bar],
+    start: datetime | None,
+    end: datetime | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": "finance_datareader_daily_history.v1",
+        "provider": "FinanceDataReader",
+        "symbol": symbol.key,
+        "start": start.isoformat() if start else None,
+        "end": end.isoformat() if end else None,
+        "generated_at": datetime.now().isoformat(),
+        "bar_count": len(bars),
+        "bars": [
+            {
+                "time": bar.time.replace(tzinfo=None).isoformat(),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": int(bar.volume),
+            }
+            for bar in bars
+        ],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
+def _date_key(value: datetime | None) -> str:
+    return value.strftime("%Y%m%d") if value is not None else "none"
+
+
+def _safe_path_token(value: str) -> str:
+    return re.sub(r"[^A-Z0-9._-]+", "_", str(value or "").upper()).strip("_") or "unknown"
 
 
 @dataclass(slots=True)

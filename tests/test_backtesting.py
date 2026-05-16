@@ -47,6 +47,30 @@ def test_virtual_market_data_provider_replays_bars_chronologically():
     assert provider.get_latest_bar(symbol).close == 110
 
 
+def test_build_replay_feed_adds_opening_gap_proxy_context():
+    symbol = Symbol("005930", "KRX")
+    provider = VirtualMarketDataProvider.from_bars(
+        [
+            Bar(symbol, datetime(2026, 5, 4), 100, 105, 95, 100, 10),
+            Bar(symbol, datetime(2026, 5, 7), 110, 120, 98, 115, 10),
+        ]
+    )
+
+    feed = build_replay_feed(provider, [symbol])
+
+    first = feed[0].bars[symbol.key]
+    second = feed[1].bars[symbol.key]
+    assert first.metadata["opening_context_source"] == "daily_ohlc_proxy"
+    assert first.metadata["opening_context_available"] is False
+    assert second.metadata["opening_context_available"] is True
+    assert second.metadata["previous_close"] == 100.0
+    assert second.metadata["opening_gap_pct"] == pytest.approx(0.10)
+    assert second.metadata["open_to_close_return_pct"] == pytest.approx(115 / 110 - 1)
+    assert second.metadata["open_to_low_drawdown_pct"] == pytest.approx(98 / 110 - 1)
+    assert second.metadata["open_to_high_runup_pct"] == pytest.approx(120 / 110 - 1)
+    assert second.metadata["gap_filled"] is True
+
+
 def test_run_backtest_uses_immediate_fill_model_and_updates_portfolio_state():
     symbol = Symbol("005930", "KRX")
     provider = VirtualMarketDataProvider.from_bars(

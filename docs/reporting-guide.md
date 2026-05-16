@@ -21,9 +21,23 @@ Use:
 py -3 tools\leaps_portfolio_report.py --config configs\runtime\live_multi_sleeve.json --sleeve-id LEaps --notify
 ```
 
-The helper is read-only. It runs a sleeve-scoped report cycle, compares current
-virtual account quantities against freshly sized targets, and can send the
-message to Telegram through the engine notification module.
+The helper is read-only. By default it uses `--mode latest-target`, which reads
+the latest live-cycle artifacts instead of running a fresh model cycle. It
+compares current virtual account quantities against the last persisted
+live-cycle target/order candidates and can send the message to Telegram through
+the engine notification module.
+
+Report modes:
+
+- `--mode latest-target`: default operator mode. Reads virtual account,
+  order-runtime status, framework-state, cycle journal, and the latest
+  `multi_sleeve_candidate_orders.json`. It does not collect market data or run
+  alpha/portfolio/risk/execution again.
+- `--mode fast-current`: fastest current-state mode. Shows account/order state
+  and open tickets while hiding latest targets.
+- `--mode recompute`: diagnostic mode. Runs the old sleeve-scoped
+  `runtime-run-once` path and recomputes snapshot, alpha, portfolio, risk, and
+  execution.
 
 Live trading itself uses the multi-sleeve single runner:
 
@@ -41,6 +55,7 @@ Portfolio reports are sleeve-scoped read models; order submission is owned by
 The message is UTF-8 Korean text and includes:
 
 - sleeve equity, cash, stock exposure, active insight count, and order-intent count
+- report source: latest live-cycle, fast current, or recompute
 - current quantity vs target quantity for each held/targeted symbol
 - symbol names when the universe file or common mapping knows them
 - current holding unrealized PnL, cumulative estimated realized PnL, and
@@ -65,6 +80,10 @@ the current holding and `보유+누적` when both numbers are shown together.
 objects in JSON output. Agents should prefer those compact objects for quick
 health/status checks and use the full `framework` / `portfolio_state` payloads
 only for deeper diagnostics.
+
+Use `--mode recompute` only when the operator explicitly wants a fresh
+hypothetical target. Routine Telegram reports should stay on `latest-target` so
+reporting does not compete with the live order loop or KIS request budget.
 
 Position lifecycle state is persisted by the virtual account store, not by
 reporting. A report may display fields such as entry time, high-watermark price,

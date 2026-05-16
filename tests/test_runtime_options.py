@@ -269,14 +269,14 @@ def test_us_etf_rotation_sample_config_is_usd_etf_only():
     assert dict(sleeve.cash_by_currency) == {}
     assert sleeve.universe.coarse_path == Path("configs/universes/us_etf_rotation_core.json")
     assert [module.ref for module in sleeve.alpha.modules] == [
-        "alphas/etf_rotation.py",
+        "alphas/daa_pullback.py",
         "alphas/volatility_trailing_stop.py",
     ]
     assert sleeve.portfolio.model == ModuleReference("portfolios/rl_ppo_constructor.py")
-    assert dict(sleeve.portfolio.parameters)["allocation_mode"] == "rl_weights"
+    assert dict(sleeve.portfolio.parameters)["allocation_mode"] == "risk_softmax"
     assert dict(sleeve.portfolio.parameters)["policy_path"] is None
-    assert dict(sleeve.portfolio.parameters)["top_k"] == 8
-    assert dict(sleeve.alpha.input_selections)["us_etf_rotation"] == "us_etf_rotation"
+    assert dict(sleeve.portfolio.parameters)["top_k"] == 3
+    assert dict(sleeve.alpha.input_selections)["us_etf_rotation_daa_pullback"] == "us_etf_rotation"
     assert universe_payload["id"] == "us-etf-rotation-core"
     assert all(symbol["asset_type"] == "etf" and symbol["is_etf"] is True for symbol in universe_payload["symbols"])
 

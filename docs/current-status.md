@@ -1,6 +1,6 @@
 # Current Status
 
-Last updated: 2026-05-15
+Last updated: 2026-05-17
 
 This document records what is currently implemented and what should come next. It is intentionally operational: keep it close to the code and update it whenever a public runtime contract changes.
 
@@ -82,6 +82,19 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
   state in `RuntimeStateStore` under `engine-portfolio-blend`, advances active
   transitions between portfolio rebalance runs, and bypasses explicit
   flat/down/stop/urgent/manual/operator/force/risk targets.
+- LEaps KRX ETF safety overlay is implemented for `live_multi_sleeve` and the
+  KR200 candidate profile. `selections/krx_etf_safety.py` selects domestic ETF
+  safety candidates, `alphas/krx_etf_safety.py` emits KODEX-200-regime ETF
+  target-bucket insights, and `portfolios/research_adaptive_allocator.py`
+  consumes those insights as a separate ETF bucket so they do not contaminate
+  stock top-k ranking.
+- LEaps KRW risk also has an intraday KODEX 200 guard for minute/live cycles.
+  `risks/kospi_growth_us_hedge.py` stores the guard's session high through
+  `context.model_state`/`StatePatch`, freezes new stock entries before the
+  configured opening gate, and freezes or risk-off clamps KRW exposure when the
+  benchmark is weak versus the prior daily reference or rolls over from its
+  session high. Defensive KRX ETF symbols can be exempted so protection orders
+  still pass risk while growth-stock entries are blocked.
 - Recent US ETF minute feed import:
   - runtime config: `configs/runtime/us_etf_rotation_sleeve.json`
   - sleeve: `us_etf_rotation`
@@ -340,6 +353,12 @@ meaningful target changes immediate while suppressing sub-3.5 percentage-point
 target churn. The anchor is read through `context.model_state` and updated by
 portfolio `StatePatch(namespace="target_anchor")`; explicit FLAT/DOWN stop
 targets bypass the guard.
+An expanded KRX research candidate now exists at
+`configs/runtime/leaps_workspace_kr200_candidate.json`. It uses
+`configs/universes/leaps_kr_research_200.json`, active max 60, top-k 12, and a
+PPO seed ensemble trained with 17,329,806 KRW initial cash. The training matrix
+drops newly listed symbols with short histories so the PPO episode is not
+truncated by one short series.
 LEaps alpha v0.2 upgrades the momentum and ETF rotation modules with
 risk-adjusted scoring. Momentum now uses fast/slow trend confirmation,
 20-session momentum, short acceleration, normalized volatility, and liquidity,
@@ -890,6 +909,7 @@ IndicatorSnapshot
   -> AlphaRuntime
   -> InsightManager
   -> PortfolioConstructionEngine
+  -> PortfolioTargetResolver
   -> PortfolioTargetBatch
   -> OrderSizingEngine
   -> OrderSizingBatch
@@ -916,6 +936,7 @@ Implemented framework contracts:
 - `PortfolioConstructionEngine`
 - `PortfolioConstructionModel`
 - `EqualWeightPortfolioConstructionModel`
+- `PortfolioTargetResolver`
 - `RiskManagementContext`
 - `RiskManagementModel`
 - `RiskDecision`
@@ -988,8 +1009,9 @@ Current v0 behavior:
 - `BrokerAccountRuntimeConfig` separates account identity from sleeve strategy config: `account_id`, `market_scope`, virtual account store path, order runtime store path, and gateway choice. Order runtime commands resolve stores from this profile first, then fall back to legacy sleeve `portfolio.account_store_path`.
 - Real KIS account attachment is now a read-only sync path, not a direct portfolio source. `KISVirtualAccountSync` calls broker-engine operations for balance, holdings, and execution history, converts executions into `VirtualFillEvent` records, applies owned or explicitly assigned fills into `VirtualSleeveAccountStore`, and records unknown broker fills for later allocation. KIS holdings are reported for reconciliation but do not overwrite sleeve holdings.
 - `FillAllocation` supports partial or full splitting of one broker fill across multiple virtual sleeves by quantity. The broker fill stays in the raw fill ledger, and each sleeve portfolio projection gets only its allocated quantity and proportional fee. This is intentionally lighter than StockProgram's order-chain-lot model: the LEAN engine still sees only `PortfolioProvider.current_portfolio(sleeve_id)`.
-- Unknown broker executions are not silently turned into strategy positions. The operator can intentionally assign unknown fills to a sleeve with `--assign-unknown-to-sleeve`, or record them first and later distribute them with `virtual-account-allocate-fill`.
-- `VirtualSleeveAccountStore` can report allocation status per broker fill (`unallocated`, `partially_allocated`, `fully_allocated`) and reconcile KIS current holdings against the aggregate virtual sleeve projection. This gives operators a bounded daily check instead of replaying all historical fills during every engine cycle.
+- Unknown broker executions are not silently turned into strategy positions. The operator can intentionally assign unknown fills to a sleeve with `--assign-unknown-to-sleeve`, record them first and later distribute them with `virtual-account-allocate-fill`, or explicitly mark manual/operator fills as non-actionable with `virtual-account-ignore-fill --reason ...`. Ignored broker fills stay in the raw broker-fill ledger but no longer count as unallocated work or alter any sleeve portfolio.
+- `VirtualSleeveAccountStore` can report allocation status per broker fill (`unallocated`, `partially_allocated`, `fully_allocated`, `ignored`) and reconcile KIS current holdings against the aggregate virtual sleeve projection. This gives operators a bounded daily check instead of replaying all historical fills during every engine cycle. For overseas KIS accounts, the adapter now exposes `current_quantity`, `settled_quantity`, and `orderable_quantity` separately; reconciliation uses current quantity, while settled quantity remains visible for app/settlement-view comparisons.
+- `virtual-account-reconcile` also includes `order_runtime_filled_positions`, so an incident report can compare broker current positions, virtual sleeve holdings, and order-runtime filled events in one read-only payload. `order-runtime-supervise` now returns a warning when holdings reconciliation is not matched, instead of hiding a contradictory virtual account behind an `ok` status. Its default execution-history window is market-local: domestic routes use Korea Standard Time and overseas routes use America/New_York, preventing US-market fills from being missed during KST early-morning operation.
 - KIS cash balance sync follows the StockProgram lesson without copying the whole fund interface. `virtual-account-sync-cash` stores the KIS account cash snapshot, keeps strategy sleeve cash as internal allocation state, and assigns residual cash to `default sleeve`. `virtual-account-transfer-cash` moves cash between virtual sleeves explicitly.
 - Backtesting remains separated: `run_backtest(...)`, `run_framework_backtest(...)`, and `run_framework_replay(...)` still receive an explicit in-memory `Portfolio` and do not read or write the live/paper virtual account store.
 - The `LEaps` sleeve has a workspace at `sleeves/LEaps` with sleeve-local stock momentum selection, operational symbol selection, KOSPI conviction alpha, volatility trailing-stop alpha, RL PPO portfolio construction, KRW risk, and limit execution modules. `us_etf_rotation` has its own workspace and USD ETF rotation models. `configs/runtime/live_multi_sleeve.json` wires both sleeves into one live runner while keeping their model stacks and account routes separate.
@@ -1011,7 +1033,7 @@ Current v0 behavior:
 - `PassThroughRiskManagementModel` remains available for tests and controlled smoke scenarios.
 - Execution now has a small `ExecutionEngine` that wraps a sleeve execution model and returns an auditable `OrderIntentBatch`.
 - Sleeves can inject execution models through `execution.model` and `execution.parameters`. File-based execution model references resolve relative to `workspace_path`, matching alpha, portfolio, and risk loading.
-- Execution models convert approved targets into `OrderIntent` records only. `ImmediateExecutionModel` remains the default one-ticket limit model, while `StandardExecutionModel`, `LimitExecutionModel`, `MarketExecutionModel`, and `SlicedExecutionModel` can express market/limit style, time-in-force, limit offsets, and quantity/notional slicing. They do not submit broker orders.
+- Execution models convert approved targets into `OrderIntent` records only. `ImmediateExecutionModel` remains the default one-ticket limit model, while `StandardExecutionModel`, `LimitExecutionModel`, `MarketExecutionModel`, and `SlicedExecutionModel` can express market/limit style, time-in-force, limit offsets, quantity/notional slicing, and lifecycle policy metadata such as urgency, max order age, price drift tolerance, minimum replace interval, and max replacement count. They do not submit broker orders.
 - Execution model interfaces are now session-aware without breaking older
   models. A custom model may keep the legacy four-argument `create_orders`
   signature, or opt into `execution_context` / `market_session`. The context
@@ -1658,6 +1680,18 @@ sma_20_daily_provisional = previous 19 confirmed daily closes + current live pri
 ```
 
 Do not mix daily bars, minute bars, and quote snapshots into the same indicator stream. Indicator definitions now support a `resolution` field such as `daily`, `minute`, or `quote`. `IndicatorRegistry` skips bar updates whose resolution does not match the indicator plan, so a live quote cannot accidentally advance a confirmed daily SMA or momentum window. `MarketDataSnapshotEngine` stamps latest bars as `live` when the provider did not specify a resolution, and daily history loaders stamp warmed/backtest bars as `daily`.
+Bars with `any`, `unknown`, or blank resolution are not allowed to update
+confirmed daily indicators; they are counted as resolution mismatches. Snapshot
+worker cycle reports expose `indicator_update_count` and
+`indicator_resolution_mismatch_count` for diagnostics. If snapshot quality is
+`invalid`, the framework skips alpha and portfolio construction for that cycle.
+Active insights are suppressed from that cycle's portfolio input, but the
+insight ledger is preserved so a transient bad snapshot does not erase a valid
+previous daily thesis.
+
+KIS daily history normalization also quarantines zero-volume daily rows with
+split-like close discontinuities from the previous close. This is a conservative
+data-quality guard, not a full corporate-action adjustment engine.
 
 Current practical split:
 
@@ -1695,11 +1729,16 @@ INPUT_RESOLUTION = "daily"
 
 Portfolio construction now uses `portfolio.rebalance.cadence`. When cadence is not due, `FrameworkRunner` reuses the last allocation targets instead of rebuilding a new target set from a minute-level context. `OrderSizingEngine` still recomputes desired value, target quantity, and delta quantity from the current virtual portfolio, current price, and current cash/equity every cycle. If `portfolio.rebalance.reused_target_churn_guard` is enabled, reused batches can suppress tiny adjacent-lot non-exit flips caused by discretization, while fresh allocation batches and explicit exit/flat targets remain tradeable. Risk and execution then run against the resulting sized targets. Urgent exits should be modeled as always-on risk or explicitly quote-resolution exit models; daily portfolio cadence should not be the only safety path.
 
-`portfolio.blend` is now available for operational target transitions. The live
-LEaps and `us_etf_rotation` configs enable a 300-minute orderable-session blend
-for raw target drift of 0.08 or more. The old side is the stored target snapshot,
-not a concurrently running old model. Active blend progress is visible in
-`portfolio_target_batch.metadata.portfolio_blend`.
+`portfolio.target_resolution` now runs before `portfolio.blend`. The default
+complete mode resolves raw portfolio output into a complete desired target vector:
+old-only or held-only symbols become explicit 0% targets when the new raw batch
+is non-empty, while patch-style carry-forward is opt-in. Empty raw batches are
+no-action by default, so expired insights do not become implicit all-sell
+signals. `portfolio.blend` then cross-fades complete old/new target vectors.
+The live LEaps and `us_etf_rotation` configs enable a
+300-minute orderable-session blend for target drift of 0.08 or more. The old
+side is the stored target snapshot, not a concurrently running old model. Active
+blend progress is visible in `portfolio_target_batch.metadata.portfolio_blend`.
 
 ## Next Work
 

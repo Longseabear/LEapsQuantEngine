@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+import json
 import logging
+from pathlib import Path
 from threading import Lock
 import time
 from typing import Any, Mapping
@@ -11,7 +13,7 @@ import requests
 
 from leaps_quant_engine.adapters.kis_direct import KISDirectClient
 from leaps_quant_engine.market_data import MarketDataError, MarketDataProvider
-from leaps_quant_engine.models import Bar, Symbol
+from leaps_quant_engine.models import Bar, DataResolution, Symbol
 from leaps_quant_engine.settings import KISSettings, load_kis_settings
 
 
@@ -344,6 +346,7 @@ class KISBrokerEngineMarketDataProvider(MarketDataProvider):
             low=price,
             close=price,
             volume=int(_first_present(result, ("volume", "acml_vol", "accumulated_volume"), default=0)),
+            resolution=DataResolution.LIVE.value,
         )
 
     def get_history(
@@ -363,7 +366,7 @@ class KISBrokerEngineMarketDataProvider(MarketDataProvider):
             ),
         )
         rows = _extract_history_rows(result)
-        return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
+        return _daily_rows_to_bars(symbol, rows)
 
     def get_cached_daily_history(
         self,
@@ -382,7 +385,7 @@ class KISBrokerEngineMarketDataProvider(MarketDataProvider):
             },
         )
         rows = _extract_history_rows(result)
-        return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
+        return _daily_rows_to_bars(symbol, rows)
 
 
 @dataclass(slots=True)
@@ -419,6 +422,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
             low=price,
             close=price,
             volume=int(_first_present(result, ("volume", "acml_vol", "accumulated_volume"), default=0)),
+            resolution=DataResolution.LIVE.value,
         )
 
     def get_history(
@@ -438,7 +442,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
             ),
         )
         rows = _extract_history_rows(result)
-        return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
+        return _daily_rows_to_bars(symbol, rows)
 
     def get_cached_daily_history(
         self,
@@ -457,7 +461,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
             },
         )
         rows = _extract_history_rows(result)
-        return sorted((_row_to_bar(symbol, row) for row in rows), key=lambda bar: bar.time)
+        return _daily_rows_to_bars(symbol, rows)
 
     def get_cached_minute_history(
         self,
@@ -484,7 +488,7 @@ class KISCachedMarketDataProvider(MarketDataProvider):
         )
         rows = _extract_history_rows(result)
         return sorted(
-            (_row_to_bar(symbol, row, default_date=trade_date) for row in rows),
+            (_row_to_bar(symbol, row, default_date=trade_date, resolution=DataResolution.MINUTE.value) for row in rows),
             key=lambda bar: bar.time,
         )
 
@@ -495,6 +499,8 @@ class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
 
     client: MarketDataEngineClient
     exchange_by_symbol: Mapping[str, str] = field(default_factory=dict)
+    live_quote_cache_max_age_seconds: float = 90.0
+    prefer_live_quote_cache: bool = True
 
     @classmethod
     def from_env(
@@ -514,11 +520,32 @@ class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
         return self.client.health_check()
 
     def get_latest_bar(self, symbol: Symbol) -> Bar:
-        result = self.client.call_tool(
-            "get_stock_price",
-            _latest_quote_arguments(symbol, exchange_by_symbol=self.exchange_by_symbol),
-        )
-        return _quote_to_bar(symbol, result, require_live_price=True, allow_reference_price=True)
+        arguments = _latest_quote_arguments(symbol, exchange_by_symbol=self.exchange_by_symbol)
+        if self.prefer_live_quote_cache:
+            cached = _read_live_quote_cache_bar(
+                self.client,
+                symbol,
+                max_age_seconds=self.live_quote_cache_max_age_seconds,
+            )
+            if cached is not None:
+                return cached
+        try:
+            result = self.client.call_tool(
+                "get_stock_price",
+                arguments,
+            )
+            bar = _quote_to_bar(symbol, result, require_live_price=True, allow_reference_price=True)
+            _write_live_quote_cache_bar(self.client, bar)
+            return bar
+        except Exception:
+            cached = _read_live_quote_cache_bar(
+                self.client,
+                symbol,
+                max_age_seconds=self.live_quote_cache_max_age_seconds,
+            )
+            if cached is not None:
+                return cached
+            raise
 
     def get_history(
         self,
@@ -528,6 +555,127 @@ class MarketDataEngineLiveQuoteProvider(MarketDataProvider):
         end: datetime | None = None,
     ) -> list[Bar]:
         raise MarketDataError("MarketDataEngineLiveQuoteProvider does not support history.")
+
+
+def _read_live_quote_cache_bar(
+    client: Any,
+    symbol: Symbol,
+    *,
+    max_age_seconds: float,
+) -> Bar | None:
+    path = _live_quote_cache_path(client)
+    if path is None:
+        return None
+    payload = _read_json_object(path)
+    entry = payload.get(symbol.key)
+    if not isinstance(entry, dict):
+        return None
+    cached_at = _parse_cache_datetime(entry.get("cached_at"))
+    if cached_at is None:
+        return None
+    now = datetime.now(tz=cached_at.tzinfo) if cached_at.tzinfo is not None else datetime.now()
+    cache_age_seconds = max((now - cached_at).total_seconds(), 0.0)
+    if cache_age_seconds > max_age_seconds:
+        return None
+    bar = _bar_from_live_quote_cache_entry(symbol, entry)
+    if bar is None:
+        return None
+    metadata = dict(bar.metadata)
+    metadata.update(
+        {
+            "live_quote_cache_status": "hit",
+            "live_quote_cache_age_seconds": cache_age_seconds,
+            "live_quote_cache_cached_at": cached_at.isoformat(),
+        }
+    )
+    return replace(bar, metadata=metadata)
+
+
+def _write_live_quote_cache_bar(client: Any, bar: Bar) -> None:
+    path = _live_quote_cache_path(client)
+    if path is None:
+        return
+    payload = _read_json_object(path)
+    payload[bar.symbol.key] = _bar_to_live_quote_cache_entry(bar)
+    _write_json_object(path, payload)
+
+
+def _live_quote_cache_path(client: Any) -> Path | None:
+    cache_dir = getattr(client, "cache_dir", None)
+    if cache_dir is None:
+        return None
+    return Path(cache_dir) / "live-quotes" / "latest.json"
+
+
+def _bar_to_live_quote_cache_entry(bar: Bar) -> dict[str, Any]:
+    return {
+        "symbol": bar.symbol.key,
+        "ticker": bar.symbol.ticker,
+        "market": bar.symbol.market,
+        "time": bar.time.isoformat(),
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+        "resolution": bar.resolution,
+        "metadata": dict(bar.metadata),
+        "cached_at": datetime.now().isoformat(),
+    }
+
+
+def _bar_from_live_quote_cache_entry(symbol: Symbol, entry: Mapping[str, Any]) -> Bar | None:
+    bar_time = _parse_cache_datetime(entry.get("time"))
+    if bar_time is None:
+        return None
+    try:
+        return Bar(
+            symbol=symbol,
+            time=bar_time,
+            open=float(entry.get("open")),
+            high=float(entry.get("high")),
+            low=float(entry.get("low")),
+            close=float(entry.get("close")),
+            volume=int(float(entry.get("volume") or 0)),
+            resolution=_live_quote_cache_resolution(entry),
+            metadata=dict(entry.get("metadata") or {}),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _live_quote_cache_resolution(entry: Mapping[str, Any]) -> str:
+    resolution = str(entry.get("resolution") or "").strip().lower()
+    if resolution in {"", DataResolution.ANY.value, "unknown", "*"}:
+        return DataResolution.LIVE.value
+    return resolution
+
+
+def _parse_cache_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_json_object(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f"{path.name}.{time.monotonic_ns()}.tmp")
+    temporary_path.write_text(
+        json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
 
 
 def _daily_history_arguments(
@@ -674,7 +822,13 @@ def _extract_history_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raise MarketDataError(f"Could not extract history rows from KIS payload keys={sorted(payload)}")
 
 
-def _row_to_bar(symbol: Symbol, row: dict[str, Any], *, default_date: datetime | None = None) -> Bar:
+def _row_to_bar(
+    symbol: Symbol,
+    row: dict[str, Any],
+    *,
+    default_date: datetime | None = None,
+    resolution: str = DataResolution.DAILY.value,
+) -> Bar:
     return Bar(
         symbol=symbol,
         time=_parse_row_datetime(row, default_date=default_date),
@@ -683,6 +837,7 @@ def _row_to_bar(symbol: Symbol, row: dict[str, Any], *, default_date: datetime |
         low=_float_field(row, "low", "low_price", "stck_lwpr", "ovrs_nmix_lwpr"),
         close=_float_field(row, "close", "close_price", "stck_clpr", "stck_prpr", "ovrs_nmix_prpr"),
         volume=int(_first_present(row, ("volume", "cntg_vol", "acml_vol", "acml_vol_qty"), default=0)),
+        resolution=resolution,
     )
 
 
@@ -734,8 +889,34 @@ def _quote_to_bar(
         low=low_price,
         close=price,
         volume=volume,
+        resolution=DataResolution.LIVE.value,
         metadata=metadata,
     )
+
+
+def _daily_rows_to_bars(symbol: Symbol, rows: list[dict[str, Any]]) -> list[Bar]:
+    bars = sorted((_row_to_bar(symbol, row, resolution=DataResolution.DAILY.value) for row in rows), key=lambda bar: bar.time)
+    return _quarantine_daily_history_outliers(bars)
+
+
+def _quarantine_daily_history_outliers(bars: list[Bar]) -> list[Bar]:
+    if len(bars) < 2:
+        return bars
+    result: list[Bar] = []
+    previous: Bar | None = None
+    for bar in bars:
+        if previous is not None and _looks_like_adjusted_price_discontinuity(previous, bar):
+            continue
+        result.append(bar)
+        previous = bar
+    return result
+
+
+def _looks_like_adjusted_price_discontinuity(previous: Bar, current: Bar) -> bool:
+    if current.volume > 0 or previous.close <= 0 or current.close <= 0:
+        return False
+    ratio = current.close / previous.close
+    return ratio >= 3.0 or ratio <= (1.0 / 3.0)
 
 
 def _parse_date(value: str) -> datetime:

@@ -34,5 +34,16 @@ The same symbol may have different periods, readiness, and current values in dif
 
 Indicators consume normalized `Bar` / `DataSlice` inputs only.
 
-Do not let live quote snapshots accidentally advance confirmed daily indicators. Daily/history indicators and live quote indicators should be explicitly separated by name/config until formal resolution validation exists.
+Do not let live quote snapshots accidentally advance confirmed daily indicators.
+Daily/history indicators and live quote indicators must be explicitly separated
+by name/config.
 
+`IndicatorRegistry` enforces the configured indicator resolution:
+
+- confirmed daily indicators update only from `daily` or `daily_confirmed` bars
+- live/quote indicators update only from live/intraday bars
+- `any` is only for intentionally generic indicators
+
+Unknown bar resolutions are not accepted for confirmed daily indicators. Provider
+adapters should stamp historical rows as `daily`, minute replay rows as
+`minute`, and live/latest quote rows as `live`.

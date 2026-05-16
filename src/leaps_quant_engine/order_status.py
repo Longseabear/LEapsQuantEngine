@@ -74,6 +74,10 @@ class OrderRuntimeStatusReport:
         return sum(1 for status in self.allocation_statuses if status.remaining_quantity > 0)
 
     @property
+    def ignored_fill_count(self) -> int:
+        return sum(1 for status in self.allocation_statuses if status.status == "ignored")
+
+    @property
     def needs_attention(self) -> bool:
         return bool(self.order_snapshot.open_tickets or self.unallocated_fill_count or self.warnings)
 
@@ -102,11 +106,19 @@ class OrderRuntimeStatusReport:
             "virtual_account": {
                 "raw_broker_fill_count": len(self.allocation_statuses),
                 "unallocated_fill_count": self.unallocated_fill_count,
+                "ignored_fill_count": self.ignored_fill_count,
                 "allocation_status_counts": allocation_status_counts,
                 "unallocated_fills": [
                     status.to_dict()
                     for status in self.allocation_statuses
                     if status.remaining_quantity > 0
+                ]
+                if include_details
+                else [],
+                "ignored_fills": [
+                    status.to_dict()
+                    for status in self.allocation_statuses
+                    if status.status == "ignored"
                 ]
                 if include_details
                 else [],

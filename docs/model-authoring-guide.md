@@ -44,6 +44,34 @@ side effects outside that contract.
 - Keep model IDs stable. They are used in insight superseding, logs, journals,
   and runtime wiring.
 
+## Model Vs Engine Responsibility
+
+Use this split when deciding where a feature belongs:
+
+- Selection models decide the active candidate set. The engine still forces
+  held, open-order, exit-watch, and manual symbols into the live universe.
+- Alpha models decide predictions only. They do not decide position quantity
+  and they do not clear broker tickets.
+- Portfolio models decide desired allocation percentages. They should not emit
+  share quantities or mutate current holdings.
+- Risk models decide sleeve strategy constraints such as max exposure,
+  concentration, stale-data tolerance, stop/reduce, and model-specific exits.
+  Engine guards always own oversell prevention, missing route blocks,
+  duplicate submit/idempotency, unsupported sessions, and broker capability
+  checks.
+- Execution models decide order style and trading urgency: market vs limit,
+  limit offset, time-in-force, slicing, extended-session permission, max order
+  age, price-drift tolerance, minimum replace interval, and max replacement
+  count. The order runtime executes only approved lifecycle transitions.
+- Virtual account reconciliation is not a strategy model. Unknown broker fills
+  must be explicitly assigned to a sleeve or explicitly ignored as
+  operator/manual activity. The engine records that decision and keeps it out of
+  strategy state unless allocation is requested.
+
+If a behavior would make every sleeve inherit one strategy's assumption, keep it
+out of core and express it through a model contract or an explicit operator
+workflow.
+
 ## Recommended Sleeve Layout
 
 ```text
@@ -472,27 +500,47 @@ Example:
       "reused_target_churn_lot_fraction": 0.5,
       "reused_target_churn_equity_bps": 5
     },
+    "target_resolution": {
+      "mode": "complete"
+    },
     "blend": {
       "enabled": true,
       "duration_minutes": 300,
       "target_drift_threshold_pct": 0.08,
-      "clock": "orderable_session",
-      "missing_target_behavior": "drop"
+      "clock": "orderable_session"
     }
   }
 }
 ```
 
+Target Resolution notes:
+
+- Portfolio models normally emit a complete desired target set, not a partial
+  patch. With `portfolio.target_resolution.mode="complete"`, a previously
+  targeted or currently held symbol missing from a non-empty new raw output is
+  converted to an explicit 0% target before blend.
+- Empty raw target batches are `empty_no_action` by default. Do not rely on
+  "emit nothing" to mean all-cash; emit explicit 0% targets when the model
+  wants positions closed.
+- Use `mode="patch"` only for a model that intentionally emits partial changes.
+  The resolver carries omitted previous targets forward, then blend runs on the
+  merged complete vector.
+- Blend must never infer missing-target semantics. Its input is the resolved
+  complete vector.
+
 Portfolio Blend notes:
 
 - Do not register an "old model" and "new model" together. The old side is the
   stored target snapshot.
-- Emit explicit 0% targets when a complete-portfolio allocator wants a held
-  symbol to be reduced or closed. With `missing_target_behavior="drop"`, omitted
-  targets remain omitted.
+- For complete-portfolio allocators, omitted old-only targets fade toward 0%
+  because target resolution has already made them explicit 0% targets.
 - Tags containing `:flat`, `:down`, `stop`, `urgent`, `manual`, `operator`,
-  `force`, or `risk` bypass the blend for that symbol, so trailing stops and
-  risk exits are not delayed.
+  `force`, `risk`, `no_longer_in_target_portfolio`, or
+  `missing_target_zero` bypass the blend for that symbol, so trailing stops,
+  risk exits, and explicit old-only target exits are not delayed.
+- Retargeting during an active blend does not restart the blend clock. The
+  active transition keeps its original `started_at`, elapsed time, and deadline;
+  only the destination target vector is updated.
 - Reports and cycle output expose `portfolio_target_batch.metadata.portfolio_blend`
   with status, progress, transition id, elapsed minutes, duration, drift, and
   bypassed symbols.
@@ -754,13 +802,26 @@ Notes:
   `time_in_force=day`, but it should not manually clear stale pending tickets;
   the supervisor expires them after the relevant market-local date rolls over.
 - If a model needs more aggressive exit behavior, express that as execution
-  policy through order type, limit offset, urgency metadata, or a future
-  replace policy. Do not hide broker cancel/replace calls inside the model.
+  policy through order type, limit offset, and `execution_policy` metadata.
+  `StandardExecutionModel` can stamp `urgency`, `max_order_age_seconds`,
+  `price_drift_bps`, `min_replace_interval_seconds`, and `max_replacements`
+  onto each `OrderIntent`. Do not hide broker cancel/replace calls inside the
+  model.
+- Opening-auction and extended-session data can arrive as minute bars with
+  `Bar.metadata["market_session_phase"]`. Use this as opening/execution
+  context, not as confirmed daily data. A model that reacts to pre-open gaps
+  should check `is_extended_market_hours` or the explicit session phase and
+  keep daily momentum/SMA inputs on daily-confirmed indicators.
+- Long daily backtests can expose an opening proxy through
+  `Bar.metadata["opening_context_source"] == "daily_ohlc_proxy"`. Values such
+  as `opening_gap_pct` and `gap_filled` are derived from daily OHLC and the
+  previous close. Alpha models read them through
+  `context.metadata_value(symbol, "opening_gap_pct")`. Treat them as proxy
+  features, not historical pre-open book observations.
 - Cancel/replace policy is an execution-model responsibility, while the order
-  runtime owns broker lifecycle execution. A future replace-aware model should
-  emit policy fields such as max order age, price-drift threshold, minimum
-  replace interval, max replacement count, and urgency. The runtime should then
-  cancel/replace only at ticket-safe boundaries.
+  runtime owns broker lifecycle execution. The runtime should cancel/replace
+  only at ticket-safe boundaries and should use model-provided policy fields
+  rather than inventing one sleeve's urgency as a core default.
 
 ## Validation Checklist
 

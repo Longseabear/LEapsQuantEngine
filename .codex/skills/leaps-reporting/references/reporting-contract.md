@@ -9,8 +9,10 @@ Scope:
 - Portfolio report payloads are sleeve-scoped read models.
 - The live submit loop is multi-sleeve and uses
   `configs/runtime/live_multi_sleeve.json`.
-- A report may use single-sleeve `runtime-run-once` to inspect one sleeve, but
-  live loop liveness must be checked through
+- Routine operator reports use `--mode latest-target`, reading the latest
+  live-cycle artifacts without recomputing alpha/portfolio/risk/execution.
+- A report may use single-sleeve `runtime-run-once` only in `--mode recompute`
+  for diagnostics. Live loop liveness must be checked through
   `tools/leaps_multi_sleeve_live_order_loop.ps1` and the multi-route order
   status commands.
 
@@ -19,6 +21,7 @@ Required sections:
 1. Header
    - sleeve id
    - generated time
+   - report source/mode
    - snapshot status and collected/requested symbol count
 
 2. Portfolio summary
@@ -26,6 +29,7 @@ Required sections:
    - equity by currency when available
    - gross exposure and percentage
    - current cycle order candidate count
+   - open ticket count
 
 3. Current vs target quantities
    - symbol
@@ -56,6 +60,9 @@ Required sections:
 Rules:
 
 - Reporting must be read-only.
+- `latest-target` and `fast-current` modes must not call `runtime-run-once`,
+  collect market data, run alpha, create state patches, or produce fresh order
+  intents.
 - Reporting must never call `order-runtime-submit`.
 - Reporting must not start or stop the live multi-sleeve order loop.
 - Do not infer a sell target from absence of an active target.
