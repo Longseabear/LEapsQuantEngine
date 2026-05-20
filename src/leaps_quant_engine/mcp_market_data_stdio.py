@@ -107,6 +107,20 @@ class LeapsMarketDataToolRegistry:
                     handler=lambda args: self._call_operation("get_intraday_bars", args),
                 ),
                 ToolDefinition(
+                    name="get_overseas_intraday_bars",
+                    description="Return recent overseas intraday bars through the local KIS adapter.",
+                    input_schema=_object_schema(
+                        {
+                            "symbol": {"type": "string"},
+                            "exchange": {"type": "string"},
+                            "interval_minutes": {"type": "integer", "default": 1},
+                            "record_count": {"type": "integer", "default": 120},
+                        },
+                        required=("symbol", "exchange"),
+                    ),
+                    handler=lambda args: self._call_operation("get_overseas_intraday_bars", args),
+                ),
+                ToolDefinition(
                     name="get_or_cache_domestic_minute_bars",
                     description="Fetch or reuse local cache for domestic minute bars by trade date.",
                     input_schema=_object_schema(
@@ -122,6 +136,23 @@ class LeapsMarketDataToolRegistry:
                         required=("symbol", "trade_date"),
                     ),
                     handler=lambda args: self._call_operation("get_or_cache_domestic_minute_bars", args),
+                ),
+                ToolDefinition(
+                    name="get_or_cache_overseas_minute_bars",
+                    description="Fetch or reuse local cache for overseas minute bars by trade date.",
+                    input_schema=_object_schema(
+                        {
+                            "symbol": {"type": "string"},
+                            "exchange": {"type": "string"},
+                            "trade_date": {"type": "string"},
+                            "start_time": {"type": "string"},
+                            "end_time": {"type": "string"},
+                            "interval_minutes": {"type": "integer", "default": 1},
+                            "refresh": {"type": "boolean", "default": False},
+                        },
+                        required=("symbol", "exchange", "trade_date"),
+                    ),
+                    handler=lambda args: self._call_operation("get_or_cache_overseas_minute_bars", args),
                 ),
                 ToolDefinition(
                     name="build_whitelist_live_facts",

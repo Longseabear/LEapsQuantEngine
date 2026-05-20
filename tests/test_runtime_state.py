@@ -217,3 +217,30 @@ def test_runtime_model_state_view_is_read_only_and_uses_defaults():
     empty_view = RuntimeModelStateView()
     assert empty_view.get(key) is None
     assert empty_view.entries() == ()
+
+
+def test_runtime_model_state_view_object_helpers_build_state_patches():
+    store = InMemoryRuntimeStateStore()
+    view = RuntimeModelStateView(store=store, default_sleeve_id="LEaps", default_model_id="trailing-stop")
+
+    set_patch = view.object_set(
+        {"high": 84000},
+        namespace="stop",
+        symbol_key="KRX:005930",
+        reason="seed",
+        generated_at=datetime(2026, 5, 8, 9, 30),
+    )
+    merge_patch = view.object_merge(
+        {"last": 83500},
+        namespace="stop",
+        symbol_key="KRX:005930",
+        reason="refresh",
+    )
+    store.apply_patches((set_patch, merge_patch))
+
+    assert view.object_get(namespace="stop", symbol_key="KRX:005930") == {"high": 84000, "last": 83500}
+    assert view.object_entries(namespace="stop") == ({"high": 84000, "last": 83500},)
+
+    store.apply_patches((view.object_delete(namespace="stop", symbol_key="KRX:005930", reason="closed"),))
+
+    assert view.object_get(namespace="stop", symbol_key="KRX:005930", default={"missing": True}) == {"missing": True}

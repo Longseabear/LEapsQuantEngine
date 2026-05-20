@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Mapping
 from uuid import uuid4
@@ -90,7 +90,9 @@ class PortfolioBlendTransition:
     to_weights: Mapping[str, float]
     to_tags: Mapping[str, str] = field(default_factory=dict)
     started_at: datetime = field(default_factory=datetime.now)
+    deadline_at: datetime | None = None
     duration_minutes: float = 0.0
+    from_elapsed_minutes: float = 0.0
     elapsed_minutes: float = 0.0
     last_progress_at: datetime | None = None
     source_batch_id: str = ""
@@ -102,6 +104,13 @@ class PortfolioBlendTransition:
         object.__setattr__(self, "from_weights", MappingProxyType(_normalized_weights(self.from_weights)))
         object.__setattr__(self, "to_weights", MappingProxyType(_normalized_weights(self.to_weights)))
         object.__setattr__(self, "to_tags", MappingProxyType({str(k): str(v) for k, v in dict(self.to_tags).items()}))
+        if self.deadline_at is None:
+            object.__setattr__(self, "deadline_at", self.started_at + timedelta(minutes=max(0.0, self.duration_minutes)))
+        object.__setattr__(
+            self,
+            "from_elapsed_minutes",
+            max(0.0, min(float(self.from_elapsed_minutes or 0.0), max(0.0, self.duration_minutes))),
+        )
 
     @property
     def progress(self) -> float:
@@ -116,14 +125,20 @@ class PortfolioBlendTransition:
     def advance(self, as_of: datetime, *, market_session: MarketSession | None = None) -> "PortfolioBlendTransition":
         last = self.last_progress_at or self.started_at
         delta = _elapsed_minutes(last, as_of) if _should_advance(self.clock, market_session) else 0.0
+        elapsed = min(self.duration_minutes, max(0.0, self.elapsed_minutes + delta))
+        if self.clock == "wall_time" and self.deadline_at is not None and as_of >= self.deadline_at:
+            elapsed = self.duration_minutes
         return replace(
             self,
-            elapsed_minutes=min(self.duration_minutes, max(0.0, self.elapsed_minutes + delta)),
+            elapsed_minutes=elapsed,
             last_progress_at=as_of,
         )
 
     def weights_at_progress(self, progress: float | None = None) -> dict[str, float]:
-        ratio = self.progress if progress is None else max(0.0, min(float(progress), 1.0))
+        global_ratio = self.progress if progress is None else max(0.0, min(float(progress), 1.0))
+        elapsed_at_progress = max(0.0, min(self.duration_minutes, self.duration_minutes * global_ratio))
+        remaining = max(self.duration_minutes - self.from_elapsed_minutes, 0.0)
+        ratio = 1.0 if remaining <= 0 else max(0.0, min((elapsed_at_progress - self.from_elapsed_minutes) / remaining, 1.0))
         keys = set(self.from_weights) | set(self.to_weights)
         return {
             symbol_key: _clamp_weight(
@@ -141,7 +156,9 @@ class PortfolioBlendTransition:
             "to_weights": dict(self.to_weights),
             "to_tags": dict(self.to_tags),
             "started_at": self.started_at.isoformat(),
+            "deadline_at": self.deadline_at.isoformat() if self.deadline_at else None,
             "duration_minutes": self.duration_minutes,
+            "from_elapsed_minutes": self.from_elapsed_minutes,
             "elapsed_minutes": self.elapsed_minutes,
             "last_progress_at": self.last_progress_at.isoformat() if self.last_progress_at else None,
             "source_batch_id": self.source_batch_id,
@@ -159,7 +176,9 @@ class PortfolioBlendTransition:
             to_weights=dict(payload.get("to_weights") or {}),
             to_tags=dict(payload.get("to_tags") or {}),
             started_at=_parse_datetime(payload.get("started_at")),
+            deadline_at=_optional_datetime(payload.get("deadline_at")),
             duration_minutes=float(payload.get("duration_minutes") or 0.0),
+            from_elapsed_minutes=float(payload.get("from_elapsed_minutes") or 0.0),
             elapsed_minutes=float(payload.get("elapsed_minutes") or 0.0),
             last_progress_at=_optional_datetime(payload.get("last_progress_at")),
             source_batch_id=str(payload.get("source_batch_id") or ""),
@@ -500,7 +519,9 @@ class PortfolioBlendEngine:
             to_weights=to_weights,
             to_tags=to_tags,
             started_at=context.data.time,
+            deadline_at=context.data.time + timedelta(minutes=self.policy.duration_minutes),
             duration_minutes=self.policy.duration_minutes,
+            from_elapsed_minutes=0.0,
             elapsed_minutes=0.0,
             last_progress_at=context.data.time,
             source_batch_id=source_batch_id,
@@ -523,6 +544,7 @@ class PortfolioBlendEngine:
             from_weights=transition.weights_at_progress(),
             to_weights=to_weights,
             to_tags=to_tags,
+            from_elapsed_minutes=transition.elapsed_minutes,
             source_batch_id=source_batch_id,
             reason="retarget_during_active_blend",
             target_drift=target_drift,
@@ -660,6 +682,8 @@ class PortfolioBlendEngine:
                     "elapsed_minutes": transition.elapsed_minutes,
                     "duration_minutes": transition.duration_minutes,
                     "started_at": transition.started_at.isoformat(),
+                    "deadline_at": transition.deadline_at.isoformat() if transition.deadline_at else None,
+                    "from_elapsed_minutes": transition.from_elapsed_minutes,
                     "last_progress_at": transition.last_progress_at.isoformat()
                     if transition.last_progress_at
                     else None,

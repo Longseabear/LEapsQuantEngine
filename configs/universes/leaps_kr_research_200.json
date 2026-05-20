@@ -2103,9 +2103,24 @@
       "resolution": "daily"
     },
     {
+      "name": "live_close",
+      "type": "identity",
+      "period": 1,
+      "field": "close",
+      "resolution": "live",
+      "readiness": "optional"
+    },
+    {
       "name": "sma_5_close",
       "type": "sma",
       "period": 5,
+      "field": "close",
+      "resolution": "daily"
+    },
+    {
+      "name": "sma_10_close",
+      "type": "sma",
+      "period": 10,
       "field": "close",
       "resolution": "daily"
     },

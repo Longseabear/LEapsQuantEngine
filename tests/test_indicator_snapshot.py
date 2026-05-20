@@ -105,3 +105,20 @@ def test_indicator_snapshot_store_keeps_pending_until_swap():
     assert swapped is second
     assert store.active() is second
     assert store.pending() is None
+
+
+def test_indicator_snapshot_store_separates_active_snapshots_by_lane():
+    engine, symbol = _engine_with_sma()
+    store = IndicatorSnapshotStore()
+
+    engine.on_data(DataSlice(time=datetime(2026, 5, 7, 9, 0), bars={symbol.key: _bar(symbol, 0, 10)}))
+    daily = engine.snapshot("swing-kor", lane="daily")
+    quote = engine.snapshot("swing-kor", lane="quote")
+
+    store.publish_active(daily)
+    store.publish_active(quote)
+
+    assert store.active() is quote
+    assert store.active("daily") is daily
+    assert store.active("quote") is quote
+    assert store.active_lanes() == ("daily_confirmed", "quote")

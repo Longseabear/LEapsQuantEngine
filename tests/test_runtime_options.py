@@ -95,6 +95,7 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.universe.coarse_path == Path("configs/universes/us_live_smoke.json")
     assert sleeve.universe.fine.enabled is True
     assert sleeve.universe.active.max_symbols == 2
+    assert sleeve.universe.active.cadence == "startup_only"
     assert sleeve.universe.active.selection_model == ModuleReference(
         "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel"
     )
@@ -113,6 +114,25 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.portfolio.rebalance.reused_target_churn_equity_bps == 5
     assert sleeve.worker.cycle_interval_seconds == 60
     assert sleeve.indicators.min_ready_ratio == 0.9
+
+
+def test_runtime_config_accepts_kis_gateway_market_data_provider():
+    payload = _runtime_payload()
+    payload["market_data"] = {
+        "provider": "kis-gateway",
+        "history_provider": "kis-cache",
+        "source": "kis-gateway",
+        "history_source": "kis-cache",
+        "rate_limit_per_second": 18,
+        "gateway_base_url": "http://127.0.0.1:8766",
+        "snapshot_store_path": "data/market-data-snapshots/live.jsonl",
+    }
+
+    config = parse_runtime_config(payload)
+
+    assert config.market_data.provider == "kis-gateway"
+    assert config.market_data.gateway_base_url == "http://127.0.0.1:8766"
+    assert config.market_data.snapshot_store_path == Path("data/market-data-snapshots/live.jsonl")
 
 
 def test_runtime_config_can_wire_selection_results_to_alpha_inputs():
@@ -138,6 +158,16 @@ def test_runtime_config_can_wire_selection_results_to_alpha_inputs():
         "etf-rotation": "momentum-active-selection",
     }
     assert config.to_dict()["sleeves"][0]["alpha"]["input_selections"]["momentum-alpha"] == "static-top-n"
+
+
+def test_runtime_config_parses_active_universe_cadence():
+    payload = _runtime_payload()
+    payload["sleeves"][0]["universe"]["active"]["cadence"] = "once_per_day"
+
+    config = parse_runtime_config(payload)
+
+    assert config.sleeve("us-live").universe.active.cadence == "once_per_day"
+    assert config.to_dict()["sleeves"][0]["universe"]["active"]["cadence"] == "once_per_day"
 
 
 def test_runtime_config_routes_sleeves_to_broker_account_profiles():
@@ -275,7 +305,7 @@ def test_us_etf_rotation_sample_config_is_usd_etf_only():
     assert sleeve.portfolio.model == ModuleReference("portfolios/rl_ppo_constructor.py")
     assert dict(sleeve.portfolio.parameters)["allocation_mode"] == "risk_softmax"
     assert dict(sleeve.portfolio.parameters)["policy_path"] is None
-    assert dict(sleeve.portfolio.parameters)["top_k"] == 3
+    assert dict(sleeve.portfolio.parameters)["top_k"] == 4
     assert dict(sleeve.alpha.input_selections)["us_etf_rotation_daa_pullback"] == "us_etf_rotation"
     assert universe_payload["id"] == "us-etf-rotation-core"
     assert all(symbol["asset_type"] == "etf" and symbol["is_etf"] is True for symbol in universe_payload["symbols"])

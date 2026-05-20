@@ -53,6 +53,7 @@ py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_wor
   --start 2023-05-10 `
   --end 2026-05-08 `
   --warmup-start 2023-04-03 `
+  --daily-bar-time 09:00 `
   --cash 2000000 `
   --currency KRW `
   --source finance-datareader `
@@ -61,13 +62,30 @@ py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_wor
   --summary-only
 ```
 
+Daily bars from FinanceDataReader or cached daily history may be timestamped at
+`00:00:00`. Use `--daily-bar-time HH:MM` on `runtime-backtest-daily` or
+`framework-backtest-daily` when a daily run should simulate the engine cycle at
+market open, for example `09:00` for KRX or `09:30` for US. This changes replay
+cycle timestamps, cadence checks, fills, journals, and reports while preserving
+the daily OHLCV values.
+
 Use `--source kis-cache` only for short cache/integration smokes where cached
 history is known to exist.
 
 Runtime backtest reports include a `timings` block. Use it to separate
 `config_bootstrap_ms`, daily `history_feed_build_ms` or minute `feed_load_ms`,
 `daily_warmup_ms`, `framework_replay_ms`, `report_generation_ms`, and
-`total_ms`.
+`total_ms`. For runtime minute replay, also inspect the `replay_*_ms` fields
+such as `replay_indicator_update_ms`, `replay_indicator_snapshot_ms`,
+`replay_universe_selection_ms`, `replay_framework_runner_ms`,
+`replay_journal_append_ms`, `replay_fill_model_ms`, and
+`replay_snapshot_record_ms`; these explain wall-clock overhead outside the
+narrow alpha/portfolio/risk/execution model timings.
+
+When writing a cycle journal during repeated research runs, prefer the default
+`--journal-mode auto`. It uses full lineage for detailed reports and light
+cycle entries for `--summary-only`. Use `--journal-mode full` only when lineage
+itself is the debugging target.
 
 FinanceDataReader daily history is cache-first by default under
 `data/runtime/cache/finance-datareader/daily`. Delete that ignored cache
@@ -116,6 +134,12 @@ requests before writing one standard replay CSV.
 If the downloader returns `empty` or `partial`, report data availability rather
 than a backtest CLI limitation.
 
+For recent US/overseas KIS bars, `download-us-minute-feed` also accepts
+`--provider kis-cache`. The sleeve universe must carry an overseas exchange
+such as `"exchange": "NAS"` unless the symbol market is already `NAS`, `NYS`,
+or `AMS`. Treat this as a same-day/recent collector path; KIS overseas minute
+lookup is not a deep historical minute vendor feed.
+
 ## Minute Cache
 
 For KRX research universes, prefer a rolling minute cache over ad hoc one-off
@@ -138,6 +162,11 @@ The cache writes per-day `YYYY-MM-DD.csv.gz` files under
 metadata: KOSPI symbols map to `.KS`, KOSDAQ symbols map to `.KQ`, while replay
 rows stay normalized as `KRX:<ticker>`.
 
+`minute-cache-build --provider kis-cache` supports KRX and overseas universes.
+For overseas universes, confirm the exchange map before running large pulls:
+the provider routes `US:SMH` plus `"exchange": "NAS"` to the KIS overseas
+intraday endpoint and writes normalized `US:SMH` rows.
+
 Export cached bars to a standard minute feed:
 
 ```powershell
@@ -156,6 +185,19 @@ standard sorted `DataSlice` replay shape without an intermediate feed file.
 Missing weekdays are reported as `missing_weekday_cache_day`; KRX holidays can
 appear there until a full exchange calendar is attached.
 
+For repeated minute research over the same feed/range, add
+`--compiled-replay-cache <path>.json.gz`. The first run writes a pre-grouped
+minute replay artifact; later runs can use only `--compiled-replay-cache` to
+skip CSV/day-file parsing and time-bucket grouping. Use
+`--refresh-compiled-replay-cache` after changing the underlying minute data.
+This cache is replay data only, not model state.
+
+Add `--daily-warmup-cache <path>.json.gz` for repeated minute tests over the
+same confirmed daily warmup window. This stores daily warmup bars, not
+serialized indicator objects, so the engine still replays through
+`IndicatorEngine.warm_up(...)`. Use `--refresh-daily-warmup-cache` when the
+warmup window or daily source changes.
+
 ## Warmup Rule
 
 Always separate indicator warmup from evaluation. For a short test such as
@@ -164,6 +206,17 @@ Always separate indicator warmup from evaluation. For a short test such as
 Cold daily momentum, SMA, ATR, volatility, or liquidity indicators can make a
 strategy look inactive even when the model would have produced signals after
 warmup.
+
+Temporal PPO has an additional requirement: the alpha-gated insight must carry a
+point-in-time `rl_temporal_features` window. Runtime backtests create that
+window automatically when the portfolio parameters use `feature_schema` values
+such as `v2_temporal` or `v2_temporal_residual`, but `--warmup-start` still has
+to reach far enough back for the daily window. Use at least 84 daily bars for
+`v2_temporal` and at least 144 daily bars for `v2_temporal_residual`.
+
+In `runtime-backtest-minute`, the temporal window still comes from
+`--daily-source`; minute bars should not advance confirmed daily temporal
+features.
 
 ## Opening Gap Proxy
 

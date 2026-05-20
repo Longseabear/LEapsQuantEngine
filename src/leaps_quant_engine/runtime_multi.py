@@ -17,6 +17,8 @@ from leaps_quant_engine.runtime_bootstrap import (
     RuntimeRunOnceReport,
     RuntimeSleeveRuntime,
     bootstrap_sleeve_runtime,
+    _snapshot_store_for_config,
+    _runtime_live_provider,
 )
 from leaps_quant_engine.runtime_config import RuntimeConfigSnapshot
 from leaps_quant_engine.snapshot_worker import (
@@ -139,15 +141,13 @@ def run_multi_sleeve_once(
     )
 
     union_universe = _union_active_universe(snapshot.config.runtime_id, runtimes)
-    live_provider = deps.live_provider_factory(
-        union_universe,
-        snapshot.config.market_data.rate_limit_per_second,
-    )
+    live_provider = _runtime_live_provider(snapshot, union_universe, deps)
     snapshot_engine = MarketDataSnapshotEngine(
         provider=live_provider,
         indicator_engine=shared_indicator_engine,
         stores_by_sleeve=shared_stores,
         source=source or snapshot.config.market_data.source,
+        snapshot_store=_snapshot_store_for_config(snapshot),
     )
     collection = snapshot_engine.collect_once_best_effort(list(union_universe.symbols))
     update_started = time.perf_counter()
@@ -167,9 +167,13 @@ def run_multi_sleeve_once(
     reports: list[RuntimeRunOnceReport] = []
     completed_at = datetime.now()
     for runtime in runtimes:
-        indicator_snapshot = indicator_snapshots[runtime.sleeve_id]
+        indicator_snapshot = runtime.worker._enrich_indicator_snapshot(indicator_snapshots[runtime.sleeve_id])
+        runtime.worker.stores_by_sleeve.setdefault(runtime.sleeve_id, IndicatorSnapshotStore()).publish_active(
+            indicator_snapshot
+        )
         sleeve_snapshot = _filter_market_snapshot(collection.snapshot, runtime.active_result.active_universe.symbols)
         runtime.worker.last_market_snapshot = sleeve_snapshot
+        runtime.worker.last_market_snapshot_by_lane[sleeve_snapshot.lane] = sleeve_snapshot
         worker_report = _worker_report_for_runtime(
             runtime,
             collection_snapshot=collection.snapshot,
@@ -299,7 +303,9 @@ def _worker_report_for_runtime(
         indicator_update_count=indicator_update_report.updated_count,
         indicator_resolution_mismatch_count=indicator_update_report.resolution_mismatch_count,
         market_snapshot_id=collection_snapshot.snapshot_id,
+        market_snapshot_lane=collection_snapshot.lane,
         indicator_snapshot_id=indicator_snapshot.snapshot_id,
+        indicator_snapshot_lane=indicator_snapshot.lane,
         snapshot_as_of=indicator_snapshot.as_of.isoformat(),
         snapshot_quality=quality_report,
         collection_elapsed_ms=collection_report.elapsed_ms,
@@ -332,6 +338,7 @@ def _filter_market_snapshot(snapshot: MarketDataSnapshot, symbols: Iterable[Symb
         source=snapshot.source,
         snapshot_id=f"{snapshot.snapshot_id}:filtered",
         time=snapshot.time,
+        lane=snapshot.lane,
     )
 
 

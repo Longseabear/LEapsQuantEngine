@@ -10,6 +10,7 @@ from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, TimeInForce
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderTicketStatus
+from leaps_quant_engine.security import SecurityCatalog
 from leaps_quant_engine.market_rules import (
     AFTER_HOURS_ORDERABLE_PHASES,
     MarketSession,
@@ -92,6 +93,7 @@ class EngineGuard:
         require_account_route: bool = False,
         require_orderable_session: bool = False,
         market_session: MarketSession | Mapping[str, Any] | None = None,
+        security_catalog: SecurityCatalog | None = None,
         generated_at: datetime | None = None,
     ) -> EngineGuardReport:
         generated_at = generated_at or datetime.now()
@@ -152,6 +154,7 @@ class EngineGuard:
         new_buy_notional: dict[str, float] = {}
         new_sell_quantities: dict[tuple[str, str], int] = {}
         for order in _orders(batches_tuple):
+            symbol_properties = security_catalog.resolve(order.symbol) if security_catalog is not None else None
             if market_scope is not None and market_scope_for_symbol(order.symbol) != market_scope:
                 decisions.append(
                     _decision(
@@ -172,6 +175,27 @@ class EngineGuard:
                 decisions.append(_decision("rejected", "order_quantity_must_be_positive", order.sleeve_id, order=order))
             if not capability.fractional_quantity and not is_whole_share_quantity(order.quantity):
                 decisions.append(_decision("rejected", "order_quantity_must_be_whole_share", order.sleeve_id, order=order))
+            if symbol_properties is not None:
+                if order.quantity < symbol_properties.lot_size:
+                    decisions.append(
+                        _decision(
+                            "rejected",
+                            "order_quantity_below_symbol_lot_size",
+                            order.sleeve_id,
+                            order=order,
+                            metadata={"lot_size": symbol_properties.lot_size},
+                        )
+                    )
+                if order.quantity % symbol_properties.quantity_step != 0:
+                    decisions.append(
+                        _decision(
+                            "rejected",
+                            "order_quantity_not_on_symbol_step",
+                            order.sleeve_id,
+                            order=order,
+                            metadata={"quantity_step": symbol_properties.quantity_step},
+                        )
+                    )
             if not capability.supports(order_type=order.order_type, time_in_force=order.time_in_force):
                 decisions.append(
                     _decision(
@@ -183,6 +207,24 @@ class EngineGuard:
                             "order_type": order.order_type.value,
                             "time_in_force": order.time_in_force.value,
                             "market_scope": market_scope,
+                        },
+                    )
+                )
+            if (
+                require_orderable_session
+                and session is not None
+                and symbol_properties is not None
+                and session.session_phase not in set(symbol_properties.supported_sessions)
+            ):
+                decisions.append(
+                    _decision(
+                        "rejected",
+                        "unsupported_symbol_session_phase",
+                        order.sleeve_id,
+                        order=order,
+                        metadata={
+                            "session_phase": session.session_phase,
+                            "supported_sessions": list(symbol_properties.supported_sessions),
                         },
                     )
                 )

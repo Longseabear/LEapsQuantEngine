@@ -28,4 +28,12 @@ def create_portfolio_model(params: Mapping[str, Any] | None = None) -> Reinforce
         target_smoothing_alpha=float(values.get("target_smoothing_alpha", 1.0)),
         target_drift_threshold_pct=float(values.get("target_drift_threshold_pct", 0.0)),
         missing_target_exit_confirmation_cycles=int(values.get("missing_target_exit_confirmation_cycles", 1)),
+        feature_schema=str(values.get("feature_schema", "legacy")),
+        lookback_window=int(values.get("lookback_window", 20)),
+        policy_device=str(values.get("policy_device", "cpu")),
+        max_target_turnover_pct=(
+            float(values["max_target_turnover_pct"])
+            if values.get("max_target_turnover_pct") is not None
+            else None
+        ),
     )

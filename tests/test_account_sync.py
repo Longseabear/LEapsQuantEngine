@@ -83,6 +83,54 @@ def test_execution_to_virtual_fill_uses_stable_order_summary_id_without_quantity
     assert revised.fill_id == first.fill_id
 
 
+def test_execution_to_virtual_fill_preserves_kis_transaction_costs():
+    fill = execution_to_virtual_fill(
+        {
+            "order_id": "12345",
+            "symbol": "005930",
+            "side": "sell",
+            "execution_quantity": "3",
+            "execution_price": "70000",
+            "execution_timestamp": "20260508T093000",
+            "commission_amount": "12.5",
+            "tax_amount": "8",
+            "regulatory_fee": "0.5",
+        },
+        market="domestic",
+    )
+
+    assert fill.fee == 21.0
+    assert fill.metadata["fee_components"] == {
+        "commission": 12.5,
+        "tax": 8.0,
+        "regulatory_fee": 0.5,
+    }
+    assert fill.metadata["transaction_costs"]["total_cost"] == 21.0
+    assert fill.metadata["transaction_costs"]["source"] == "kis_execution"
+
+
+def test_execution_to_virtual_fill_uses_explicit_total_without_double_counting_components():
+    fill = execution_to_virtual_fill(
+        {
+            "order_id": "12345",
+            "symbol": "005930",
+            "side": "sell",
+            "execution_quantity": "3",
+            "execution_price": "70000",
+            "execution_timestamp": "20260508T093000",
+            "total_fee_amount": "30",
+            "commission_amount": "12",
+            "tax_amount": "8",
+        },
+        market="domestic",
+    )
+
+    assert fill.fee == 30.0
+    assert fill.metadata["transaction_costs"]["fee"] == 10.0
+    assert fill.metadata["transaction_costs"]["commission"] == 12.0
+    assert fill.metadata["transaction_costs"]["tax"] == 8.0
+
+
 def test_kis_account_sync_imports_owned_and_unassigned_fills(tmp_path):
     store = VirtualSleeveAccountStore(tmp_path / "accounts.json", default_cash_by_sleeve={"LEaps": 1_000_000})
     store.register_order_intent(

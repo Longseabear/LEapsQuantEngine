@@ -66,7 +66,28 @@ def test_runtime_preflight_detects_code_changed_since_last_cycle(tmp_path):
     assert "stage_reload_and_run_runtime_once" in report.recommended_next_actions
 
 
-def _write_preflight_runtime(tmp_path):
+def test_runtime_preflight_checks_kis_gateway_liveness(tmp_path, monkeypatch):
+    config_path = _write_preflight_runtime(tmp_path, provider="kis-gateway")
+    snapshot = load_runtime_config_snapshot(config_path)
+
+    monkeypatch.setattr(
+        "leaps_quant_engine.runtime_preflight.fetch_kis_gateway_health",
+        lambda base_url, timeout_seconds: {"status": "ok", "server": "leaps-kis-gateway", "lane": {"mock": False}},
+    )
+
+    report = build_runtime_preflight_report(
+        snapshot=snapshot,
+        sleeve_ids=("LEaps",),
+        check_bootstrap=False,
+        strict_live=True,
+    )
+
+    checks = {check.name: check for check in report.checks}
+    assert checks["kis_gateway_liveness"].status == "ok"
+    assert checks["kis_gateway_liveness"].metadata["base_url"] == "http://127.0.0.1:8766"
+
+
+def _write_preflight_runtime(tmp_path, *, provider="market-data-engine"):
     workspace = tmp_path / "sleeves" / "LEaps"
     (workspace / "alphas").mkdir(parents=True)
     (tmp_path / "state" / "accounts").mkdir(parents=True)
@@ -100,7 +121,11 @@ def generate(context):
                 "runtime_id": "preflight-test",
                 "mode": "live",
                 "timezone": "Asia/Seoul",
-                "market_data": {"provider": "market-data-engine", "history_provider": "kis-cache"},
+                "market_data": {
+                    "provider": provider,
+                    "history_provider": "kis-cache",
+                    **({"gateway_base_url": "http://127.0.0.1:8766"} if provider == "kis-gateway" else {}),
+                },
                 "journal_path": "journal.jsonl",
                 "broker_accounts": [
                     {

@@ -10,13 +10,14 @@ import logging
 from pathlib import Path
 import sys
 from types import ModuleType
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from leaps_quant_engine.adapters.finance_datareader import FinanceDataReaderMarketDataProvider
 from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketDataEngineLiveQuoteProvider
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader
 from leaps_quant_engine.broker_routing import market_scope_for_symbol, market_scope_from_market
+from leaps_quant_engine.cadence import cadence_due, normalize_cadence
 from leaps_quant_engine.execution import ExecutionEngine
 from leaps_quant_engine.execution_model_loader import PythonExecutionModelLoader
 from leaps_quant_engine.framework import (
@@ -32,12 +33,14 @@ from leaps_quant_engine.framework import (
     RebalancePolicy,
 )
 from leaps_quant_engine.indicators import IndicatorEngine
-from leaps_quant_engine.market_rules import MarketSession, synthetic_domestic_market_session, synthetic_us_market_session
+from leaps_quant_engine.market_calendar import session_report_for_market_scope
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.market_data import MarketDataProvider
+from leaps_quant_engine.market_data_snapshot import FileMarketDataSnapshotStore
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
 from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
 from leaps_quant_engine.portfolio_state import PortfolioEngineState
-from leaps_quant_engine.runtime_state import RuntimeStateStore
+from leaps_quant_engine.runtime_state import ModelStateKey, StatePatch, RuntimeStateStore
 from leaps_quant_engine.runtime_config import ActiveUniverseRuntimeConfig, ModuleReference, RuntimeConfigSnapshot, SleeveRuntimeConfig
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker, SnapshotWorkerRunReport
 from leaps_quant_engine.snapshots import (
@@ -46,6 +49,7 @@ from leaps_quant_engine.snapshots import (
     SnapshotQualityReport,
     SnapshotQualityStatus,
 )
+from leaps_quant_engine.temporal_features import temporal_feature_provider_from_portfolio_parameters
 from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.universe.fine import FineUniverseRefreshReport, FineUniverseRuntime
 from leaps_quant_engine.universe.loader import load_universe_definition
@@ -53,6 +57,7 @@ from leaps_quant_engine.universe.runtime import ActiveUniverseResult, CompositeU
 from leaps_quant_engine.universe.selection import UniverseSelectionModel
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 from leaps_quant_engine.warmup import WarmupPolicy, WarmupReport, run_daily_indicator_warmup
+from leaps_quant_engine.kis_gateway import DEFAULT_KIS_GATEWAY_BASE_URL, KISGatewayClient
 
 
 class RuntimeBootstrapError(RuntimeError):
@@ -60,6 +65,9 @@ class RuntimeBootstrapError(RuntimeError):
 
 
 agent_status_logger = logging.getLogger("leaps_quant_engine.agent_status")
+
+UNIVERSE_SELECTION_STATE_MODEL_ID = "engine-universe-selection"
+ACTIVE_UNIVERSE_STATE_NAMESPACE = "active_universe"
 
 LiveProviderFactory = Callable[[UniverseDefinition, int | None], MarketDataProvider]
 HistoryProviderFactory = Callable[[], MarketDataProvider]
@@ -82,10 +90,7 @@ class RuntimeBootstrapDependencies:
     runtime_state_commit_enabled: bool = True
 
     def __post_init__(self) -> None:
-        if self.live_provider_factory is None:
-            object.__setattr__(self, "live_provider_factory", _default_live_provider_factory)
-        if self.history_provider_factory is None:
-            object.__setattr__(self, "history_provider_factory", _default_history_provider_factory)
+        return None
 
 
 @dataclass(slots=True)
@@ -122,12 +127,89 @@ class RuntimeSleeveRuntime:
         return self.sleeve_config.sleeve_id
 
     def run_once(self, *, warmup: bool | None = None) -> "RuntimeRunOnceReport":
+        self.refresh_active_universe_if_due()
         run_report = self.worker.run(
             max_cycles=1,
             warmup=self.sleeve_config.indicators.warmup_enabled if warmup is None else warmup,
             refresh_history=self.sleeve_config.indicators.refresh_history,
         )
         return self.build_run_once_report(run_report)
+
+    def refresh_active_universe_if_due(
+        self,
+        *,
+        force: bool = False,
+        as_of: datetime | None = None,
+    ) -> bool:
+        cadence = normalize_cadence(self.sleeve_config.universe.active.cadence)
+        as_of = as_of or datetime.now()
+        store = self.framework_runner.runtime_state_store
+        key = ModelStateKey(
+            sleeve_id=self.sleeve_id,
+            model_id=UNIVERSE_SELECTION_STATE_MODEL_ID,
+            namespace=ACTIVE_UNIVERSE_STATE_NAMESPACE,
+        )
+        record = store.get(key) if store is not None else None
+        last_selected_at = _parse_datetime_or_none(record.value.get("selected_at")) if record is not None else None
+        if not force and record is not None and not cadence_due(cadence, as_of, last_selected_at):
+            return False
+        if not force and record is None and cadence == "startup_only":
+            self._persist_active_universe_state(as_of=as_of, reason="startup_only_seed")
+            return False
+        indicator_snapshot = self._latest_indicator_snapshot() or self.selection_indicator_snapshot
+        if len(self.selection_models) == 1:
+            selection_runtime = UniverseSelectionRuntime(
+                coarse_universe=self.coarse_universe,
+                selection_model=self.selection_model,
+            )
+        else:
+            selection_runtime = CompositeUniverseSelectionRuntime(
+                coarse_universe=self.coarse_universe,
+                selection_models=self.selection_models,
+            )
+        portfolio = self.portfolio_provider.current_portfolio(self.sleeve_id)
+        active_result = selection_runtime.select_active(
+            sleeve_id=self.sleeve_id,
+            indicator_snapshot=indicator_snapshot,
+            as_of=as_of,
+            previous_live_symbols=tuple(self.active_result.active_universe.symbols),
+            held_symbols=portfolio.held_symbols,
+            manual_symbols=tuple(self.active_result.selection.forced_symbols),
+            active_universe_id=f"{self.coarse_universe.id}-active",
+        )
+        self.active_result = active_result
+        self.worker.update_universe(active_result.active_universe)
+        self._persist_active_universe_state(as_of=as_of, reason="active_universe_refreshed")
+        return True
+
+    def _latest_indicator_snapshot(self) -> IndicatorSnapshot | None:
+        store = self.worker.stores_by_sleeve.get(self.sleeve_id)
+        return store.active() if store is not None else None
+
+    def _persist_active_universe_state(self, *, as_of: datetime, reason: str) -> None:
+        store = self.framework_runner.runtime_state_store
+        if store is None:
+            return
+        store.apply_patches(
+            (
+                StatePatch(
+                    key=ModelStateKey(
+                        sleeve_id=self.sleeve_id,
+                        model_id=UNIVERSE_SELECTION_STATE_MODEL_ID,
+                        namespace=ACTIVE_UNIVERSE_STATE_NAMESPACE,
+                    ),
+                    value={
+                        "active_universe_id": self.active_result.active_universe.id,
+                        "selected_at": as_of.isoformat(),
+                        "cadence": normalize_cadence(self.sleeve_config.universe.active.cadence),
+                        "symbol_keys": [symbol.key for symbol in self.active_result.active_universe.symbols],
+                    },
+                    reason=reason,
+                    generated_at=as_of,
+                ),
+            ),
+            applied_at=as_of,
+        )
 
     def build_run_once_report(self, worker_report: SnapshotWorkerRunReport) -> "RuntimeRunOnceReport":
         framework_result = self._run_framework_once()
@@ -274,7 +356,10 @@ class RuntimeSleeveRuntime:
         )
 
     def _latest_data_slice(self, indicator_snapshot: IndicatorSnapshot) -> DataSlice:
-        market_snapshot = self.worker.last_market_snapshot
+        market_snapshot = self.worker.last_market_snapshot_by_lane.get(
+            indicator_snapshot.lane,
+            self.worker.last_market_snapshot,
+        )
         if market_snapshot is not None and market_snapshot.bars:
             return market_snapshot.as_data_slice()
         return _data_slice_from_indicator_snapshot(indicator_snapshot)
@@ -450,11 +535,8 @@ def bootstrap_sleeve_runtime(
     deps = dependencies or RuntimeBootstrapDependencies()
     sleeve_config = _resolve_sleeve_config(snapshot, sleeve_id)
     coarse_universe = deps.load_universe(resolve_runtime_path(snapshot, sleeve_config.universe.coarse_path))
-    live_provider = deps.live_provider_factory(
-        coarse_universe,
-        snapshot.config.market_data.rate_limit_per_second,
-    )
-    history_provider = deps.history_provider_factory()
+    live_provider = _runtime_live_provider(snapshot, coarse_universe, deps)
+    history_provider = _runtime_history_provider(deps)
     alpha_runtime = _build_alpha_runtime(snapshot, sleeve_config, deps.alpha_loader)
     portfolio_engine = _build_portfolio_engine(snapshot, sleeve_config, deps.portfolio_model_loader)
     portfolio_target_resolver = _build_portfolio_target_resolver(sleeve_config)
@@ -479,6 +561,7 @@ def bootstrap_sleeve_runtime(
     portfolio_provider = deps.portfolio_provider or _build_portfolio_provider(snapshot, sleeve_config)
     portfolio = portfolio_provider.current_portfolio(sleeve_config.sleeve_id)
     held_symbols = _merge_symbols(portfolio.held_symbols, held_symbols)
+    temporal_feature_provider = temporal_feature_provider_from_portfolio_parameters(sleeve_config.portfolio.parameters)
     framework_runner = FrameworkRunner(
         sleeve_id=sleeve_config.sleeve_id,
         alpha_runtime=alpha_runtime,
@@ -523,7 +606,15 @@ def bootstrap_sleeve_runtime(
             universe_id=selection_base_universe.id,
             source_snapshot_id=f"warmup:{selection_base_universe.id}",
             quality_report=_snapshot_quality_from_warmup(selection_warmup_report),
+            lane="daily_confirmed",
         )
+        if temporal_feature_provider is not None:
+            temporal_feature_provider.warm_up_from_provider(
+                history_provider,
+                selection_base_universe.symbols,
+                end=_confirmed_daily_warmup_end(snapshot),
+                refresh_history=sleeve_config.indicators.refresh_history,
+            )
 
     if len(selection_models) == 1:
         selection_runtime = UniverseSelectionRuntime(
@@ -561,6 +652,8 @@ def bootstrap_sleeve_runtime(
         stores_by_sleeve=indicator_snapshot_stores,
         warmup_policy=warmup_policy,
         entry_block_reasons=_warmup_entry_block_reasons(selection_warmup_report),
+        temporal_feature_provider=temporal_feature_provider,
+        snapshot_store=_snapshot_store_for_config(snapshot),
     )
     return RuntimeSleeveRuntime(
         snapshot=snapshot,
@@ -917,9 +1010,20 @@ def _symbol_from_key(symbol_key: str) -> Symbol:
 
 
 def _synthetic_market_session_for_scope(market_scope: str) -> MarketSession:
-    if market_scope == "overseas":
-        return synthetic_us_market_session(datetime.now(timezone.utc))
-    return synthetic_domestic_market_session(datetime.now(timezone(timedelta(hours=9))))
+    now = datetime.now(timezone.utc) if market_scope == "overseas" else datetime.now(timezone(timedelta(hours=9)))
+    return session_report_for_market_scope(market_scope, now=now).session
+
+
+def _parse_datetime_or_none(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def resolve_runtime_path(snapshot: RuntimeConfigSnapshot, path: str | Path) -> Path:
@@ -939,11 +1043,47 @@ def _default_live_provider_factory(
     )
 
 
+def _runtime_live_provider(
+    snapshot: RuntimeConfigSnapshot,
+    universe: UniverseDefinition,
+    deps: RuntimeBootstrapDependencies,
+) -> MarketDataProvider:
+    if deps.live_provider_factory is not None:
+        return deps.live_provider_factory(
+            universe,
+            snapshot.config.market_data.rate_limit_per_second,
+        )
+    market_data = snapshot.config.market_data
+    if market_data.provider == "kis-gateway":
+        rate_limit = market_data.rate_limit_per_second or 18
+        return MarketDataEngineLiveQuoteProvider(
+            client=KISGatewayClient(
+                base_url=market_data.gateway_base_url or DEFAULT_KIS_GATEWAY_BASE_URL,
+                rate_limit_per_second=rate_limit,
+            ),
+            exchange_by_symbol=_exchange_map_from_universe(universe),
+        )
+    return _default_live_provider_factory(universe, market_data.rate_limit_per_second)
+
+
+def _runtime_history_provider(deps: RuntimeBootstrapDependencies) -> MarketDataProvider:
+    if deps.history_provider_factory is not None:
+        return deps.history_provider_factory()
+    return _default_history_provider_factory()
+
+
 def _default_history_provider_factory() -> MarketDataProvider:
     return _FallbackHistoryProvider(
         primary=KISCachedMarketDataProvider.from_env(),
         fallback=FinanceDataReaderMarketDataProvider(),
     )
+
+
+def _snapshot_store_for_config(snapshot: RuntimeConfigSnapshot) -> FileMarketDataSnapshotStore | None:
+    path = snapshot.config.market_data.snapshot_store_path
+    if path is None:
+        return None
+    return FileMarketDataSnapshotStore(resolve_runtime_path(snapshot, path))
 
 
 @dataclass(frozen=True, slots=True)
@@ -957,6 +1097,29 @@ class _FallbackHistoryProvider(MarketDataProvider):
         except Exception:  # noqa: BLE001 - runtime warmup should degrade to deterministic public history.
             return self.fallback.get_latest_bar(symbol)
 
+    def get_cached_daily_history(
+        self,
+        symbol: Symbol,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        refresh: bool = False,
+    ) -> list[Bar]:
+        try:
+            primary_cached = getattr(self.primary, "get_cached_daily_history", None)
+            if primary_cached is not None:
+                bars = primary_cached(symbol, start=start, end=end, refresh=refresh)
+            else:
+                bars = self.primary.get_history(symbol, start=start, end=end)
+        except Exception:  # noqa: BLE001 - provider failures are surfaced only if fallback also fails.
+            bars = []
+        if bars and not _history_looks_too_short(bars, start=start, end=end):
+            return bars
+        fallback_cached = getattr(self.fallback, "get_cached_daily_history", None)
+        if fallback_cached is not None:
+            return fallback_cached(symbol, start=start, end=end, refresh=refresh)
+        return self.fallback.get_history(symbol, start=start, end=end)
+
     def get_history(
         self,
         symbol: Symbol,
@@ -968,9 +1131,31 @@ class _FallbackHistoryProvider(MarketDataProvider):
             bars = self.primary.get_history(symbol, start=start, end=end)
         except Exception:  # noqa: BLE001 - provider failures are surfaced by warmup if fallback also fails.
             bars = []
-        if bars:
+        if bars and not _history_looks_too_short(bars, start=start, end=end):
             return bars
         return self.fallback.get_history(symbol, start=start, end=end)
+
+
+def _history_looks_too_short(
+    bars: Sequence[Bar],
+    *,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    if start is None or end is None:
+        return False
+    if end < start:
+        return False
+    requested_days = (end.date() - start.date()).days + 1
+    if requested_days < 45:
+        return False
+    requested_weekdays = sum(
+        1
+        for day_offset in range(requested_days)
+        if (start.date() + timedelta(days=day_offset)).weekday() < 5
+    )
+    min_reasonable_bars = max(1, int(requested_weekdays * 0.6))
+    return len(bars) < min_reasonable_bars
 
 
 def _exchange_map_from_universe(universe: UniverseDefinition) -> dict[str, str]:

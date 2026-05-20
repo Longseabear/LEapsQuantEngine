@@ -1,0 +1,136 @@
+{
+  "runtime_id": "semiconduct-kor-shadow",
+  "mode": "paper",
+  "timezone": "Asia/Seoul",
+  "market_data": {
+    "provider": "market-data-engine",
+    "history_provider": "kis-cache",
+    "source": "market-data-engine",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 18
+  },
+  "broker_accounts": [
+    {
+      "account_id": "semiconduct-kor-shadow",
+      "market_scope": "domestic",
+      "currency": "KRW",
+      "account_store_path": "../../data/virtual-accounts/semiconduct_kor_shadow.json",
+      "order_store_path": "../../data/order-runtime/semiconduct_kor_shadow.jsonl",
+      "broker_gateway": "paper",
+      "metadata": {
+        "note": "Pseudo/shadow route for semiconduct-kor. Uses live market data but paper order lifecycle only; never submit this account through broker-engine."
+      }
+    }
+  ],
+  "journal_path": "../../data/cycle-journal/semiconduct_kor_shadow.jsonl",
+  "sleeves": [
+    {
+      "sleeve_id": "semiconduct-kor",
+      "workspace_path": "sleeves/semiconduct-kor",
+      "broker_account_id": "semiconduct-kor-shadow",
+      "broker_account_routes": {
+        "domestic": "semiconduct-kor-shadow"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "KRW": 8944000
+      },
+      "universe": {
+        "coarse_path": "configs/universes/semiconduct_kor_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 12,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/samsung_core.py:SamsungCoreSelectionModel",
+            "selections/semiconductor_momentum.py:SemiconductorMomentumSelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ]
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 100,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/samsung_strike_risk_reentry.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "semiconduct-kor-samsung-strike-reentry": "semiconduct-kor-samsung-core"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/samsung_buy_only.py",
+        "parameters": {
+          "max_target_percent": 1.0,
+          "fallback_hold_existing": true,
+          "min_cash_to_add_pct": 0.01
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.0,
+          "min_order_notional": 100000.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true,
+          "cadence": "every_5_minutes",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 5.0
+        },
+        "target_resolution": {
+          "mode": "patch"
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 180,
+          "target_drift_threshold_pct": 0.06,
+          "clock": "orderable_session"
+        }
+      },
+      "risk": {
+        "model": "risks/basic.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct": 1.0,
+          "max_total_exposure_pct": 1.0,
+          "cash_buffer_pct": 0.0,
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/immediate.py",
+        "parameters": {
+          "tag_prefix": "semiconduct-kor-shadow",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "limit_offset_bps": 8.0,
+          "max_slice_notional": 1500000,
+          "max_slices": 3,
+          "urgency": "normal",
+          "max_order_age_seconds": 900,
+          "price_drift_bps": 80,
+          "min_replace_interval_seconds": 180,
+          "max_replacements": 2
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 60,
+        "min_success": 1
+      }
+    }
+  ],
+  "metadata": {
+    "description": "Live-market, paper-broker shadow runtime for the semiconduct-kor Samsung buy-only strike-risk re-entry strategy. Initial KRW cash mirrors the 2026-05-20 manual Samsung sale gross proceeds."
+  }
+}

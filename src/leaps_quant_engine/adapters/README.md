@@ -5,7 +5,7 @@ Adapters isolate external providers from the deterministic engine core.
 ## Main Files
 
 - `kis.py`: compatibility provider surface for KIS-backed live and cached data.
-- `kis_direct.py`: in-process KIS REST boundary for quotes, cache-first history, news-title snapshots, account sync, and order submission.
+- `kis_direct.py`: in-process KIS REST boundary for quotes, cache-first daily/minute history, news-title snapshots, account sync, and order submission.
 - `finance_datareader.py`: FinanceDataReader historical daily provider and FDR/Naver-backed fundamental snapshot importer for long-horizon research/backtests.
 
 ## Rules
@@ -27,3 +27,11 @@ KIS news title operations are exposed as read-only adapter calls:
 These return normalized title-level records with raw KIS rows preserved under
 `raw_output`. They are context inputs for agents or future research pipelines,
 not trading decisions by themselves.
+
+KIS minute history operations are cache-first adapter calls:
+
+- `get_or_cache_domestic_minute_bars`
+- `get_or_cache_overseas_minute_bars`
+
+Overseas minute lookup is a recent intraday query. Use it for live/recent
+collection and short validation, not as a guaranteed long-range minute archive.

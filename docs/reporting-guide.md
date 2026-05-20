@@ -85,6 +85,28 @@ Use `--mode recompute` only when the operator explicitly wants a fresh
 hypothetical target. Routine Telegram reports should stay on `latest-target` so
 reporting does not compete with the live order loop or KIS request budget.
 
+## Operator UI
+
+Use:
+
+```powershell
+py -3 -m leaps_quant_engine.cli operator-ui configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --sleeve-id us_etf_rotation
+```
+
+The operator UI is read-only and snapshot-only. It reads local runtime config,
+order runtime state, virtual-account state, cycle journal entries, recovery
+status, health status, and synthetic market-session reports. It must not call
+KIS, live market-data providers, broker gateways, or runtime control queues.
+
+For CI or quick agent inspection, the same payload can be printed without
+starting the HTTP server:
+
+```powershell
+py -3 -m leaps_quant_engine.cli operator-ui configs/runtime/live_multi_sleeve.json --snapshot-only
+```
+
 Position lifecycle state is persisted by the virtual account store, not by
 reporting. A report may display fields such as entry time, high-watermark price,
 or latest stop price after those fields are wired into the report payload, but

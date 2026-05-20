@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
 from leaps_quant_engine.alpha import SnapshotContext
 from leaps_quant_engine.execution_model_loader import PythonExecutionModelLoader
+from leaps_quant_engine.framework import RiskDecisionStatus, RiskManagementContext
 from leaps_quant_engine.framework.portfolio_model_loader import PythonPortfolioConstructionModelLoader
 from leaps_quant_engine.framework.risk_model_loader import PythonRiskManagementModelLoader
+from leaps_quant_engine.models import Bar, DataSlice, PortfolioTarget, Symbol
+from leaps_quant_engine.portfolio import Holding, Portfolio
+from leaps_quant_engine.runtime_config import parse_runtime_config
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
 from leaps_quant_engine.universe.loader import parse_universe_definition
 from leaps_quant_engine.universe.selection import UniverseSelectionContext
@@ -141,6 +146,28 @@ def test_us_etf_rotation_alpha_treats_missing_spy_gate_as_risk_off():
     assert by_symbol["US:TLT"].metadata["risk_on"] is False
 
 
+def test_us_etf_rotation_daa_pullback_selects_four_etfs():
+    module = _load("sleeves/us_etf_rotation/alphas/daa_pullback.py")
+    now = datetime(2026, 5, 18)
+    snapshot = _snapshot(
+        now,
+        {
+            "US:SPY": _values(close=600, fast=590, slow=560, momentum=0.06, momentum_5=0.01, vol=0.02),
+            "US:QQQ": _values(close=500, fast=490, slow=470, momentum=0.12, momentum_5=0.02, vol=0.03),
+            "US:IWM": _values(close=220, fast=216, slow=205, momentum=0.09, momentum_5=0.01, vol=0.03),
+            "US:XLK": _values(close=180, fast=176, slow=160, momentum=0.20, momentum_5=0.03, vol=0.02),
+            "US:XLE": _values(close=95, fast=93, slow=88, momentum=0.16, momentum_5=0.02, vol=0.02),
+        },
+    )
+
+    context = SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(tuple(snapshot.symbols))
+    insights = module.generate(context)
+
+    up_symbols = [insight.symbol.key for insight in insights if insight.direction.value == "up"]
+    assert len(up_symbols) == 4
+    assert up_symbols == ["US:XLK", "US:XLE", "US:QQQ", "US:IWM"]
+
+
 def test_us_etf_rotation_selection_keeps_etf_universe_only():
     module = _load("sleeves/us_etf_rotation/selections/etf_rotation.py")
     now = datetime(2026, 5, 8)
@@ -260,6 +287,113 @@ def test_us_etf_rotation_workspace_models_load_from_sleeve_folder():
     assert portfolio.model.top_k == 8
     assert risk.model_name == "BasicRiskManagementModel"
     assert execution.model_name == "UsEtfRotationExecutionModel"
+
+
+def test_us_etf_rotation_live_cadences_match_etf_horizon():
+    for config_path in (
+        ROOT / "configs" / "runtime" / "live_multi_sleeve.json",
+        ROOT / "configs" / "runtime" / "us_etf_rotation_sleeve.json",
+    ):
+        config = parse_runtime_config(json.loads(config_path.read_text(encoding="utf-8")))
+        sleeve = config.sleeve("us_etf_rotation")
+
+        assert sleeve.universe.active.cadence == "once_per_day"
+        assert sleeve.worker.cycle_interval_seconds == 300
+        assert sleeve.portfolio.rebalance.cadence == "every_5_minutes"
+
+    pullback = _load("sleeves/us_etf_rotation/alphas/daa_pullback.py")
+    trailing_stop = _load("sleeves/us_etf_rotation/alphas/volatility_trailing_stop.py")
+
+    assert pullback.EVALUATION_CADENCE == "every_cycle"
+    assert trailing_stop.EVALUATION_CADENCE == "every_cycle"
+
+
+def test_us_etf_rotation_risk_clamps_cycle_buy_notional():
+    first = Symbol("AAA", "US")
+    second = Symbol("BBB", "US")
+    now = datetime(2026, 5, 19, 9, 30)
+    data = DataSlice(
+        time=now,
+        bars={
+            first.key: Bar(first, now, 100, 100, 100, 100, 1000),
+            second.key: Bar(second, now, 100, 100, 100, 100, 1000),
+        },
+    )
+    risk = PythonRiskManagementModelLoader().load(
+        SLEEVE / "risks" / "basic.py",
+        parameters={
+            "max_position_pct": 1.0,
+            "max_total_exposure_pct": 1.0,
+            "cash_buffer_pct": 0.0,
+            "max_cycle_buy_notional": 500.0,
+        },
+    )
+
+    batch = risk.model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="us_etf_rotation",
+            data=data,
+            portfolio=Portfolio(cash=2_000, cash_by_currency={"USD": 2_000}),
+            targets=(
+                PortfolioTarget(first, quantity=5, tag="entry"),
+                PortfolioTarget(second, quantity=5, tag="entry"),
+            ),
+        )
+    )
+
+    approved_by_symbol = {target.symbol.key: target.quantity for target in batch.approved_targets}
+    approved_notional = sum(approved_by_symbol.values()) * 100
+
+    assert risk.model_name == "CycleBuyNotionalRiskModel"
+    assert approved_notional <= 500
+    assert approved_by_symbol == {"US:AAA": 3, "US:BBB": 2}
+    assert all(decision.status is RiskDecisionStatus.CLAMPED for decision in batch.decisions)
+    assert {decision.reason for decision in batch.decisions} == {"cycle_buy_notional_clamped"}
+
+
+def test_us_etf_rotation_risk_does_not_block_reductions_with_cycle_buy_cap():
+    sell_symbol = Symbol("OLD", "US")
+    buy_symbol = Symbol("NEW", "US")
+    now = datetime(2026, 5, 19, 9, 30)
+    data = DataSlice(
+        time=now,
+        bars={
+            sell_symbol.key: Bar(sell_symbol, now, 100, 100, 100, 100, 1000),
+            buy_symbol.key: Bar(buy_symbol, now, 100, 100, 100, 100, 1000),
+        },
+    )
+    risk = PythonRiskManagementModelLoader().load(
+        SLEEVE / "risks" / "basic.py",
+        parameters={
+            "max_position_pct": 1.0,
+            "max_total_exposure_pct": 1.0,
+            "cash_buffer_pct": 0.0,
+            "max_cycle_buy_notional": 200.0,
+        },
+    )
+
+    batch = risk.model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="us_etf_rotation",
+            data=data,
+            portfolio=Portfolio(
+                cash=1_000,
+                cash_by_currency={"USD": 1_000},
+                holdings={sell_symbol.key: Holding(sell_symbol, quantity=5, average_price=100.0)},
+            ),
+            targets=(
+                PortfolioTarget(sell_symbol, quantity=2, tag="reduce"),
+                PortfolioTarget(buy_symbol, quantity=5, tag="entry"),
+            ),
+        )
+    )
+
+    approved_by_symbol = {target.symbol.key: target.quantity for target in batch.approved_targets}
+
+    assert approved_by_symbol["US:OLD"] == 2
+    assert approved_by_symbol["US:NEW"] == 2
+    assert batch.decisions[0].status is RiskDecisionStatus.APPROVED
+    assert batch.decisions[1].status is RiskDecisionStatus.CLAMPED
 
 
 def _snapshot(now: datetime, values: dict[str, dict[str, float]]) -> IndicatorSnapshot:

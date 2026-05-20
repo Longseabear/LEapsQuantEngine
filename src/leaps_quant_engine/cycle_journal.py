@@ -151,6 +151,11 @@ class CycleJournalEntry:
             "model_state_event_count": len(getattr(framework, "state_events", ())) if framework is not None else 0,
         }
         timings = framework.timings.to_dict() if framework is not None else {}
+        lineage = {}
+        if framework is not None:
+            from leaps_quant_engine.lineage import build_cycle_lineage_summary
+
+            lineage = build_cycle_lineage_summary(framework).to_dict()
         status = "ok"
         all_errors = tuple(errors)
         all_warnings = tuple(warnings) + quality_reasons
@@ -179,6 +184,7 @@ class CycleJournalEntry:
                 "engine_source_hash": current_engine_source_fingerprint().digest,
                 "coarse_universe_id": getattr(report, "coarse_universe_id", ""),
                 "active_universe_id": getattr(report, "active_universe_id", ""),
+                "lineage": lineage,
             },
         )
 
@@ -197,9 +203,22 @@ class CycleJournalEntry:
         snapshot_status: str | None = "fresh",
         warnings: Iterable[str] = (),
         errors: Iterable[str] = (),
+        include_lineage: bool = True,
     ) -> "CycleJournalEntry":
         generated_at = cycle.execution_batch.generated_at
         all_errors = tuple(errors)
+        metadata: dict[str, Any] = {
+            "engine_source_hash": current_engine_source_fingerprint().digest,
+            "source_snapshot_id": cycle.source_snapshot_id,
+            "indicator_snapshot_id": cycle.indicator_snapshot_id,
+        }
+        if include_lineage:
+            from leaps_quant_engine.lineage import build_cycle_lineage_summary
+
+            metadata["lineage"] = build_cycle_lineage_summary(cycle).to_dict()
+        else:
+            metadata["lineage_omitted"] = "journal_mode_light"
+
         return cls(
             runtime_id=runtime_id,
             config_version=config_version,
@@ -227,11 +246,7 @@ class CycleJournalEntry:
             timings=cycle.timings.to_dict(),
             warnings=tuple(warnings),
             errors=all_errors,
-            metadata={
-                "engine_source_hash": current_engine_source_fingerprint().digest,
-                "source_snapshot_id": cycle.source_snapshot_id,
-                "indicator_snapshot_id": cycle.indicator_snapshot_id,
-            },
+            metadata=metadata,
         )
 
 

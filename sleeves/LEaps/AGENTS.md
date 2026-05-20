@@ -34,6 +34,14 @@ running `runtime-backtest-daily`, the engine can load pre-start daily bars into
 Do not diagnose a one-day or short-window test as weak signal until warmup is
 non-zero or an explicit `--warmup-start` was provided.
 
+Temporal PPO is alpha-gated. When a LEaps portfolio config uses
+`feature_schema=v2_temporal` or `v2_temporal_residual`, the engine can attach a
+point-in-time daily `rl_temporal_features` window to `SnapshotContext`
+metadata. Alpha modules should copy that window into emitted UP insight
+metadata after deciding the symbol is actionable. If the window is missing, the
+temporal PPO portfolio path must fail closed rather than inventing candidates
+or repeating the latest token.
+
 Current LEaps alpha input wiring is intentional:
 
 ```text
@@ -63,6 +71,86 @@ Known current strategy risk: the active RL allocator plus daily rebalance can
 produce high turnover. If tuning this, adjust portfolio/risk policy such as
 rebalance cadence, minimum drift, cooldown, or turnover guard. Do not add hidden
 state mutations inside alpha/portfolio/execution modules.
+
+V4 candidate note: `configs/runtime/live_multi_sleeve_v4.json` uses
+`portfolios/v4_banded_momentum.py` as a deterministic replacement candidate for
+the PPO allocator. The model consumes active alpha insights only, keeps held
+symbols through wider hold/trim bands, emits explicit zero targets for confirmed
+missing or hard-exit cases, and stores only portfolio/position bookkeeping
+through `StatePatch`. Its turnover budget is intentionally priority based: when
+the daily budget is tight, allocate to the highest-ranked whole-share-buyable
+candidate first instead of thinly spreading target percent across unbuyable
+names. If this profile is promoted, keep the live config and backtest config on
+the same `max_target_turnover_pct`, `daily_turnover_budget_pct`,
+`target_drift_threshold_pct`, `reentry_cooldown_days`,
+`entry_top_n/hold_top_n/trim_top_n`, and whole-share guard settings. The
+cooldown is an active 5-minute-cycle guard. The drift threshold is available
+but disabled in the candidate config after the 2.5% experiment reduced order
+count while worsening the 2026-05-11..15 minute replay; do not enable it
+without re-running minute replays.
+
+Current intraday risk behavior: LEaps uses `KRX:069500` as the domestic market
+guard. The live config enables smoothed intraday guard caps, so the guard should
+reduce KRW gross exposure continuously from the base regime cap toward the
+risk-off cap instead of hard-blocking every new stock entry at one threshold.
+The guard also tracks the same-session low and only releases a recovery probe
+cap after a configured low-to-current rebound is confirmed for multiple cycles.
+If `intraday_guard_hard_entry_freeze` is re-enabled, document that as a
+deliberate kill-switch style override and test it against live target output.
+
+Current per-symbol risk behavior: market guard caps the KRW budget, while the
+symbol guard decides whether an individual stock can be added, reduced, or
+exited. The symbol guard blocks adding to a held loser, blocks entries after
+large intraday selloffs or high-to-current drawdowns, halves positions on
+deeper per-symbol loss or 10-day-line breaks, and exits on severe loss,
+high-drawdown, or 20-day-line breaks. The live config enables volatility
+adjusted symbol thresholds using alpha metadata such as `volatility` or ATR
+percent: low-volatility names tighten faster, high-volatility names get wider
+held-position noise bands, and entry/add blocks have a separate upper
+multiplier so high volatility alone does not loosen new buys too far. Keep
+these controls in risk, not alpha or execution, and report their clamp reason
+as `symbol_guard_*`.
+
+## Train/Live Parity Checklist
+
+LEaps is an active live sleeve. Treat train/live parity as a release blocker for
+portfolio models, especially PPO/RL allocators.
+
+2026-05-18 incident: the temporal PPO allocator was trained without a hard
+single-name `max_position_pct` cap in the training environment. Live inference
+added `portfolio.parameters.max_position_pct = 0.10`, which clipped raw PPO
+weights such as 34%, 31%, and 23% into three equal 10% targets. The clipped
+weight was not redistributed, so the model's intended gross exposure collapsed
+from roughly 88% to roughly 30% target exposure and about 25% realized exposure.
+This was a train/live mismatch, not a deliberate PPO risk-off decision.
+
+Before promoting, reloading, or diagnosing any LEaps RL portfolio profile:
+
+- Compare the policy metadata JSON with the runtime config for
+  `allocation_mode`, `feature_schema`, `lookback_window`, `top_k`,
+  `max_target_turnover_pct`, integer-lot handling, action space, cash handling,
+  and any smoothing or drift settings.
+- Do not add portfolio-construction-time constraints in live unless the same
+  constraint exists in training, or unless the mismatch is explicitly documented
+  as a deterministic live-only overlay with an expected effect.
+- Single-name caps are allowed as risk controls, but if they belong in
+  portfolio construction they must be trained with the same cap and
+  redistribution behavior. If they are live safety controls, keep them in the
+  risk layer and report them as risk clamps.
+- Reconstruct the latest raw PPO action after promotion. Compare raw weights,
+  final portfolio targets, order-sizing output, risk decisions, and order
+  intents. Repeated identical target weights such as `10%, 10%, 10%` are a
+  warning sign unless the raw action also produced them.
+- Verify that target gross exposure, realized exposure, and cash weight line up
+  with the policy output after deterministic layers. Explain any missing
+  exposure as turnover cap, whole-share rounding, risk clamp, session guard, or
+  cash reserve.
+- Save or report the config hash, policy artifact path, metadata path, latest
+  target batch id, and latest cycle time when a model is promoted.
+- Run `runtime-config-validate` and `runtime-preflight` before relying on a
+  changed live config. For material portfolio changes, run at least one short
+  replay/backtest using the same config family and inspect target-vs-order
+  lineage.
 
 Backtests default to zero simulated slippage. Use `--slippage-bps` when checking
 execution friction. The report's `metrics.slippage_cost` and

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 import time
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from leaps_quant_engine.broker_routing import currency_for_market_scope, currency_for_symbol
 from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol
@@ -92,6 +93,10 @@ class VirtualFillEvent:
     sleeve_id: str | None = None
     broker_order_id: str = ""
     fee: float = 0.0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     @property
     def notional(self) -> float:
@@ -109,6 +114,7 @@ class VirtualFillEvent:
             "sleeve_id": self.sleeve_id or "",
             "broker_order_id": self.broker_order_id,
             "fee": self.fee,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -124,7 +130,80 @@ class VirtualFillEvent:
             sleeve_id=str(payload.get("sleeve_id") or "") or None,
             broker_order_id=str(payload.get("broker_order_id") or ""),
             fee=float(payload.get("fee") or 0.0),
+            metadata=dict(payload.get("metadata") or {}),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioMutationRecord:
+    sleeve_id: str
+    symbol: Symbol
+    side: OrderSide
+    quantity: int
+    fill_price: float
+    fee: float
+    realized_pnl_estimate: float
+    before_quantity: int
+    after_quantity: int
+    before_average_price: float
+    after_average_price: float
+    before_cash: float
+    after_cash: float
+    currency: str
+    fill_id: str
+    order_intent_id: str = ""
+    ticket_id: str = ""
+    event_id: str = ""
+    broker_order_id: str = ""
+    applied_at: datetime | None = None
+
+    @property
+    def notional(self) -> float:
+        return self.quantity * self.fill_price
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sleeve_id": self.sleeve_id,
+            "symbol": self.symbol.key,
+            "side": self.side.value,
+            "quantity": self.quantity,
+            "fill_price": self.fill_price,
+            "notional": self.notional,
+            "fee": self.fee,
+            "realized_pnl_estimate": self.realized_pnl_estimate,
+            "before_quantity": self.before_quantity,
+            "after_quantity": self.after_quantity,
+            "before_average_price": self.before_average_price,
+            "after_average_price": self.after_average_price,
+            "before_cash": self.before_cash,
+            "after_cash": self.after_cash,
+            "currency": self.currency,
+            "fill_id": self.fill_id,
+            "order_intent_id": self.order_intent_id,
+            "ticket_id": self.ticket_id,
+            "event_id": self.event_id,
+            "broker_order_id": self.broker_order_id,
+            "applied_at": self.applied_at.isoformat() if self.applied_at else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FillApplicationReport:
+    applied: bool
+    sleeve_id: str
+    fill_id: str
+    reason: str = ""
+    portfolio: Portfolio | None = None
+    mutation: PortfolioMutationRecord | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "sleeve_id": self.sleeve_id,
+            "fill_id": self.fill_id,
+            "reason": self.reason,
+            "mutation": self.mutation.to_dict() if self.mutation is not None else None,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,15 +827,27 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         return updated
 
     def apply_order_event(self, event: OrderEvent) -> Portfolio:
+        report = self.apply_order_event_with_report(event)
+        if report.portfolio is not None:
+            return report.portfolio
+        return self.current_portfolio(event.sleeve_id)
+
+    def apply_order_event_with_report(self, event: OrderEvent) -> FillApplicationReport:
         if event.broker_order_id:
             try:
                 self.bind_broker_order_id(event.order_intent_id, event.broker_order_id)
             except ValueError:
                 pass
         if not event.is_fill or event.quantity <= 0 or event.fill_price is None:
-            return self.current_portfolio(event.sleeve_id)
+            return FillApplicationReport(
+                applied=False,
+                sleeve_id=event.sleeve_id,
+                fill_id="",
+                reason="order_event_is_not_a_fill",
+                portfolio=self.current_portfolio(event.sleeve_id),
+            )
         fee = _float_or_none(event.metadata.get("fee")) or 0.0
-        return self.apply_fill(
+        return self.apply_fill_with_report(
             VirtualFillEvent(
                 fill_id=f"order-event:{event.event_id}",
                 order_id=event.order_intent_id,
@@ -768,20 +859,55 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                 filled_at=event.occurred_at,
                 sleeve_id=event.sleeve_id,
                 fee=fee,
-            )
+            ),
+            order_intent_id=event.order_intent_id,
+            ticket_id=event.ticket_id,
+            event_id=event.event_id,
         )
 
     def apply_fill(self, fill: VirtualFillEvent) -> Portfolio:
+        report = self.apply_fill_with_report(fill)
+        if report.portfolio is None:
+            return self.current_portfolio(report.sleeve_id)
+        return report.portfolio
+
+    def apply_fill_with_report(
+        self,
+        fill: VirtualFillEvent,
+        *,
+        order_intent_id: str = "",
+        ticket_id: str = "",
+        event_id: str = "",
+    ) -> FillApplicationReport:
         if fill.quantity <= 0:
             raise ValueError("fill quantity must be positive.")
         state = self._load_state()
         if fill.fill_id in state["fills"]:
             sleeve_id = state["fills"][fill.fill_id].get("sleeve_id") or UNKNOWN_SLEEVE_ID
-            return _portfolio_from_dict(state["sleeves"][sleeve_id])
+            return FillApplicationReport(
+                applied=False,
+                sleeve_id=sleeve_id,
+                fill_id=fill.fill_id,
+                reason="duplicate_fill_id",
+                portfolio=_portfolio_from_dict(state["sleeves"][sleeve_id]),
+            )
 
-        sleeve_id = self._apply_fill_to_state(state, fill)
+        sleeve_id, mutation = self._apply_fill_to_state_with_report(
+            state,
+            fill,
+            order_intent_id=order_intent_id,
+            ticket_id=ticket_id,
+            event_id=event_id,
+        )
         self._write_state(state)
-        return _portfolio_from_dict(state["sleeves"][sleeve_id])
+        return FillApplicationReport(
+            applied=True,
+            sleeve_id=sleeve_id,
+            fill_id=fill.fill_id,
+            reason="applied",
+            portfolio=_portfolio_from_dict(state["sleeves"][sleeve_id]),
+            mutation=mutation,
+        )
 
     def apply_fill_allocations(
         self,
@@ -831,6 +957,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                 sleeve_id=allocation.sleeve_id,
                 broker_order_id=fill.broker_order_id,
                 fee=fill.fee * (allocation.quantity / fill.quantity),
+                metadata=_scale_fill_metadata(fill.metadata, allocation.quantity / fill.quantity),
             )
             self._apply_fill_to_state(state, allocation_fill, record_unknown_ownership=False)
             state["fill_allocations"][allocation_id] = allocation.to_dict()
@@ -1017,6 +1144,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                 "broker_fills": {},
                 "fill_allocations": {},
                 "ignored_broker_fills": {},
+                "portfolio_mutations": {},
                 "account_cash_snapshots": {},
                 "cash_transfers": {},
                 "position_states": {},
@@ -1032,6 +1160,7 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         payload.setdefault("broker_fills", {})
         payload.setdefault("fill_allocations", {})
         payload.setdefault("ignored_broker_fills", {})
+        payload.setdefault("portfolio_mutations", {})
         payload.setdefault("account_cash_snapshots", {})
         payload.setdefault("cash_transfers", {})
         payload.setdefault("position_states", {})
@@ -1060,13 +1189,37 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         *,
         record_unknown_ownership: bool = True,
     ) -> str:
+        sleeve_id, _mutation = self._apply_fill_to_state_with_report(
+            state,
+            fill,
+            record_unknown_ownership=record_unknown_ownership,
+        )
+        return sleeve_id
+
+    def _apply_fill_to_state_with_report(
+        self,
+        state: dict[str, Any],
+        fill: VirtualFillEvent,
+        *,
+        record_unknown_ownership: bool = True,
+        order_intent_id: str = "",
+        ticket_id: str = "",
+        event_id: str = "",
+    ) -> tuple[str, PortfolioMutationRecord]:
         ownership = self._resolve_ownership(state, fill)
         sleeve_id = fill.sleeve_id or ownership.sleeve_id if ownership else fill.sleeve_id or UNKNOWN_SLEEVE_ID
         self._ensure_sleeve(state, sleeve_id)
         portfolio = _portfolio_from_dict(state["sleeves"][sleeve_id])
         previous_holding = portfolio.holdings.get(fill.symbol.key)
         previous_quantity = previous_holding.quantity if previous_holding is not None else 0
+        previous_average_price = previous_holding.average_price if previous_holding is not None else 0.0
+        currency = currency_for_symbol(fill.symbol)
+        previous_cash = portfolio.cash_for_currency(currency)
         _apply_fill_to_portfolio(portfolio, fill)
+        updated_holding = portfolio.holdings.get(fill.symbol.key)
+        updated_quantity = updated_holding.quantity if updated_holding is not None else 0
+        updated_average_price = updated_holding.average_price if updated_holding is not None else 0.0
+        updated_cash = portfolio.cash_for_currency(currency)
         state["sleeves"][sleeve_id] = _portfolio_to_dict(portfolio)
         _apply_fill_to_position_state(
             state,
@@ -1089,7 +1242,34 @@ class VirtualSleeveAccountStore(PortfolioProvider):
                 broker_order_id=fill.broker_order_id,
                 created_at=fill.filled_at,
             ).to_dict()
-        return sleeve_id
+        realized_pnl = 0.0
+        if fill.side is OrderSide.SELL:
+            realized_quantity = min(fill.quantity, previous_quantity)
+            realized_pnl = (fill.fill_price - previous_average_price) * realized_quantity - fill.fee
+        mutation = PortfolioMutationRecord(
+            sleeve_id=sleeve_id,
+            symbol=fill.symbol,
+            side=fill.side,
+            quantity=fill.quantity,
+            fill_price=fill.fill_price,
+            fee=fill.fee,
+            realized_pnl_estimate=realized_pnl,
+            before_quantity=previous_quantity,
+            after_quantity=updated_quantity,
+            before_average_price=previous_average_price,
+            after_average_price=updated_average_price,
+            before_cash=previous_cash,
+            after_cash=updated_cash,
+            currency=currency,
+            fill_id=fill.fill_id,
+            order_intent_id=order_intent_id or fill.order_id,
+            ticket_id=ticket_id,
+            event_id=event_id,
+            broker_order_id=fill.broker_order_id,
+            applied_at=fill.filled_at,
+        )
+        state.setdefault("portfolio_mutations", {})[fill.fill_id] = mutation.to_dict()
+        return sleeve_id, mutation
 
 
 def _apply_fill_to_portfolio(portfolio: Portfolio, fill: VirtualFillEvent) -> None:
@@ -1111,6 +1291,30 @@ def _apply_fill_to_portfolio(portfolio: Portfolio, fill: VirtualFillEvent) -> No
         portfolio.holdings.pop(fill.symbol.key, None)
         return
     holding.quantity = new_quantity
+
+
+def _scale_fill_metadata(metadata: Mapping[str, Any], ratio: float) -> dict[str, Any]:
+    payload = dict(metadata)
+    payload["allocation_ratio"] = ratio
+    fee_components = payload.get("fee_components")
+    if isinstance(fee_components, dict):
+        payload["fee_components"] = _scale_numeric_mapping(fee_components, ratio)
+    transaction_costs = payload.get("transaction_costs")
+    if isinstance(transaction_costs, dict):
+        scaled = dict(transaction_costs)
+        for key in ("fee", "commission", "tax", "regulatory_fee", "slippage_cost", "total_cost"):
+            if key in scaled:
+                scaled[key] = _safe_scaled_float(scaled[key], ratio)
+        payload["transaction_costs"] = scaled
+    return payload
+
+
+def _scale_numeric_mapping(payload: Mapping[str, Any], ratio: float) -> dict[str, Any]:
+    return {key: _safe_scaled_float(value, ratio) for key, value in payload.items()}
+
+
+def _safe_scaled_float(value: Any, ratio: float) -> float:
+    return float(str(value).replace(",", "").strip() or 0.0) * ratio
 
 
 def _apply_fill_to_position_state(

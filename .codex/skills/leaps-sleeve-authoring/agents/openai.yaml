@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEaps Sleeve Authoring"
+  short_description: "Create and update LEaps sleeve workspaces and model wiring."
+  default_prompt: "Use this skill to create or review a LEaps sleeve workspace, wire selection/alpha/portfolio/risk/execution models, and verify runtime config/backtests."

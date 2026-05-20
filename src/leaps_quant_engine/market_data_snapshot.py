@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import json
 import logging
+from pathlib import Path
 import time
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
 from uuid import uuid4
 
 from leaps_quant_engine.indicators import IndicatorEngine, IndicatorUpdateReport
@@ -15,6 +17,12 @@ from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorSnapshotSto
 
 
 logger = logging.getLogger(__name__)
+
+
+QUOTE_SNAPSHOT_LANE = "quote"
+MINUTE_SNAPSHOT_LANE = "minute"
+DAILY_CONFIRMED_SNAPSHOT_LANE = "daily_confirmed"
+UNKNOWN_SNAPSHOT_LANE = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,9 +54,11 @@ class MarketDataSnapshot:
     time: datetime
     bars: Mapping[str, Bar]
     source: str
+    lane: str = UNKNOWN_SNAPSHOT_LANE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bars", MappingProxyType(dict(self.bars)))
+        object.__setattr__(self, "lane", normalize_snapshot_lane(self.lane))
 
     @classmethod
     def from_bars(
@@ -58,16 +68,129 @@ class MarketDataSnapshot:
         source: str,
         snapshot_id: str | None = None,
         time: datetime | None = None,
+        lane: str | None = None,
     ) -> "MarketDataSnapshot":
+        resolved_lane = normalize_snapshot_lane(lane) if lane is not None else infer_snapshot_lane(bars.values())
         return cls(
             snapshot_id=snapshot_id or f"market-data-{uuid4()}",
             time=time or max((bar.time for bar in bars.values()), default=datetime.now()),
             bars=bars,
             source=source,
+            lane=resolved_lane,
         )
 
     def as_data_slice(self) -> DataSlice:
         return DataSlice(time=self.time, bars=dict(self.bars), resolution=_slice_resolution(self.bars.values()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "time": self.time.isoformat(),
+            "source": self.source,
+            "lane": self.lane,
+            "bars": [_bar_to_dict(bar) for bar in self.bars.values()],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "MarketDataSnapshot":
+        bars = {
+            bar.symbol.key: bar
+            for bar in (_bar_from_dict(item) for item in payload.get("bars", []) if isinstance(item, Mapping))
+        }
+        return cls(
+            snapshot_id=str(payload.get("snapshot_id") or ""),
+            time=_parse_datetime(payload.get("time")) or datetime.now(),
+            source=str(payload.get("source") or "unknown"),
+            bars=bars,
+            lane=str(payload.get("lane") or infer_snapshot_lane(bars.values())),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDataSnapshotRecord:
+    snapshot: MarketDataSnapshot
+    quality_by_sleeve: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot": self.snapshot.to_dict(),
+            "quality_by_sleeve": {key: dict(value) for key, value in self.quality_by_sleeve.items()},
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "MarketDataSnapshotRecord":
+        return cls(
+            snapshot=MarketDataSnapshot.from_dict(dict(payload.get("snapshot") or {})),
+            quality_by_sleeve={
+                str(key): dict(value)
+                for key, value in dict(payload.get("quality_by_sleeve") or {}).items()
+                if isinstance(value, Mapping)
+            },
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+@dataclass(slots=True)
+class FileMarketDataSnapshotStore:
+    path: Path
+
+    def append(
+        self,
+        snapshot: MarketDataSnapshot,
+        *,
+        quality_by_sleeve: Mapping[str, SnapshotQualityReport] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> MarketDataSnapshotRecord:
+        record = MarketDataSnapshotRecord(
+            snapshot=snapshot,
+            quality_by_sleeve={
+                sleeve_id: report.to_dict()
+                for sleeve_id, report in dict(quality_by_sleeve or {}).items()
+            },
+            metadata=dict(metadata or {}),
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n")
+        return record
+
+    def latest(self, *, lane: str | None = None) -> MarketDataSnapshotRecord | None:
+        target_lane = normalize_snapshot_lane(lane) if lane is not None else None
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            record = MarketDataSnapshotRecord.from_dict(payload)
+            if target_lane is None or record.snapshot.lane == target_lane:
+                return record
+        return None
+
+    def entries(self, *, limit: int = 100, lane: str | None = None) -> tuple[MarketDataSnapshotRecord, ...]:
+        target_lane = normalize_snapshot_lane(lane) if lane is not None else None
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return ()
+        records: list[MarketDataSnapshotRecord] = []
+        for line in lines[-max(int(limit), 0):]:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                record = MarketDataSnapshotRecord.from_dict(payload)
+                if target_lane is None or record.snapshot.lane == target_lane:
+                    records.append(record)
+        return tuple(records)
 
 
 @dataclass(slots=True)
@@ -76,6 +199,7 @@ class MarketDataSnapshotEngine:
     indicator_engine: IndicatorEngine
     stores_by_sleeve: dict[str, IndicatorSnapshotStore] = field(default_factory=dict)
     source: str = "provider"
+    snapshot_store: FileMarketDataSnapshotStore | None = None
     last_indicator_update_report: IndicatorUpdateReport = field(default_factory=IndicatorUpdateReport, init=False)
     last_indicator_update_report_by_sleeve: dict[str, IndicatorUpdateReport] = field(default_factory=dict, init=False)
 
@@ -207,6 +331,7 @@ class MarketDataSnapshotEngine:
                 source_snapshot_id=snapshot.snapshot_id,
                 as_of=snapshot.time,
                 quality_report=(quality_report_by_sleeve or {}).get(sleeve_id),
+                lane=snapshot.lane,
             )
             store = self.stores_by_sleeve.setdefault(sleeve_id, IndicatorSnapshotStore())
             if publish_active:
@@ -228,6 +353,7 @@ class MarketDataSnapshotEngine:
                         if indicator_snapshot.quality_report is not None
                         else None
                     ),
+                    "snapshot_lane": snapshot.lane,
                 },
             )
         logger.info(
@@ -239,6 +365,7 @@ class MarketDataSnapshotEngine:
                 "elapsed_ms": (time.perf_counter() - started) * 1000,
             },
         )
+        self._append_snapshot(snapshot, quality_by_sleeve=quality_report_by_sleeve)
         return indicator_snapshots
 
     def run_once(
@@ -260,6 +387,15 @@ class MarketDataSnapshotEngine:
         )
         return snapshot, indicator_snapshots
 
+    def _append_snapshot(
+        self,
+        snapshot: MarketDataSnapshot,
+        quality_by_sleeve: Mapping[str, SnapshotQualityReport] | None = None,
+    ) -> None:
+        if self.snapshot_store is None:
+            return
+        self.snapshot_store.append(snapshot, quality_by_sleeve=quality_by_sleeve)
+
 
 def _as_live_bar(bar: Bar) -> Bar:
     if bar.resolution not in {"", "any", "unknown"}:
@@ -272,3 +408,74 @@ def _slice_resolution(bars: object) -> str:
     if len(resolutions) == 1:
         return next(iter(resolutions), "any")
     return "mixed"
+
+
+def normalize_snapshot_lane(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"", "any", "*"}:
+        return UNKNOWN_SNAPSHOT_LANE
+    if text in {"quote", "live", "tick", "second"}:
+        return QUOTE_SNAPSHOT_LANE
+    if text in {"minute", "intraday"}:
+        return MINUTE_SNAPSHOT_LANE
+    if text in {"daily", "daily_confirmed", "confirmed_daily"}:
+        return DAILY_CONFIRMED_SNAPSHOT_LANE
+    if text == UNKNOWN_SNAPSHOT_LANE:
+        return UNKNOWN_SNAPSHOT_LANE
+    return text
+
+
+def infer_snapshot_lane(bars: object) -> str:
+    lanes = {
+        normalize_snapshot_lane(getattr(bar, "resolution", None))
+        for bar in bars
+    }
+    lanes.discard(UNKNOWN_SNAPSHOT_LANE)
+    if not lanes:
+        return UNKNOWN_SNAPSHOT_LANE
+    if len(lanes) > 1:
+        raise ValueError(f"MarketDataSnapshot cannot mix resolution lanes: {sorted(lanes)}")
+    return next(iter(lanes))
+
+
+def _bar_to_dict(bar: Bar) -> dict[str, Any]:
+    return {
+        "symbol": {"ticker": bar.symbol.ticker, "market": bar.symbol.market},
+        "time": bar.time.isoformat(),
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+        "resolution": bar.resolution,
+        "metadata": dict(bar.metadata),
+    }
+
+
+def _bar_from_dict(payload: Mapping[str, Any]) -> Bar:
+    symbol_payload = payload.get("symbol")
+    if isinstance(symbol_payload, Mapping):
+        symbol = Symbol(str(symbol_payload.get("ticker") or ""), str(symbol_payload.get("market") or "KR"))
+    else:
+        market, _, ticker = str(payload.get("symbol_key") or "").partition(":")
+        symbol = Symbol(ticker or str(payload.get("ticker") or ""), market or str(payload.get("market") or "KR"))
+    return Bar(
+        symbol=symbol,
+        time=_parse_datetime(payload.get("time")) or datetime.now(),
+        open=float(payload.get("open") or 0.0),
+        high=float(payload.get("high") or 0.0),
+        low=float(payload.get("low") or 0.0),
+        close=float(payload.get("close") or 0.0),
+        volume=int(float(payload.get("volume") or 0)),
+        resolution=str(payload.get("resolution") or "any"),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None

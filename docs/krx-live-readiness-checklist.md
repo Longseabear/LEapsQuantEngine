@@ -36,13 +36,18 @@ Passed:
 - Unallocated fill count is `0`.
 - Notification engine status is `ok`.
 - KIS direct health is `ok`.
+- KIS gateway health is `ok` when the shared gateway is part of the live stack.
 - Samsung Electronics quote lookup works through the KIS adapter.
 - Indicator warmup loads 16 of 16 symbols and reaches ready ratio `1.0`.
 
 Changed during readiness:
 
-- `market_data.rate_limit_per_second` was reduced from `20` to `5`.
-  At `20`, KIS returned `EGW00201` rate-limit errors during quote collection.
+- `market_data.rate_limit_per_second` is `18` when KIS calls are coordinated
+  through one AppKey-level lane. If a temporary process bypasses the shared
+  lane, lower its explicit rate limit before starting it.
+- Live configs that use KIS should set `market_data.provider` to
+  `kis-gateway`, include `gateway_base_url`, and keep the local Gateway healthy
+  before strict preflight.
 - `LEaps.portfolio.account_store_path` now points to the domestic virtual
   account store: `../../data/virtual-accounts/kis_domestic.json`.
 
@@ -79,6 +84,8 @@ KRX:487240  broker 11  virtual 0
 Go only if every item is true:
 
 - `runtime-preflight` returns `status: ok`.
+- `runtime-preflight --strict-live` reports `kis_gateway_liveness: ok` when the
+  provider is `kis-gateway`.
 - `runtime-health` returns `status: ok`.
 - `runtime-recovery-status` returns `status: ok`.
 - `order-runtime-status` returns `needs_attention: false`.
@@ -136,8 +143,14 @@ py -3 -m leaps_quant_engine.cli runtime-preflight configs/runtime/live_multi_sle
 ```powershell
 py -3 -m leaps_quant_engine.cli kis-health
 
+py -3 -m leaps_quant_engine.cli kis-gateway-health --base-url http://127.0.0.1:8766
+
 py -3 -m leaps_quant_engine.cli kis-quote 005930 --market KRX
 ```
+
+If `runtime-preflight --strict-live` reports `kis_gateway_liveness` as warning
+or critical, start or repair the Gateway first. The live runtime is expected to
+share that KIS lane instead of opening another direct KIS lane.
 
 4. Check order and recovery state.
 

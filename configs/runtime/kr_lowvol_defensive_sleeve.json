@@ -1,0 +1,139 @@
+{
+  "runtime_id": "kr-lowvol-defensive",
+  "mode": "paper",
+  "timezone": "Asia/Seoul",
+  "market_data": {
+    "provider": "market-data-engine",
+    "history_provider": "kis-cache",
+    "source": "market-data-engine",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 18
+  },
+  "broker_accounts": [
+    {
+      "account_id": "kr-lowvol-defensive-paper",
+      "market_scope": "domestic",
+      "currency": "KRW",
+      "account_store_path": "../../data/virtual-accounts/kr_lowvol_defensive_paper.json",
+      "order_store_path": "../../data/order-runtime/kr_lowvol_defensive_paper.jsonl",
+      "broker_gateway": "paper",
+      "metadata": {
+        "note": "Paper route for the kr-lowvol-defensive sleeve. Live broker submission must be opted in separately."
+      }
+    }
+  ],
+  "journal_path": "../../data/cycle-journal/kr_lowvol_defensive.jsonl",
+  "sleeves": [
+    {
+      "sleeve_id": "kr-lowvol-defensive",
+      "workspace_path": "sleeves/kr-lowvol-defensive",
+      "broker_account_id": "kr-lowvol-defensive-paper",
+      "broker_account_routes": {
+        "domestic": "kr-lowvol-defensive-paper"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "KRW": 10000000
+      },
+      "universe": {
+        "coarse_path": "configs/universes/kr_lowvol_defensive_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 40,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/lowvol_rank.py:LowVolDefensiveSelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ]
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 160,
+        "min_ready_ratio": 0.96,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/lowvol_defensive.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "kr-lowvol-defensive-alpha": "kr-lowvol-defensive-core"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/inverse_vol.py",
+        "parameters": {
+          "top_k": 12,
+          "core_gross_exposure": 0.88,
+          "neutral_gross_exposure": 0.65,
+          "defensive_gross_exposure": 0.40,
+          "max_position_pct": 0.10,
+          "min_position_pct": 0.015,
+          "emit_zero_for_missing_held_targets": true
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.05,
+          "min_order_notional": 250000.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true,
+          "cadence": "monthly",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 20.0
+        },
+        "target_resolution": {
+          "mode": "patch"
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 360,
+          "target_drift_threshold_pct": 0.08,
+          "clock": "orderable_session"
+        }
+      },
+      "risk": {
+        "model": "risks/basic.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct": 0.11,
+          "max_total_exposure_pct": 0.90,
+          "cash_buffer_pct": 0.05,
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/immediate.py",
+        "parameters": {
+          "tag_prefix": "kr-lowvol-defensive",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "limit_offset_bps": 6.0,
+          "max_slice_notional": 1000000,
+          "max_slices": 4,
+          "urgency": "patient",
+          "max_order_age_seconds": 1200,
+          "price_drift_bps": 70,
+          "min_replace_interval_seconds": 240,
+          "max_replacements": 2
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 300,
+        "min_success": 1
+      }
+    }
+  ],
+  "metadata": {
+    "description": "Paper runtime for a KRW-only defensive low-volatility Korean equity sleeve. V2 adds anti-lottery, anti-crowding, quality, value, and dividend factor metadata while staying separate from the LEaps growth/PPO sleeve."
+  }
+}

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 import csv
 import gzip
+import hashlib
 import json
 import math
 import time as perf_time
@@ -22,6 +23,7 @@ from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataError, MarketDataProvider
 from leaps_quant_engine.market_rules import synthetic_domestic_market_session, synthetic_us_market_session
 from leaps_quant_engine.models import Bar, DataResolution, DataSlice, OrderIntent, OrderSide, Symbol
+from leaps_quant_engine.market_data_snapshot import normalize_snapshot_lane
 from leaps_quant_engine.orders import (
     FixedBpsSlippageModel,
     KisFeeModel,
@@ -32,6 +34,10 @@ from leaps_quant_engine.orders import (
     SimulatedFillModel,
 )
 from leaps_quant_engine.portfolio import Portfolio, currency_for_symbol
+from leaps_quant_engine.temporal_features import (
+    TemporalFeatureWindowProvider,
+    enrich_indicator_snapshot_with_temporal_features,
+)
 from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.universe.selection import (
     CompositeUniverseSelectionResult,
@@ -331,6 +337,58 @@ class FrameworkBacktestResult:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class CompiledMinuteReplayCacheReport:
+    status: str
+    path: str
+    schema_version: str
+    slice_count: int
+    row_count: int
+    start: datetime | None = None
+    end: datetime | None = None
+    source: str | None = None
+    source_signature: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "path": self.path,
+            "schema_version": self.schema_version,
+            "slice_count": self.slice_count,
+            "row_count": self.row_count,
+            "start": self.start.isoformat() if self.start is not None else None,
+            "end": self.end.isoformat() if self.end is not None else None,
+            "source": self.source,
+            "source_signature": self.source_signature,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DailyWarmupCacheReport:
+    status: str
+    path: str | None
+    schema_version: str
+    row_count: int
+    symbol_count: int
+    start: datetime | None = None
+    end: datetime | None = None
+    source: str | None = None
+    source_signature: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "path": self.path,
+            "schema_version": self.schema_version,
+            "row_count": self.row_count,
+            "symbol_count": self.symbol_count,
+            "start": self.start.isoformat() if self.start is not None else None,
+            "end": self.end.isoformat() if self.end is not None else None,
+            "source": self.source,
+            "source_signature": self.source_signature,
+        }
+
+
 def build_replay_feed(
     provider: MarketDataProvider,
     symbols: list[Symbol],
@@ -339,6 +397,7 @@ def build_replay_feed(
     end: datetime | None = None,
     refresh_history: bool = False,
     include_opening_gap_context: bool = True,
+    daily_bar_time: dt_time | None = None,
 ) -> list[DataSlice]:
     bars_by_symbol = {
         symbol.key: get_daily_history(
@@ -350,6 +409,11 @@ def build_replay_feed(
         )
         for symbol in symbols
     }
+    if daily_bar_time is not None:
+        bars_by_symbol = {
+            symbol_key: _with_daily_bar_time(series, daily_bar_time)
+            for symbol_key, series in bars_by_symbol.items()
+        }
     if include_opening_gap_context:
         bars_by_symbol = {
             symbol_key: _with_opening_gap_context(series)
@@ -363,6 +427,20 @@ def build_replay_feed(
         DataSlice(time=time, bars=bars_by_time[time])
         for time in sorted(bars_by_time)
         if bars_by_time[time]
+    ]
+
+
+def _with_daily_bar_time(series: list[Bar], daily_bar_time: dt_time) -> list[Bar]:
+    return [
+        replace(
+            bar,
+            time=datetime.combine(
+                bar.time.date(),
+                daily_bar_time,
+                tzinfo=bar.time.tzinfo,
+            ),
+        )
+        for bar in series
     ]
 
 
@@ -438,6 +516,186 @@ def load_minute_replay_feed(
     )
 
 
+def load_compiled_minute_replay_cache(path: str | Path) -> tuple[list[DataSlice], CompiledMinuteReplayCacheReport]:
+    """Load a pre-grouped minute replay artifact without changing replay semantics."""
+
+    source_path = Path(path)
+    payload = _read_compiled_minute_replay_payload(source_path)
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version != "leaps_compiled_minute_replay.v1":
+        raise ValueError(f"Unsupported compiled minute replay cache schema: {schema_version}")
+    slices: list[DataSlice] = []
+    row_count = 0
+    for item in payload.get("slices") or ():
+        if not isinstance(item, Mapping):
+            raise ValueError(f"Compiled minute replay slices must be objects: {source_path}")
+        slice_time = _parse_datetime(str(item["time"]))
+        bars: dict[str, Bar] = {}
+        for bar_item in item.get("bars") or ():
+            if not isinstance(bar_item, Mapping):
+                raise ValueError(f"Compiled minute replay bars must be objects: {source_path}")
+            bar = _compiled_minute_bar_from_payload(bar_item, default_time=slice_time)
+            bars[bar.symbol.key] = bar
+            row_count += 1
+        if bars:
+            slices.append(DataSlice(time=slice_time, bars=bars, resolution=DataResolution.MINUTE.value))
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+    report = CompiledMinuteReplayCacheReport(
+        status="hit",
+        path=str(source_path),
+        schema_version=schema_version,
+        slice_count=len(slices),
+        row_count=row_count,
+        start=_parse_optional_datetime(metadata.get("start")),
+        end=_parse_optional_datetime(metadata.get("end")),
+        source=str(metadata.get("source") or "") or None,
+        source_signature=str(metadata.get("source_signature") or "") or None,
+    )
+    return slices, report
+
+
+def write_compiled_minute_replay_cache(
+    path: str | Path,
+    feed: list[DataSlice],
+    *,
+    source: str | None = None,
+    source_signature: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> CompiledMinuteReplayCacheReport:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    row_count = 0
+    slices_payload: list[dict[str, object]] = []
+    for data in sorted(feed, key=lambda item: item.time):
+        bars_payload = []
+        for symbol_key in sorted(data.bars):
+            bars_payload.append(_compiled_minute_bar_to_payload(data.bars[symbol_key]))
+            row_count += 1
+        if bars_payload:
+            slices_payload.append({"time": data.time.replace(tzinfo=None).isoformat(), "bars": bars_payload})
+    payload = {
+        "schema_version": "leaps_compiled_minute_replay.v1",
+        "metadata": {
+            "source": source,
+            "source_signature": source_signature,
+            "start": start.isoformat() if start is not None else None,
+            "end": end.isoformat() if end is not None else None,
+            "created_at": datetime.now().isoformat(),
+        },
+        "slices": slices_payload,
+    }
+    _write_compiled_minute_replay_payload(destination, payload)
+    return CompiledMinuteReplayCacheReport(
+        status="written",
+        path=str(destination),
+        schema_version="leaps_compiled_minute_replay.v1",
+        slice_count=len(slices_payload),
+        row_count=row_count,
+        start=start,
+        end=end,
+        source=source,
+        source_signature=source_signature,
+    )
+
+
+def minute_replay_source_signature(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    source_path = Path(path)
+    if not source_path.exists():
+        return None
+    stat = source_path.stat()
+    payload = f"{source_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def load_daily_warmup_cache(path: str | Path) -> tuple[list[Bar], DailyWarmupCacheReport]:
+    source_path = Path(path)
+    payload = _read_compiled_minute_replay_payload(source_path)
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version != "leaps_daily_warmup_cache.v1":
+        raise ValueError(f"Unsupported daily warmup cache schema: {schema_version}")
+    bars = [
+        _bar_from_cache_payload(item, default_resolution=DataResolution.DAILY.value)
+        for item in payload.get("bars") or ()
+        if isinstance(item, Mapping)
+    ]
+    bars = sorted(bars, key=lambda bar: (bar.time, bar.symbol.key))
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+    report = DailyWarmupCacheReport(
+        status="hit",
+        path=str(source_path),
+        schema_version=schema_version,
+        row_count=len(bars),
+        symbol_count=len({bar.symbol.key for bar in bars}),
+        start=_parse_optional_datetime(metadata.get("start")),
+        end=_parse_optional_datetime(metadata.get("end")),
+        source=str(metadata.get("source") or "") or None,
+        source_signature=str(metadata.get("source_signature") or "") or None,
+    )
+    return bars, report
+
+
+def write_daily_warmup_cache(
+    path: str | Path,
+    bars: list[Bar],
+    *,
+    source: str | None = None,
+    source_signature: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> DailyWarmupCacheReport:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ordered = sorted((replace(bar, resolution=DataResolution.DAILY.value) for bar in bars), key=lambda bar: (bar.time, bar.symbol.key))
+    payload = {
+        "schema_version": "leaps_daily_warmup_cache.v1",
+        "metadata": {
+            "source": source,
+            "source_signature": source_signature,
+            "start": start.isoformat() if start is not None else None,
+            "end": end.isoformat() if end is not None else None,
+            "created_at": datetime.now().isoformat(),
+        },
+        "bars": [_bar_to_cache_payload(bar) for bar in ordered],
+    }
+    _write_compiled_minute_replay_payload(destination, payload)
+    return DailyWarmupCacheReport(
+        status="written",
+        path=str(destination),
+        schema_version="leaps_daily_warmup_cache.v1",
+        row_count=len(ordered),
+        symbol_count=len({bar.symbol.key for bar in ordered}),
+        start=start,
+        end=end,
+        source=source,
+        source_signature=source_signature,
+    )
+
+
+def load_daily_warmup_bars_for_backtest(
+    provider: MarketDataProvider,
+    universe: UniverseDefinition,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    refresh_history: bool = False,
+) -> list[Bar]:
+    bars: list[Bar] = []
+    for symbol in universe.symbols:
+        bars.extend(
+            get_daily_history(
+                provider,
+                symbol,
+                start=start,
+                end=end,
+                refresh_history=refresh_history,
+            )
+        )
+    return sorted(bars, key=lambda bar: (bar.time, bar.symbol.key))
+
+
 def _build_minute_replay_feed_from_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -474,19 +732,15 @@ def warm_up_daily_indicators_for_backtest(
     end: datetime | None = None,
     refresh_history: bool = False,
 ) -> int:
-    bars: list[Bar] = []
     if sleeve_id not in indicator_engine.registries_by_sleeve:
         indicator_engine.register_universe(sleeve_id, universe)
-    for symbol in universe.symbols:
-        bars.extend(
-            get_daily_history(
-                provider,
-                symbol,
-                start=start,
-                end=end,
-                refresh_history=refresh_history,
-            )
-        )
+    bars = load_daily_warmup_bars_for_backtest(
+        provider,
+        universe,
+        start=start,
+        end=end,
+        refresh_history=refresh_history,
+    )
     indicator_engine.warm_up(sleeve_id, bars)
     return len(bars)
 
@@ -551,6 +805,9 @@ def run_framework_backtest(
     selection_models: tuple[UniverseSelectionModel, ...] = (),
     alpha_input_selections: Mapping[str, str] | None = None,
     fill_model: SimulatedFillModel | None = None,
+    temporal_feature_provider: TemporalFeatureWindowProvider | None = None,
+    cycle_journal_include_lineage: bool = True,
+    daily_bar_time: dt_time | None = None,
 ) -> FrameworkBacktestResult:
     feed_started = perf_time.perf_counter()
     feed = build_replay_feed(
@@ -559,6 +816,7 @@ def run_framework_backtest(
         start=warmup_start or start,
         end=end,
         refresh_history=refresh_history,
+        daily_bar_time=daily_bar_time,
     )
     feed_build_ms = _perf_elapsed_ms(feed_started)
     indicator_engine = indicator_engine or IndicatorEngine()
@@ -584,25 +842,42 @@ def run_framework_backtest(
     evaluated_data_slice_count = 0
     evaluated_start: datetime | None = None
     evaluated_end: datetime | None = None
+    replay_stage_timings: dict[str, float] = {}
 
     replay_started = perf_time.perf_counter()
     for index, data in enumerate(feed, start=1):
         for bar in data.bars.values():
             last_prices[bar.symbol.key] = bar.close
+        stage_started = perf_time.perf_counter()
         indicator_engine.on_data(data)
+        _add_timing_ms(replay_stage_timings, "replay_indicator_update_ms", stage_started)
+        if temporal_feature_provider is not None:
+            stage_started = perf_time.perf_counter()
+            temporal_feature_provider.update(data)
+            _add_timing_ms(replay_stage_timings, "replay_temporal_update_ms", stage_started)
         if start is not None and data.time < start:
             warmup_data_slice_count += 1
             continue
         evaluated_start = data.time if evaluated_start is None else evaluated_start
         evaluated_end = data.time
+        stage_started = perf_time.perf_counter()
         indicator_snapshot = indicator_engine.snapshot(
             sleeve_id,
             universe_id=universe.id,
             source_snapshot_id=f"backtest-{sleeve_id}-{index}",
             as_of=data.time,
             created_at=data.time,
+            lane=normalize_snapshot_lane(data.resolution),
         )
+        _add_timing_ms(replay_stage_timings, "replay_indicator_snapshot_ms", stage_started)
+        stage_started = perf_time.perf_counter()
+        indicator_snapshot = enrich_indicator_snapshot_with_temporal_features(
+            indicator_snapshot,
+            temporal_feature_provider,
+        )
+        _add_timing_ms(replay_stage_timings, "replay_temporal_enrich_ms", stage_started)
         evaluated_data_slice_count += 1
+        stage_started = perf_time.perf_counter()
         fundamental_snapshot = _fundamental_snapshot(
             fundamental_store,
             sleeve_id=sleeve_id,
@@ -611,6 +886,8 @@ def run_framework_backtest(
             names=fundamental_names,
             source_snapshot_id=f"backtest-{sleeve_id}-{index}",
         )
+        _add_timing_ms(replay_stage_timings, "replay_fundamental_snapshot_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         selection_result = _select_backtest_universe(
             universe=universe,
             selection_models=selection_models,
@@ -619,6 +896,7 @@ def run_framework_backtest(
             previous_live_symbols=previous_live_symbols,
             held_symbols=portfolio.held_symbols,
         )
+        _add_timing_ms(replay_stage_timings, "replay_universe_selection_ms", stage_started)
         cycle_alpha_symbols = alpha_symbols_by_model
         if selection_result is not None:
             selection_results.append(selection_result)
@@ -629,6 +907,7 @@ def run_framework_backtest(
                 fallback=alpha_symbols_by_model,
             )
         market_sessions = _market_sessions_for_backtest(universe, data)
+        stage_started = perf_time.perf_counter()
         cycle = framework_runner.run_once(
             indicator_snapshot=indicator_snapshot,
             fundamental_snapshot=fundamental_snapshot,
@@ -638,7 +917,9 @@ def run_framework_backtest(
             market_session=_primary_market_session(universe, market_sessions),
             market_sessions=market_sessions,
         )
+        _add_timing_ms(replay_stage_timings, "replay_framework_runner_ms", stage_started)
         if cycle_journal_store is not None:
+            stage_started = perf_time.perf_counter()
             cycle_journal_store.append(
                 CycleJournalEntry.from_framework_cycle(
                     cycle,
@@ -647,20 +928,30 @@ def run_framework_backtest(
                     account_id=account_id,
                     route_id=account_id,
                     market_scope=market_scope,
+                    include_lineage=cycle_journal_include_lineage,
                 )
             )
+            _add_timing_ms(replay_stage_timings, "replay_journal_append_ms", stage_started)
         framework_cycles.append(cycle)
         orders.extend(cycle.order_intents)
+        stage_started = perf_time.perf_counter()
         coordination = coordinator.coordinate((cycle.execution_batch,), generated_at=data.time)
+        _add_timing_ms(replay_stage_timings, "replay_order_coordination_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         fill_events = fill_model.fill(coordination.tickets, occurred_at=data.time)
+        _add_timing_ms(replay_stage_timings, "replay_fill_model_ms", stage_started)
         order_tickets.extend(coordination.tickets)
         order_events.extend(coordination.events)
         order_events.extend(fill_events)
         order_collisions.extend(coordination.collisions)
+        stage_started = perf_time.perf_counter()
         for event in fill_events:
             tracker.record_fill_event(event)
             portfolio.apply_order_event(event)
+        _add_timing_ms(replay_stage_timings, "replay_portfolio_apply_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         tracker.record_snapshot(data.time, portfolio.cash, dict(portfolio.cash_by_currency), portfolio.holdings, last_prices)
+        _add_timing_ms(replay_stage_timings, "replay_snapshot_record_ms", stage_started)
     replay_ms = _perf_elapsed_ms(replay_started)
 
     return FrameworkBacktestResult(
@@ -691,6 +982,7 @@ def run_framework_backtest(
         timings={
             "history_feed_build_ms": feed_build_ms,
             "framework_replay_wall_ms": replay_ms,
+            **_rounded_timings(replay_stage_timings),
         },
     )
 
@@ -715,6 +1007,8 @@ def run_framework_replay(
     account_id: str | None = None,
     market_scope: str | None = None,
     warmup_data_slice_count: int = 0,
+    temporal_feature_provider: TemporalFeatureWindowProvider | None = None,
+    cycle_journal_include_lineage: bool = True,
 ) -> FrameworkBacktestResult:
     replay_started = perf_time.perf_counter()
     indicator_engine = indicator_engine or IndicatorEngine()
@@ -736,18 +1030,35 @@ def run_framework_replay(
     last_prices: dict[str, float] = {}
     coordinator = OrderCoordinator()
     fill_model = fill_model or SimulatedFillModel()
+    replay_stage_timings: dict[str, float] = {}
 
     for index, data in enumerate(sorted(feed, key=lambda item: item.time), start=1):
         for bar in data.bars.values():
             last_prices[bar.symbol.key] = bar.close
+        stage_started = perf_time.perf_counter()
         indicator_engine.on_data(data)
+        _add_timing_ms(replay_stage_timings, "replay_indicator_update_ms", stage_started)
+        if temporal_feature_provider is not None:
+            stage_started = perf_time.perf_counter()
+            temporal_feature_provider.update(data)
+            _add_timing_ms(replay_stage_timings, "replay_temporal_update_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         indicator_snapshot = indicator_engine.snapshot(
             sleeve_id,
             universe_id=universe.id,
             source_snapshot_id=f"replay-{sleeve_id}-{index}",
             as_of=data.time,
             created_at=data.time,
+            lane=normalize_snapshot_lane(data.resolution),
         )
+        _add_timing_ms(replay_stage_timings, "replay_indicator_snapshot_ms", stage_started)
+        stage_started = perf_time.perf_counter()
+        indicator_snapshot = enrich_indicator_snapshot_with_temporal_features(
+            indicator_snapshot,
+            temporal_feature_provider,
+        )
+        _add_timing_ms(replay_stage_timings, "replay_temporal_enrich_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         fundamental_snapshot = _fundamental_snapshot(
             fundamental_store,
             sleeve_id=sleeve_id,
@@ -756,6 +1067,8 @@ def run_framework_replay(
             names=fundamental_names,
             source_snapshot_id=f"replay-{sleeve_id}-{index}",
         )
+        _add_timing_ms(replay_stage_timings, "replay_fundamental_snapshot_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         selection_result = _select_backtest_universe(
             universe=universe,
             selection_models=selection_models,
@@ -764,6 +1077,7 @@ def run_framework_replay(
             previous_live_symbols=previous_live_symbols,
             held_symbols=portfolio.held_symbols,
         )
+        _add_timing_ms(replay_stage_timings, "replay_universe_selection_ms", stage_started)
         cycle_alpha_symbols = alpha_symbols_by_model
         if selection_result is not None:
             selection_results.append(selection_result)
@@ -774,6 +1088,7 @@ def run_framework_replay(
                 fallback=alpha_symbols_by_model,
             )
         market_sessions = _market_sessions_for_backtest(universe, data)
+        stage_started = perf_time.perf_counter()
         cycle = framework_runner.run_once(
             indicator_snapshot=indicator_snapshot,
             fundamental_snapshot=fundamental_snapshot,
@@ -783,7 +1098,9 @@ def run_framework_replay(
             market_session=_primary_market_session(universe, market_sessions),
             market_sessions=market_sessions,
         )
+        _add_timing_ms(replay_stage_timings, "replay_framework_runner_ms", stage_started)
         if cycle_journal_store is not None:
+            stage_started = perf_time.perf_counter()
             cycle_journal_store.append(
                 CycleJournalEntry.from_framework_cycle(
                     cycle,
@@ -792,20 +1109,30 @@ def run_framework_replay(
                     account_id=account_id,
                     route_id=account_id,
                     market_scope=market_scope,
+                    include_lineage=cycle_journal_include_lineage,
                 )
             )
+            _add_timing_ms(replay_stage_timings, "replay_journal_append_ms", stage_started)
         framework_cycles.append(cycle)
         orders.extend(cycle.order_intents)
+        stage_started = perf_time.perf_counter()
         coordination = coordinator.coordinate((cycle.execution_batch,), generated_at=data.time)
+        _add_timing_ms(replay_stage_timings, "replay_order_coordination_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         fill_events = fill_model.fill(coordination.tickets, occurred_at=data.time)
+        _add_timing_ms(replay_stage_timings, "replay_fill_model_ms", stage_started)
         order_tickets.extend(coordination.tickets)
         order_events.extend(coordination.events)
         order_events.extend(fill_events)
         order_collisions.extend(coordination.collisions)
+        stage_started = perf_time.perf_counter()
         for event in fill_events:
             tracker.record_fill_event(event)
             portfolio.apply_order_event(event)
+        _add_timing_ms(replay_stage_timings, "replay_portfolio_apply_ms", stage_started)
+        stage_started = perf_time.perf_counter()
         tracker.record_snapshot(data.time, portfolio.cash, dict(portfolio.cash_by_currency), portfolio.holdings, last_prices)
+        _add_timing_ms(replay_stage_timings, "replay_snapshot_record_ms", stage_started)
     replay_ms = _perf_elapsed_ms(replay_started)
 
     return FrameworkBacktestResult(
@@ -835,6 +1162,7 @@ def run_framework_replay(
         end=feed[-1].time if feed else None,
         timings={
             "framework_replay_wall_ms": replay_ms,
+            **_rounded_timings(replay_stage_timings),
         },
     )
 
@@ -1531,6 +1859,72 @@ def _ensure_row_mapping(item: Any, path: Path) -> Mapping[str, Any]:
     return item
 
 
+def _read_compiled_minute_replay_payload(path: Path) -> Mapping[str, Any]:
+    opener = gzip.open if path.name.lower().endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Compiled minute replay cache must be a JSON object: {path}")
+    return payload
+
+
+def _write_compiled_minute_replay_payload(path: Path, payload: Mapping[str, Any]) -> None:
+    opener = gzip.open if path.name.lower().endswith(".gz") else open
+    with opener(path, "wt", encoding="utf-8", newline="") as handle:
+        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _compiled_minute_bar_to_payload(bar: Bar) -> dict[str, object]:
+    return _bar_to_cache_payload(bar)
+
+
+def _bar_to_cache_payload(bar: Bar) -> dict[str, object]:
+    return {
+        "symbol": bar.symbol.key,
+        "time": bar.time.replace(tzinfo=None).isoformat(),
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": int(bar.volume),
+        "resolution": str(bar.resolution),
+        "metadata": dict(bar.metadata),
+    }
+
+
+def _compiled_minute_bar_from_payload(item: Mapping[str, Any], *, default_time: datetime) -> Bar:
+    return _bar_from_cache_payload(item, default_resolution=DataResolution.MINUTE.value, default_time=default_time)
+
+
+def _bar_from_cache_payload(
+    item: Mapping[str, Any],
+    *,
+    default_resolution: str,
+    default_time: datetime | None = None,
+) -> Bar:
+    symbol = _minute_row_symbol(item, default_market="KRX")
+    bar_time = _parse_optional_datetime(item.get("time")) or default_time
+    if bar_time is None:
+        raise ValueError("Cached bar requires time.")
+    return Bar(
+        symbol=symbol,
+        time=bar_time,
+        open=float(item["open"]),
+        high=float(item["high"]),
+        low=float(item["low"]),
+        close=float(item["close"]),
+        volume=int(float(item.get("volume") or 0)),
+        resolution=str(item.get("resolution") or default_resolution),
+        metadata=dict(item.get("metadata") or {}),
+    )
+
+
+def _parse_optional_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    return _parse_datetime(str(value))
+
+
 def _minute_row_to_bar(row: Mapping[str, Any], *, default_market: str) -> Bar:
     symbol = _minute_row_symbol(row, default_market=default_market)
     close = _required_row_float(row, ("close", "close_price", "last_price", "stck_prpr", "stck_clpr"))
@@ -1641,6 +2035,14 @@ def _optional_row_int(row: Mapping[str, Any], names: tuple[str, ...], *, default
 
 def _perf_elapsed_ms(started: float) -> float:
     return round((perf_time.perf_counter() - started) * 1000.0, 3)
+
+
+def _add_timing_ms(bucket: dict[str, float], key: str, started: float) -> None:
+    bucket[key] = bucket.get(key, 0.0) + ((perf_time.perf_counter() - started) * 1000.0)
+
+
+def _rounded_timings(bucket: Mapping[str, float]) -> dict[str, float]:
+    return {key: round(value, 3) for key, value in bucket.items()}
 
 
 def _parse_datetime(value: str) -> datetime:

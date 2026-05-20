@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from leaps_quant_engine.cycle_journal import CycleJournalStore
+from leaps_quant_engine.kis_gateway import fetch_kis_gateway_health
+from leaps_quant_engine.market_calendar import session_report_for_market_scope
 from leaps_quant_engine.market_data import MarketDataError
 from leaps_quant_engine.models import Bar, Symbol
 from leaps_quant_engine.order_status import OrderRuntimeStatusReport
@@ -69,6 +71,8 @@ class RuntimePreflightReport:
                 actions.append("run_order_runtime_supervise")
             elif check.name in {"unallocated_fills"}:
                 actions.append("review_virtual_account_allocations")
+            elif check.name in {"kis_gateway_liveness"}:
+                actions.append("start_or_check_kis_gateway")
         return tuple(dict.fromkeys(actions))
 
     def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
@@ -95,7 +99,7 @@ def build_runtime_preflight_report(
     check_bootstrap: bool = True,
     generated_at: datetime | None = None,
 ) -> RuntimePreflightReport:
-    generated_at = generated_at or datetime.now()
+    generated_at = generated_at or datetime.now().astimezone()
     selected_sleeve_ids = tuple(dict.fromkeys(sleeve_ids or (sleeve.sleeve_id for sleeve in snapshot.config.sleeves)))
     code_identity = build_runtime_code_identity(snapshot, sleeve_ids=selected_sleeve_ids)
     checks: list[RuntimePreflightCheck] = [
@@ -115,6 +119,8 @@ def build_runtime_preflight_report(
     ]
     checks.extend(_file_checks(code_identity, strict_live=strict_live))
     checks.extend(_route_checks(snapshot, selected_sleeve_ids, strict_live=strict_live))
+    checks.extend(_gateway_checks(snapshot, strict_live=strict_live))
+    checks.extend(_calendar_checks(snapshot, selected_sleeve_ids, generated_at=generated_at))
     checks.extend(_journal_checks(snapshot, selected_sleeve_ids, code_identity, journal_store, journal_path))
     checks.extend(_order_status_checks(order_statuses))
     if check_bootstrap:
@@ -126,6 +132,46 @@ def build_runtime_preflight_report(
         sleeve_ids=selected_sleeve_ids,
         code_identity=code_identity,
         checks=tuple(checks),
+    )
+
+
+def _gateway_checks(snapshot: RuntimeConfigSnapshot, *, strict_live: bool) -> tuple[RuntimePreflightCheck, ...]:
+    market_data = snapshot.config.market_data
+    if market_data.provider != "kis-gateway":
+        return ()
+    base_url = market_data.gateway_base_url
+    if not base_url:
+        return (
+            RuntimePreflightCheck(
+                "kis_gateway_liveness",
+                "critical" if strict_live and snapshot.config.mode == "live" else "warning",
+                reason="missing_gateway_base_url",
+            ),
+        )
+    try:
+        health = fetch_kis_gateway_health(base_url, timeout_seconds=3.0)
+    except Exception as exc:  # noqa: BLE001 - preflight must report failures without raising.
+        return (
+            RuntimePreflightCheck(
+                "kis_gateway_liveness",
+                "critical" if strict_live and snapshot.config.mode == "live" else "warning",
+                reason=str(exc),
+                metadata={"base_url": base_url},
+            ),
+        )
+    status = str(health.get("status") or "").lower()
+    return (
+        RuntimePreflightCheck(
+            "kis_gateway_liveness",
+            "ok" if status == "ok" else ("critical" if strict_live and snapshot.config.mode == "live" else "warning"),
+            reason="" if status == "ok" else f"gateway_status={status or 'unknown'}",
+            metadata={
+                "base_url": base_url,
+                "server": health.get("server"),
+                "lane": health.get("lane"),
+                "counters": health.get("counters"),
+            },
+        ),
     )
 
 
@@ -187,6 +233,33 @@ def _route_checks(
             )
             checks.append(_path_parent_check("account_store_path", account_store_path, account_id, strict_live=strict_live))
             checks.append(_path_parent_check("order_store_path", order_store_path, account_id, strict_live=strict_live))
+    return tuple(checks)
+
+
+def _calendar_checks(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_ids: tuple[str, ...],
+    *,
+    generated_at: datetime,
+) -> tuple[RuntimePreflightCheck, ...]:
+    scopes: set[str] = set()
+    for sleeve_id in sleeve_ids:
+        sleeve = snapshot.config.sleeve(sleeve_id)
+        scopes.update(str(scope).strip().lower() for scope in sleeve.broker_account_routes.keys())
+    if not scopes:
+        scopes.add("domestic")
+    checks: list[RuntimePreflightCheck] = []
+    for scope in sorted(scope for scope in scopes if scope in {"domestic", "overseas"}):
+        report = session_report_for_market_scope(scope, now=generated_at)
+        status = "warning" if report.quality.status == "degraded" else "ok"
+        checks.append(
+            RuntimePreflightCheck(
+                "market_calendar",
+                status,
+                reason=";".join(report.quality.warnings),
+                metadata=report.to_dict(),
+            )
+        )
     return tuple(checks)
 
 

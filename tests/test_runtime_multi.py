@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
@@ -32,6 +32,18 @@ class FakeHistoryProvider:
         return []
 
 
+class DailyHistoryProvider:
+    def get_latest_bar(self, symbol):
+        return Bar(symbol, datetime(2026, 5, 9), 1, 1, 1, 1, 1)
+
+    def get_history(self, symbol, *, start=None, end=None):
+        base = datetime(2026, 1, 1)
+        return [
+            Bar(symbol, base + timedelta(days=index), 100 + index, 100 + index, 100 + index, 100 + index, 1000)
+            for index in range(100)
+        ]
+
+
 class FakeAlphaModel:
     alpha_id = "fake-alpha"
     version = "1.0"
@@ -59,6 +71,39 @@ class FakeAlphaLoader:
             version="1.0",
             path=path,
             content_hash="abc",
+        )
+
+
+class TemporalFeatureEchoAlphaModel:
+    alpha_id = "temporal-echo-alpha"
+    version = "1.0"
+
+    def generate(self, context):
+        symbol_key = context.symbol_keys[0]
+        rows = context.metadata_value(symbol_key, "rl_temporal_features")
+        return [
+            Insight(
+                sleeve_id=context.sleeve_id,
+                symbol=context.symbol(symbol_key),
+                direction=InsightDirection.UP,
+                generated_at=context.as_of,
+                source_snapshot_id=context.source_snapshot_id,
+                alpha_id=self.alpha_id,
+                alpha_version=self.version,
+                reason="temporal_echo",
+                metadata={"temporal_row_count": len(rows or [])},
+            )
+        ]
+
+
+class TemporalFeatureEchoAlphaLoader:
+    def load(self, path):
+        return SimpleNamespace(
+            model=TemporalFeatureEchoAlphaModel(),
+            alpha_id="temporal-echo-alpha",
+            version="1.0",
+            path=path,
+            content_hash="temporal",
         )
 
 
@@ -199,3 +244,40 @@ def test_multi_sleeve_runner_collects_union_market_snapshot_once(tmp_path):
     assert {item.worker.cycles[0].market_snapshot_id for item in report.reports} == {report.market_snapshot_id}
     assert report.framework_state["sleeve-a"]["saved"] is True
     assert report.framework_state["sleeve-b"]["saved"] is True
+
+
+def test_multi_sleeve_runner_enriches_temporal_features_before_framework(tmp_path):
+    universe_a = tmp_path / "universe_a.json"
+    universe_b = tmp_path / "universe_b.json"
+    config_path = tmp_path / "runtime.json"
+    _write_universe(universe_a, "universe-a", ["NVDA"])
+    _write_universe(universe_b, "universe-b", ["IBM"])
+    _write_multi_runtime_config(config_path, universe_a, universe_b)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["sleeves"][0]["indicators"]["warmup_enabled"] = True
+    payload["sleeves"][0]["portfolio"]["parameters"] = {
+        "feature_schema": "v2_temporal",
+        "lookback_window": 64,
+    }
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbol = Symbol("NVDA", "US")
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 150)})
+
+    report = run_multi_sleeve_once(
+        snapshot,
+        ("sleeve-a",),
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit_per_second: live_provider,
+            history_provider_factory=lambda: DailyHistoryProvider(),
+            alpha_loader=TemporalFeatureEchoAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+        ),
+        refresh_fine=False,
+        framework_state_dir=tmp_path / "framework-state",
+    )
+
+    insight = report.reports[0].framework.new_insight_batch.insights[0]
+    assert insight.metadata["temporal_row_count"] == 64

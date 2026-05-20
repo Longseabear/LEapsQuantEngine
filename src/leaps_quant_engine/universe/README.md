@@ -41,6 +41,20 @@ Runtime config can declare either the legacy single `universe.active.selection_m
 or a multi-model `universe.active.selection_models` list. The selected symbols
 remain attributable by `selection_id` for alpha input wiring and status reports.
 
+## Active Selection Cadence
+
+`universe.active.cadence` controls when active selection is refreshed:
+
+- `startup_only`: select during bootstrap and reuse until reload or forced refresh.
+- `once_per_day`: refresh once per calendar day.
+- interval aliases such as `every_5m` / `every_5_minutes`.
+
+The runtime stores the latest active universe in `RuntimeStateStore` under
+`engine-universe-selection / active_universe`. When a refresh is due,
+`RuntimeSleeveRuntime` rebuilds the active result and calls
+`BackgroundSnapshotWorker.update_universe(...)` at the cycle boundary. Selection
+models should remain deterministic; they do not own worker mutation directly.
+
 ## Forced Live Universe
 
 Selection models may rank or reject candidates, but the engine must force operational symbols back into the live universe:

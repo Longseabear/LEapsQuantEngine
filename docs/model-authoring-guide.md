@@ -300,12 +300,46 @@ Cadence fields are optional but recommended for non-intraday models:
 
 - `EVALUATION_CADENCE = "once_per_day"` keeps daily/swing alpha from being
   regenerated every minute. Existing insights remain active until expiry.
+- `EVALUATION_CADENCE = "daily_at 08:50 Asia/Seoul"` waits until the scheduled
+  wall-clock time before generating the day's alpha. Use this when the model
+  depends on pre-open confirmed daily features and should not run on an earlier
+  startup cycle.
 - `INPUT_RESOLUTION = "daily"` documents the expected snapshot resolution for
   reviewers and agents. Indicator update protection is enforced by the universe
   indicator definitions' `resolution` field.
 - Use `"every_cycle"` only for models that truly need live or intraday
   reassessment. Emergency exits should normally be handled by always-on risk or
   explicitly quote-resolution exit models rather than by a daily alpha loop.
+
+Portfolio cadence is configured in runtime config, not inside the portfolio
+model formula:
+
+```json
+{
+  "portfolio": {
+    "rebalance": {
+      "cadence": "week_start_at 08:55 Asia/Seoul"
+    }
+  }
+}
+```
+
+For patient entries, configure the execution model rather than hiding clock
+checks in alpha or portfolio code:
+
+```json
+{
+  "execution": {
+    "parameters": {
+      "buy_window": "09:05-14:50 Asia/Seoul",
+      "window_timezone": "Asia/Seoul"
+    }
+  }
+}
+```
+
+The standard execution model blocks new buy intents outside `buy_window` but
+does not block sells unless `sell_window` is explicitly configured.
 
 Important context fields:
 
@@ -348,6 +382,28 @@ optionally position. Runtime contexts expose a read-only `context.model_state`
 view; models may add an optional `state_patches(...)` method to request updates
 after their normal decision output is created.
 
+For JSON-object state, models can use the helper surface instead of constructing
+keys by hand:
+
+```python
+state = context.model_state.object_get(
+    model_id="trailing-stop",
+    namespace="trailing_stop",
+    symbol_key="KRX:005930",
+)
+patch = context.model_state.object_merge(
+    {"high_watermark_price": 84000},
+    model_id="trailing-stop",
+    namespace="trailing_stop",
+    symbol_key="KRX:005930",
+    reason="trailing_stop_mark",
+)
+```
+
+Use `object_set(...)` for full replacement, `object_merge(...)` for patch-style
+updates, and `object_delete(...)` when a position or model state should be
+cleared at a cycle boundary.
+
 Alpha example:
 
 ```python
@@ -386,6 +442,21 @@ Supported state hook shapes:
 - portfolio: `state_patches(context, targets)`
 - execution: `state_patches(context, orders)`
 - risk: return `RiskDecisionBatch(..., state_patches=(...))`
+
+Model-owned examples:
+
+- trailing stop high-watermark state
+- target smoothing or lerp anchors that are part of a strategy thesis
+- portfolio blend transition state when the engine blend layer is enabled
+- daily loss limit baseline and max-drawdown peak in opt-in risk models
+
+Core guard examples, not model state:
+
+- oversell prevention
+- cash/reserved quantity checks
+- unsupported broker routes or sessions
+- duplicate submit/idempotency checks
+- missing price validation
 
 The runtime commits patches only after a successful framework cycle and records
 patch/event counts in the framework result and cycle journal. Live loops must
@@ -539,8 +610,10 @@ Portfolio Blend notes:
   `missing_target_zero` bypass the blend for that symbol, so trailing stops,
   risk exits, and explicit old-only target exits are not delayed.
 - Retargeting during an active blend does not restart the blend clock. The
-  active transition keeps its original `started_at`, elapsed time, and deadline;
-  only the destination target vector is updated.
+  active transition keeps its original `started_at` and `deadline_at`; only the
+  destination target vector is updated. The engine records the retarget point as
+  `from_elapsed_minutes`, so a model's small percentage changes do not cause the
+  effective target to jump or extend the transition.
 - Reports and cycle output expose `portfolio_target_batch.metadata.portfolio_blend`
   with status, progress, transition id, elapsed minutes, duration, drift, and
   bypassed symbols.
@@ -582,6 +655,48 @@ as momentum, volatility, short returns, drawdown, rank score, and current
 exposure. This follows the portfolio-RL literature pattern of using attention to
 model cross-asset relationships while keeping the engine boundary unchanged:
 the RL model still emits only allocation percentages.
+
+State-aware RL schemas may add portfolio-local fields such as
+`current_weight` and `previous_target_weight`. Store those anchors through
+portfolio `StatePatch` records and read them back from `context.model_state`;
+do not write files from the model. If a policy needs deterministic turnover
+control, implement it inside the portfolio model as target smoothing or
+`max_target_turnover_pct`, then let risk/execution handle sizing and order
+lifecycle. Urgent FLAT/DOWN/stop exits should bypass smoothing-style delays.
+Keep the runtime observation shape compatible with the policy artifact; a
+lookback setting used for training warmup is not the same as exposing a full
+temporal tensor to the live portfolio model.
+
+Temporal RL policies must use an explicit temporal schema. In LEaps this is
+`feature_schema=v2_temporal`, whose training observation shape is
+`[lookback_window, top_k, feature_dim]`. The temporal extractor attends across
+both time and candidate rank, with point-in-time features built only from bars
+available through the decision date. The runtime now has a
+`TemporalFeatureWindowProvider` that attaches those daily windows to
+`SnapshotContext` metadata when the portfolio config uses a temporal
+`feature_schema`. Alpha models that want temporal PPO must copy
+`context.metadata_value(symbol_key, "rl_temporal_features")` into each emitted
+UP insight's metadata. Do not emulate a temporal model at runtime by repeating
+the latest top-k token. Runtime temporal PPO must also stay alpha-gated:
+Portfolio construction only builds temporal tokens from active UP insights that
+carry an explicit `rl_temporal_features` window in metadata. A missing alpha
+signal, or an alpha signal without that feature window, must not let PPO scan
+the universe and create a fresh buy target on its own.
+
+Temporal windows are different from indicator warmup. Warmup prepares the
+current SMA/momentum/ATR values; the temporal feature provider prepares a
+historical tensor such as the last 64 confirmed daily rows. Backtests should use
+`--warmup-start` far enough before `--start` for both requirements. Minute
+replay still gets temporal PPO windows from the daily history provider; minute
+bars do not advance the daily temporal window.
+
+When raw momentum over-selects high-beta jumpers, prefer a separate schema over
+silently changing an existing policy's observation semantics. LEaps uses
+`feature_schema=v2_temporal_residual` for this research path: it adds residual
+momentum, market beta, and trend-quality fields, ranks candidates with
+volatility/drawdown penalties, and reserves a small large-cap core bucket before
+PPO allocation. This keeps the alpha/ranking decision explicit and lets old
+`v2_temporal` artifacts remain reproducible.
 
 When an RL constructor is used as a complete target portfolio allocator, set
 `emit_zero_for_missing_held_targets=true`. In that mode, if the model has an
@@ -769,6 +884,11 @@ Notes:
   `00`, `market/day` to `01`, `limit/ioc` to `11`, `limit/fok` to `12`,
   `market/ioc` to `13`, and `market/fok` to `14`. Keep broker-specific codes
   out of strategy models; set `order_type` and `time_in_force` instead.
+- Domestic live broker submission defaults to KIS `exchange_scope=SOR` so the
+  broker can route Korean orders across supported venues. A model should leave
+  this unset for normal operation. Only set `exchange_scope`, `venue_policy`, or
+  related venue metadata when the strategy intentionally wants `KRX` or `NXT`
+  for a tested venue-specific reason.
 - Execution models may choose market, limit, and slicing policy, but broker
   capability checks are core guards. KIS routes are whole-share only in v0.
   Domestic KRX limit prices are rounded to the KRX tick grid at broker-submit
@@ -778,6 +898,11 @@ Notes:
   The domestic preset includes a 2026 sell-side securities transaction tax
   component and broker commission. Fill events record `fee`, `commission`,
   `taxes`, and `fee_model` metadata.
+- Live execution-history sync uses actual KIS/broker cost fields when present.
+  Realized `VirtualFillEvent.fee` is the amount applied to sleeve cash, and
+  `metadata.transaction_costs` keeps fee/commission/tax/regulatory breakdowns.
+  Strategy models should never replace actual broker costs with simulated
+  estimates.
 - Market/session checks belong in the order guard, not alpha/portfolio/risk.
   Confirmed live broker-engine submit can require a normalized
   `MarketSession`; non-orderable phases should block order submission before

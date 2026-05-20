@@ -4,8 +4,8 @@ import pytest
 
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
-from leaps_quant_engine.market_data_snapshot import MarketDataSnapshot, MarketDataSnapshotEngine
-from leaps_quant_engine.models import Bar, Symbol
+from leaps_quant_engine.market_data_snapshot import FileMarketDataSnapshotStore, MarketDataSnapshot, MarketDataSnapshotEngine
+from leaps_quant_engine.models import Bar, DataResolution, Symbol
 from leaps_quant_engine.snapshots import SnapshotFreshnessPolicy, SnapshotQualityStatus
 from leaps_quant_engine.universe.loader import parse_universe_definition
 
@@ -36,9 +36,9 @@ class BestEffortProvider:
         return []
 
 
-def _bar(symbol: Symbol, minute: int, close: float) -> Bar:
+def _bar(symbol: Symbol, minute: int, close: float, *, resolution: str = DataResolution.LIVE.value) -> Bar:
     time = datetime(2026, 5, 7, 9, 0) + timedelta(minutes=minute)
-    return Bar(symbol, time, close, close, close, close, 100)
+    return Bar(symbol, time, close, close, close, close, 100, resolution=resolution)
 
 
 def test_market_data_snapshot_engine_collects_updates_and_publishes_indicator_snapshot():
@@ -73,7 +73,7 @@ def test_market_data_snapshot_engine_collects_updates_and_publishes_indicator_sn
 
 def test_market_data_snapshot_can_feed_indicator_engine_without_provider():
     symbol = Symbol("005930", "KRX")
-    snapshot = MarketDataSnapshot.from_bars({symbol.key: _bar(symbol, 0, 10)}, source="minute-replay")
+    snapshot = MarketDataSnapshot.from_bars({symbol.key: _bar(symbol, 0, 10, resolution=DataResolution.MINUTE.value)}, source="minute-replay")
 
     data_slice = snapshot.as_data_slice()
 
@@ -81,6 +81,62 @@ def test_market_data_snapshot_can_feed_indicator_engine_without_provider():
     assert data_slice.get(symbol).close == 10
     with pytest.raises(TypeError):
         snapshot.bars[symbol.key] = _bar(symbol, 1, 20)
+
+
+def test_market_data_snapshot_rejects_mixed_resolution_lanes():
+    symbol = Symbol("005930", "KRX")
+    other = Symbol("000660", "KRX")
+
+    with pytest.raises(ValueError, match="cannot mix resolution lanes"):
+        MarketDataSnapshot.from_bars(
+            {
+                symbol.key: Bar(symbol, datetime(2026, 5, 7), 10, 10, 10, 10, resolution=DataResolution.DAILY.value),
+                other.key: Bar(other, datetime(2026, 5, 7, 9, 0), 20, 20, 20, 20, resolution=DataResolution.MINUTE.value),
+            },
+            source="mixed",
+        )
+
+
+def test_file_market_data_snapshot_store_round_trips_latest_record(tmp_path):
+    symbol = Symbol("005930", "KRX")
+    store = FileMarketDataSnapshotStore(tmp_path / "snapshots.jsonl")
+    snapshot = MarketDataSnapshot.from_bars({symbol.key: _bar(symbol, 0, 10, resolution=DataResolution.DAILY.value)}, source="kis-gateway")
+
+    store.append(snapshot, metadata={"runtime_id": "live"})
+    latest = store.latest()
+
+    assert latest is not None
+    assert latest.snapshot.lane == "daily_confirmed"
+    assert latest.snapshot.snapshot_id == snapshot.snapshot_id
+    assert latest.snapshot.bars[symbol.key].close == 10
+    assert latest.metadata == {"runtime_id": "live"}
+
+
+def test_file_market_data_snapshot_store_filters_latest_by_lane(tmp_path):
+    symbol = Symbol("005930", "KRX")
+    store = FileMarketDataSnapshotStore(tmp_path / "snapshots.jsonl")
+    daily = MarketDataSnapshot.from_bars({symbol.key: _bar(symbol, 0, 10, resolution=DataResolution.DAILY.value)}, source="daily")
+    quote = MarketDataSnapshot.from_bars(
+        {
+            symbol.key: Bar(
+                symbol,
+                datetime(2026, 5, 7, 9, 1),
+                11,
+                11,
+                11,
+                11,
+                resolution=DataResolution.LIVE.value,
+            )
+        },
+        source="quote",
+    )
+
+    store.append(daily)
+    store.append(quote)
+
+    assert store.latest().snapshot.lane == "quote"
+    assert store.latest(lane="daily").snapshot.snapshot_id == daily.snapshot_id
+    assert store.latest(lane="quote").snapshot.snapshot_id == quote.snapshot_id
 
 
 def test_market_data_snapshot_engine_best_effort_reports_symbol_failures():

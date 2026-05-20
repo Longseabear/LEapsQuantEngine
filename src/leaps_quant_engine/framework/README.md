@@ -93,6 +93,19 @@ patches at the end of a successful cycle when a runtime state store is attached.
 Without a store, stateless models behave unchanged and emitted patches are only
 visible in the framework result.
 
+For simple JSON state, prefer the helper surface on `RuntimeModelStateView`:
+
+- `object_get(...)`
+- `object_entries(...)`
+- `object_set(...)`
+- `object_merge(...)`
+- `object_delete(...)`
+
+State ownership is deliberately narrow. Trailing stop high watermarks,
+portfolio blend/lerp anchors, daily loss baselines, and drawdown peaks are model
+state. Oversell prevention, cash reservation, unsupported routes, unsupported
+sessions, idempotency, and missing prices are core guards.
+
 ## Risk
 
 Risk receives portfolio targets and returns decisions:
@@ -108,6 +121,14 @@ The current `BasicRiskManagementModel` supports:
 - portfolio-level gross exposure clamp
 - available-cash clamp
 - snapshot quality entry gate
+
+Opt-in example models also exist:
+
+- `DailyLossLimitRiskModel`
+- `MaxDrawdownRiskModel`
+
+They demonstrate model-owned circuit breaker state through `RuntimeStateStore`.
+They are not always-on engine guards; a sleeve must configure them explicitly.
 
 Risk should run every framework cycle, even if alpha emits no new insights.
 

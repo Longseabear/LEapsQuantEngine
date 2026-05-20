@@ -2,8 +2,8 @@ param(
     [string]$Config = "configs/runtime/live_multi_sleeve.json",
     [string[]]$SleeveIds = @("LEaps", "us_etf_rotation"),
     [int]$IntervalSeconds = 60,
-    [double]$DomesticMaxSubmitNotional = 12000000,
-    [double]$OverseasMaxSubmitNotional = 2500,
+    [Nullable[double]]$DomesticMaxSubmitNotional = $null,
+    [Nullable[double]]$OverseasMaxSubmitNotional = $null,
     [string]$OrderBatchOutput = "data/runtime/live-order-loop/multi_sleeve_candidate_orders.json",
     [string]$Journal = "data/cycle-journal/live_multi_sleeve.jsonl",
     [string]$LogPath = "data/runtime/live-order-loop/multi_sleeve.log",
@@ -14,7 +14,7 @@ param(
     [string]$ActiveSleevesPath = "data/runtime/live-order-loop/multi_sleeve_active_sleeves.json",
     [string]$HotReload = "true",
     [string[]]$SleeveSchedules = @(
-        "LEaps|Korea Standard Time|08:30-18:30",
+        "LEaps|Korea Standard Time|09:00-18:30",
         "us_etf_rotation|Eastern Standard Time|09:30-16:00"
     ),
     [string]$SkipReconcile = "true",
@@ -59,6 +59,7 @@ $script:Config = $Config
 $script:SleeveIds = @(Normalize-SleeveIds -Items $SleeveIds)
 $script:Paused = $false
 $script:ShutdownRequested = $false
+$script:LastRunAtBySleeve = @{}
 $hotReloadEnabled = $HotReload -notmatch '^(false|0|no)$'
 
 $logFullPath = Resolve-LoopPath $LogPath
@@ -87,6 +88,14 @@ function Write-LoopLog {
 function Test-FlagEnabled {
     param([string]$Value)
     return $Value -notmatch '^(false|0|no)$'
+}
+
+function Format-SubmitNotionalCap {
+    param([Nullable[double]]$Value)
+    if ($null -eq $Value) {
+        return "none"
+    }
+    return "$Value"
 }
 
 function Add-SleeveArgs {
@@ -204,17 +213,36 @@ function Test-SleeveScheduledNow {
 function Get-ScheduledSleeveIds {
     $scheduled = @()
     $skipped = @()
+    $nowUtc = (Get-Date).ToUniversalTime()
     foreach ($sleeveId in $script:SleeveIds) {
         $status = Test-SleeveScheduledNow -SleeveId $sleeveId
-        if ($status.active) {
-            $scheduled += $sleeveId
-        } else {
+        if (-not $status.active) {
             $skipped += "$sleeveId($($status.reason) market_time=$($status.market_time))"
+            continue
         }
+        $cadenceSeconds = Get-SleeveCycleIntervalSeconds -SleeveId $sleeveId
+        $lastRun = $script:LastRunAtBySleeve[$sleeveId]
+        if ($null -ne $lastRun -and $cadenceSeconds -gt 0) {
+            $elapsedSeconds = ($nowUtc - [datetime]$lastRun).TotalSeconds
+            if ($elapsedSeconds -lt $cadenceSeconds) {
+                $remainingSeconds = [math]::Ceiling($cadenceSeconds - $elapsedSeconds)
+                $skipped += "$sleeveId(cadence_wait:${remainingSeconds}s interval=${cadenceSeconds}s)"
+                continue
+            }
+        }
+        $scheduled += $sleeveId
     }
     return [pscustomobject]@{
         sleeve_ids = @($scheduled)
         skipped = @($skipped)
+    }
+}
+
+function Mark-SleevesRan {
+    param([string[]]$SleeveIdsForRun)
+    $nowUtc = (Get-Date).ToUniversalTime()
+    foreach ($sleeveId in @($SleeveIdsForRun)) {
+        $script:LastRunAtBySleeve[$sleeveId] = $nowUtc
     }
 }
 
@@ -236,6 +264,33 @@ function Get-ConfigSleeveIds {
         }
     }
     return @($ids)
+}
+
+function Get-SleeveCycleIntervalSeconds {
+    param([string]$SleeveId)
+    $configFullPath = Resolve-LoopPath $script:Config
+    try {
+        $payload = Get-Content -Path $configFullPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($sleeve in @($payload.sleeves)) {
+            $id = [string]$sleeve.sleeve_id
+            if (-not $id) {
+                $id = [string]$sleeve.id
+            }
+            if ($id -ne $SleeveId) {
+                continue
+            }
+            if ($null -ne $sleeve.worker -and $null -ne $sleeve.worker.cycle_interval_seconds) {
+                $value = [double]$sleeve.worker.cycle_interval_seconds
+                if ($value -gt 0) {
+                    return $value
+                }
+            }
+            return [double]$IntervalSeconds
+        }
+    } catch {
+        Write-LoopLog "cadence config lookup failed sleeve=$SleeveId config=$script:Config error=$($_.Exception.Message)"
+    }
+    return [double]$IntervalSeconds
 }
 
 function Test-ActiveSleeveSet {
@@ -548,22 +603,94 @@ function Save-SubmitState {
 
 function Get-SubmitReportStatus {
     param([object[]]$SubmitOutput)
+    $summary = Get-SubmitReportSummary -SubmitOutput $SubmitOutput
+    return [string]$summary.status
+}
+
+function Get-JsonInt {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+    if ($null -eq $Object) {
+        return 0
+    }
+    if ($Object.PSObject.Properties.Name -notcontains $Name) {
+        return 0
+    }
+    try {
+        return [int]$Object.$Name
+    } catch {
+        return 0
+    }
+}
+
+function Add-SubmitReportCounts {
+    param(
+        [hashtable]$Summary,
+        [object]$Report
+    )
+    if ($null -eq $Report) {
+        return
+    }
+    $orchestration = $Report.orchestration
+    $Summary.ticket_count += Get-JsonInt -Object $orchestration -Name "ticket_count"
+    $Summary.rejected_event_count += Get-JsonInt -Object $orchestration -Name "rejected_event_count"
+}
+
+function Get-SubmitReportSummary {
+    param([object[]]$SubmitOutput)
+    $summary = @{
+        status = ""
+        ticket_count = 0
+        rejected_event_count = 0
+    }
     if ($null -eq $SubmitOutput -or $SubmitOutput.Count -eq 0) {
-        return ""
+        return [pscustomobject]$summary
     }
     $text = ($SubmitOutput | ForEach-Object { [string]$_ }) -join "`n"
     $start = $text.IndexOf("{")
     $end = $text.LastIndexOf("}")
     if ($start -lt 0 -or $end -lt $start) {
-        return ""
+        return [pscustomobject]$summary
     }
     try {
         $payload = $text.Substring($start, $end - $start + 1) | ConvertFrom-Json
-        return [string]$payload.status
+        $summary.status = [string]$payload.status
+        if ($payload.PSObject.Properties.Name -contains "routes") {
+            foreach ($route in @($payload.routes)) {
+                Add-SubmitReportCounts -Summary $summary -Report $route
+            }
+        } else {
+            Add-SubmitReportCounts -Summary $summary -Report $payload
+        }
     } catch {
         Write-LoopLog "submit status parse failed: $($_.Exception.Message)"
-        return ""
     }
+    return [pscustomobject]$summary
+}
+
+function Test-SubmitStateShouldSave {
+    param(
+        [int]$SubmitExit,
+        [int]$OrderCount,
+        [object]$SubmitSummary
+    )
+    if ($SubmitExit -ne 0 -or $OrderCount -le 0) {
+        return $false
+    }
+    if ($SubmitSummary.status -notin @("submitted", "submitted_with_warnings", "ok")) {
+        return $false
+    }
+    if ($SubmitSummary.ticket_count -le 0) {
+        Write-LoopLog "submit state not saved: no broker tickets created"
+        return $false
+    }
+    if ($SubmitSummary.ticket_count -gt 0 -and $SubmitSummary.rejected_event_count -ge $SubmitSummary.ticket_count) {
+        Write-LoopLog "submit state not saved: all broker tickets rejected ticket_count=$($SubmitSummary.ticket_count) rejected_event_count=$($SubmitSummary.rejected_event_count)"
+        return $false
+    }
+    return $true
 }
 
 function Invoke-OrderRuntimeSupervise {
@@ -592,13 +719,15 @@ function Invoke-OrderRuntimeSupervise {
     if (Test-FlagEnabled -Value $ExpireDayOpenTickets) {
         $superviseArgs += "--expire-day-open-tickets"
     }
-    py @superviseArgs 2>&1 | Out-File -FilePath $logFullPath -Append -Encoding utf8
-    Write-LoopLog "$Phase order-runtime-supervise exit=$LASTEXITCODE"
+    $safePhase = ([string]$Phase) -replace '[^a-zA-Z0-9_-]', '_'
+    $superviseOutputPath = Join-Path (Split-Path -Parent $logFullPath) "multi_sleeve_${safePhase}_supervise_latest.json"
+    py @superviseArgs 2>&1 | Set-Content -Path $superviseOutputPath -Encoding utf8
+    Write-LoopLog "$Phase order-runtime-supervise exit=$LASTEXITCODE output=$superviseOutputPath"
 }
 
 Initialize-ActiveSleeveState
 
-Write-LoopLog "multi-sleeve live order loop started config=$script:Config sleeves=$($script:SleeveIds -join ',') interval=${IntervalSeconds}s domestic_max=$DomesticMaxSubmitNotional overseas_max=$OverseasMaxSubmitNotional framework_state_dir=$FrameworkStateDir runtime_state=$runtimeStateFullPath hot_reload=$hotReloadEnabled control_queue=$controlQueueFullPath active_sleeves=$activeSleevesFullPath schedules=$($SleeveSchedules -join ';')"
+Write-LoopLog "multi-sleeve live order loop started config=$script:Config sleeves=$($script:SleeveIds -join ',') interval=${IntervalSeconds}s domestic_max=$(Format-SubmitNotionalCap $DomesticMaxSubmitNotional) overseas_max=$(Format-SubmitNotionalCap $OverseasMaxSubmitNotional) framework_state_dir=$FrameworkStateDir runtime_state=$runtimeStateFullPath hot_reload=$hotReloadEnabled control_queue=$controlQueueFullPath active_sleeves=$activeSleevesFullPath schedules=$($SleeveSchedules -join ';')"
 Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath submit_state=$submitStateFullPath"
 $cycleIndex = 0
 
@@ -635,9 +764,13 @@ while ($true) {
                 "--runtime-state", $runtimeStateFullPath,
                 "--summary-only"
             ) -SleeveIdsForArgs $scheduledSleeveIds
-            py @runArgs 2>&1 | Out-File -FilePath $logFullPath -Append -Encoding utf8
+            $runOutputPath = Join-Path (Split-Path -Parent $logFullPath) "multi_sleeve_runtime_run_latest.json"
+            py @runArgs 2>&1 | Set-Content -Path $runOutputPath -Encoding utf8
             $runExit = $LASTEXITCODE
-            Write-LoopLog "runtime-run-multi-once exit=$runExit sleeves=$($scheduledSleeveIds -join ',')"
+            Write-LoopLog "runtime-run-multi-once exit=$runExit sleeves=$($scheduledSleeveIds -join ',') output=$runOutputPath"
+            if ($runExit -eq 0) {
+                Mark-SleevesRan -SleeveIdsForRun $scheduledSleeveIds
+            }
         }
 
         if ($runExit -eq 0 -and $scheduledSleeveIds.Count -gt 0) {
@@ -668,22 +801,32 @@ while ($true) {
                     "--commit",
                     "--confirm-live-submit",
                     "--summary-only",
-                    "--poll-after-submit",
-                    "--max-submit-notional-by-account", "kis-domestic=$DomesticMaxSubmitNotional",
-                    "--max-submit-notional-by-account", "domestic=$DomesticMaxSubmitNotional",
-                    "--max-submit-notional-by-account", "kis-overseas=$OverseasMaxSubmitNotional",
-                    "--max-submit-notional-by-account", "overseas=$OverseasMaxSubmitNotional"
+                    "--poll-after-submit"
                 ) -SleeveIdsForArgs $scheduledSleeveIds
+                if ($null -ne $DomesticMaxSubmitNotional) {
+                    $submitArgs += @(
+                        "--max-submit-notional-by-account", "kis-domestic=$DomesticMaxSubmitNotional",
+                        "--max-submit-notional-by-account", "domestic=$DomesticMaxSubmitNotional"
+                    )
+                }
+                if ($null -ne $OverseasMaxSubmitNotional) {
+                    $submitArgs += @(
+                        "--max-submit-notional-by-account", "kis-overseas=$OverseasMaxSubmitNotional",
+                        "--max-submit-notional-by-account", "overseas=$OverseasMaxSubmitNotional"
+                    )
+                }
                 if ($orderCount -gt 0) {
                     $submitArgs += "--notify"
                     $notifyThisCycle = $true
                 }
                 $submitOutput = py @submitArgs 2>&1
-                $submitOutput | Out-File -FilePath $logFullPath -Append -Encoding utf8
+                $submitOutputPath = Join-Path (Split-Path -Parent $logFullPath) "multi_sleeve_submit_latest.json"
+                $submitOutput | Set-Content -Path $submitOutputPath -Encoding utf8
                 $submitExit = $LASTEXITCODE
-                $submitStatus = Get-SubmitReportStatus -SubmitOutput $submitOutput
-                Write-LoopLog "order-runtime-submit exit=$submitExit status=$submitStatus"
-                if ($submitExit -eq 0 -and $orderCount -gt 0 -and $submitStatus -in @("submitted", "submitted_with_warnings", "ok")) {
+                $submitSummary = Get-SubmitReportSummary -SubmitOutput $submitOutput
+                $submitStatus = [string]$submitSummary.status
+                Write-LoopLog "order-runtime-submit exit=$submitExit status=$submitStatus ticket_count=$($submitSummary.ticket_count) rejected_event_count=$($submitSummary.rejected_event_count) output=$submitOutputPath"
+                if (Test-SubmitStateShouldSave -SubmitExit $submitExit -OrderCount $orderCount -SubmitSummary $submitSummary) {
                     Save-SubmitState -Today $today -BatchHash $batchHash -OrderCount $orderCount -SubmittedSleeveIds $scheduledSleeveIds
                     Write-LoopLog "submit state saved order_count=$orderCount batch_hash=$batchHash"
                 } elseif ($orderCount -gt 0) {

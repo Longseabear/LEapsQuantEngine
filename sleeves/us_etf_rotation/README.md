@@ -8,6 +8,12 @@ Runtime config:
 configs/runtime/us_etf_rotation_sleeve.json
 ```
 
+Operator notes:
+
+```text
+sleeves/us_etf_rotation/OPERATING_NOTES.md
+```
+
 The sleeve uses:
 
 ```text

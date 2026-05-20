@@ -173,6 +173,22 @@ def test_alpha_runtime_skips_once_per_day_model_after_first_run_same_day():
     assert daily.seen_symbol_keys == ("KRX:005930",)
 
 
+def test_alpha_runtime_daily_at_waits_until_scheduled_time():
+    daily = SymbolEchoAlpha("daily-alpha")
+    daily.evaluation_cadence = "daily_at 08:50 Asia/Seoul"
+    before = SnapshotContext.from_indicator_snapshot(_snapshot_at(datetime(2026, 5, 18, 8, 49)))
+    due = SnapshotContext.from_indicator_snapshot(_snapshot_at(datetime(2026, 5, 18, 8, 50)))
+    runtime = AlphaRuntime(active_models=(daily,))
+
+    skipped = runtime.run(before)
+    ran = runtime.run(due)
+
+    assert skipped.insight_count == 0
+    assert skipped.metadata["skipped_alpha_ids"] == ["daily-alpha"]
+    assert ran.insight_count == 1
+    assert ran.metadata["ran_alpha_ids"] == ["daily-alpha"]
+
+
 def test_alpha_runtime_skips_once_per_month_model_until_next_month():
     monthly = SymbolEchoAlpha("monthly-alpha")
     monthly.evaluation_cadence = "once_per_month"

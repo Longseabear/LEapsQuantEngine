@@ -9,8 +9,10 @@ description = "LEAN-style dynamic quant engine with sleeve-aware portfolio orche
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.117.0",
   "python-dotenv>=1.0.1",
   "requests>=2.32.0",
+  "uvicorn>=0.37.0",
 ]
 
 [project.scripts]

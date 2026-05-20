@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import importlib.util
+import json
 from pathlib import Path
 import sys
+from typing import Any
+
+import pytest
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.alpha import SnapshotContext
-from leaps_quant_engine.framework import PortfolioConstructionContext
+from leaps_quant_engine.framework import PortfolioAllocationTarget, PortfolioConstructionContext
 from leaps_quant_engine.framework.risk import RiskManagementContext
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, PortfolioTarget, Symbol
@@ -40,15 +44,33 @@ def test_kospi_conviction_alpha_emits_krw_growth_only():
     assert insights[0].metadata["market_breadth"] == 1.0
     assert insights[0].metadata["market_conviction_bonus"] > 0
     assert insights[0].metadata["recency_weighted_momentum"] > 0
-    assert insights[0].metadata["sector_relative_strength"] > 0
+    assert "sector_relative_strength" not in insights[0].metadata
     assert insights[0].metadata["entry_timing_setup"] in {"trend", "pullback", "rebreak"}
     assert insights[0].reason == "kospi_conviction_breadth_trend_momentum"
 
 
-def test_leaps_live_alphas_run_every_cycle():
+def test_kospi_conviction_alpha_omits_sector_bonus_metadata():
+    module = _load("sleeves/LEaps/alphas/kospi_conviction.py")
+    now = datetime(2026, 5, 8)
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:011070": _values(close=100_000, fast=112_000, slow=90_000, momentum=0.30, momentum_5=0.10, vol=0.05),
+        },
+    )
+
+    insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:011070",)))
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:011070"]
+    assert "sector" not in insights[0].metadata
+    assert "sector_relative_strength" not in insights[0].metadata
+
+
+def test_leaps_live_alphas_use_patient_alpha_fast_risk_cadences():
     alpha_paths = (
         "sleeves/LEaps/alphas/kospi_conviction.py",
         "sleeves/LEaps/alphas/kospi_pullback_reversion.py",
+        "sleeves/LEaps/alphas/kospi_swing_rebalance.py",
         "sleeves/LEaps/alphas/krx_etf_safety.py",
         "sleeves/LEaps/alphas/volatility_trailing_stop.py",
     )
@@ -59,11 +81,91 @@ def test_leaps_live_alphas_run_every_cycle():
     }
 
     assert cadences == {
-        "sleeves/LEaps/alphas/kospi_conviction.py": "every_cycle",
-        "sleeves/LEaps/alphas/kospi_pullback_reversion.py": "every_cycle",
-        "sleeves/LEaps/alphas/krx_etf_safety.py": "every_cycle",
+        "sleeves/LEaps/alphas/kospi_conviction.py": "every_15_minutes",
+        "sleeves/LEaps/alphas/kospi_pullback_reversion.py": "every_15_minutes",
+        "sleeves/LEaps/alphas/kospi_swing_rebalance.py": "every_15_minutes",
+        "sleeves/LEaps/alphas/krx_etf_safety.py": "every_5_minutes",
         "sleeves/LEaps/alphas/volatility_trailing_stop.py": "every_cycle",
     }
+
+
+def test_leaps_live_config_reviews_portfolio_slowly_and_runs_worker_fast():
+    payload = json.loads((ROOT / "configs/runtime/live_multi_sleeve.json").read_text(encoding="utf-8"))
+    sleeve = next(item for item in payload["sleeves"] if item["sleeve_id"] == "LEaps")
+    portfolio = sleeve["portfolio"]
+
+    assert portfolio["rebalance"]["cadence"] == "every_30_minutes"
+    assert portfolio["parameters"]["entry_top_n"] == 10
+    assert portfolio["parameters"]["hold_top_n"] == 75
+    assert portfolio["parameters"]["trim_top_n"] == 110
+    assert portfolio["parameters"]["max_positions"] == 6
+    assert portfolio["parameters"]["min_holding_days"] == 10
+    assert portfolio["parameters"]["target_drift_threshold_pct"] == 0.08
+    assert portfolio["parameters"]["reentry_cooldown_days"] == 3
+    assert portfolio["parameters"]["score_normalization_enabled"] is True
+    assert portfolio["parameters"]["regime_alpha_weighting_enabled"] is True
+    assert portfolio["parameters"]["missing_target_exit_confirmation_cycles"] == 8
+    assert portfolio["parameters"]["hard_exit_cooldown_days"] == 7
+    assert portfolio["parameters"]["reduce_half_cooldown_days"] == 3
+    assert portfolio["parameters"]["add_requires_entry_band"] is True
+    assert portfolio["parameters"]["add_requires_unrealized_profit"] is True
+    assert portfolio["parameters"]["max_target_turnover_pct"] == 0.02
+    assert portfolio["parameters"]["daily_turnover_budget_pct"] == 0.035
+    assert sleeve["worker"]["cycle_interval_seconds"] == 10
+
+
+def test_leaps_growth_alphas_pass_through_temporal_feature_windows():
+    now = datetime(2026, 5, 14)
+    symbol_key = "KRX:005930"
+    temporal_rows = [{"selected_flag": 1.0, "momentum_20": 0.10 + index * 0.001} for index in range(64)]
+    cases = []
+
+    conviction_values = _values(
+        close=268_500,
+        fast=247_000,
+        slow=224_000,
+        momentum=0.27,
+        momentum_5=0.18,
+        vol=0.07,
+    )
+    cases.append(("sleeves/LEaps/alphas/kospi_conviction.py", conviction_values))
+
+    pullback_values = _values(
+        close=100_000,
+        fast=103_000,
+        slow=92_000,
+        momentum=0.16,
+        momentum_5=-0.025,
+        vol=0.06,
+        rolling_high=106_000,
+        rolling_low=96_000,
+    )
+    cases.append(("sleeves/LEaps/alphas/kospi_pullback_reversion.py", pullback_values))
+
+    swing_values = _values(
+        close=100_000,
+        fast=99_000,
+        slow=90_000,
+        momentum=0.12,
+        momentum_5=0.025,
+        vol=0.05,
+        rolling_high=104_000,
+    )
+    swing_values["sma_10_close"] = 98_000
+    cases.append(("sleeves/LEaps/alphas/kospi_swing_rebalance.py", swing_values))
+
+    for module_path, values in cases:
+        module = _load(module_path)
+        snapshot = _snapshot(
+            now,
+            {symbol_key: values},
+            symbol_metadata={symbol_key: {"rl_temporal_features": temporal_rows}},
+        )
+        insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols((symbol_key,)))
+        up_insights = [insight for insight in insights if insight.direction is InsightDirection.UP]
+
+        assert up_insights, module_path
+        assert up_insights[0].metadata["rl_temporal_features"] == temporal_rows
 
 
 def test_volatility_trailing_stop_uses_model_state_high_watermark():
@@ -164,9 +266,162 @@ def test_volatility_trailing_stop_does_not_replace_seeded_high_watermark_with_ro
 def test_leaps_rl_constructor_can_be_configured_as_complete_target_portfolio():
     module = _load("sleeves/LEaps/portfolios/rl_ppo_constructor.py")
 
-    model = module.create_portfolio_model({"emit_zero_for_missing_held_targets": True})
+    model = module.create_portfolio_model({"emit_zero_for_missing_held_targets": True, "policy_device": "cuda"})
 
     assert model.emit_zero_for_missing_held_targets is True
+    assert model.policy_device == "cuda"
+
+
+def test_leaps_rl_v2_observation_uses_state_aligned_features():
+    from leaps_quant_engine.rl.portfolio_constructor import _observation_from_insights
+
+    now = datetime(2026, 5, 14)
+    symbol = Symbol("005930", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="rl-portfolio-constructor",
+                    namespace="target_anchor",
+                    symbol_key=symbol.key,
+                ),
+                value={"target_percent": 0.25},
+                reason="seed_previous_target",
+            ),
+        )
+    )
+    portfolio = Portfolio(cash=7_000_000, cash_by_currency={"KRW": 7_000_000})
+    portfolio.holdings[symbol.key] = Holding(symbol, quantity=10, average_price=90_000)
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1_000_000)}),
+        portfolio=portfolio,
+        active_insights=(),
+        managed_symbols=(),
+        model_state=state_view,
+    )
+    insight = Insight(
+        sleeve_id="LEaps",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=now,
+        expires_at=now + timedelta(days=3),
+        source_snapshot_id="test",
+        alpha_id="leaps-kospi-conviction",
+        alpha_version="0.1.0",
+        confidence=0.8,
+        score=0.42,
+        metadata={
+            "momentum": 0.20,
+            "momentum_5": 0.05,
+            "return_1": 0.01,
+            "drawdown_20": 0.03,
+            "volatility": 0.07,
+        },
+    )
+
+    observation = _observation_from_insights(
+        context,
+        [insight],
+        currency="KRW",
+        top_k=2,
+        feature_schema="v2_state",
+    )
+
+    assert observation.shape == (2, 10)
+    assert observation[0, 0] == 1.0
+    assert abs(observation[0, 1] - 0.20) < 1e-6
+    assert abs(observation[0, 3] - 0.05) < 1e-6
+    assert abs(observation[0, 4] - 0.01) < 1e-6
+    assert abs(observation[0, 5] - 0.03) < 1e-6
+    assert abs(observation[0, 7] - 0.125) < 1e-6
+    assert abs(observation[0, 8] - 0.25) < 1e-6
+    assert abs(observation[0, 9] - 0.125) < 1e-6
+    assert observation[1].sum() == 0.0
+
+
+def test_leaps_rl_v2_constructor_persists_target_anchor_without_smoothing():
+    from leaps_quant_engine.rl import ReinforcementLearningPortfolioConstructionModel
+
+    now = datetime(2026, 5, 14)
+    symbol = Symbol("005930", "KRX")
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1_000_000)}),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(),
+        managed_symbols=(),
+        model_state=RuntimeModelStateView(InMemoryRuntimeStateStore(), default_sleeve_id="LEaps"),
+    )
+    model = ReinforcementLearningPortfolioConstructionModel(feature_schema="v2_state")
+
+    patches = model.state_patches(
+        context,
+        (PortfolioAllocationTarget(symbol=symbol, target_percent=0.31, tag="test"),),
+    )
+
+    assert len(patches) == 1
+    assert patches[0].key.model_id == "rl-portfolio-constructor"
+    assert patches[0].key.namespace == "target_anchor"
+    assert patches[0].key.symbol_key == symbol.key
+    assert patches[0].value["target_percent"] == 0.31
+
+
+def test_leaps_rl_constructor_caps_target_turnover_after_smoothing():
+    from leaps_quant_engine.rl import ReinforcementLearningPortfolioConstructionModel
+
+    now = datetime(2026, 5, 14)
+    samsung = Symbol("005930", "KRX")
+    hynix = Symbol("000660", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="rl-portfolio-constructor",
+                    namespace="target_anchor",
+                    symbol_key=samsung.key,
+                ),
+                value={"target_percent": 0.20},
+                reason="seed_previous_target",
+            ),
+        )
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                samsung.key: Bar(samsung, now, 100_000, 100_000, 100_000, 100_000, 1_000_000),
+                hynix.key: Bar(hynix, now, 200_000, 200_000, 200_000, 200_000, 1_000_000),
+            },
+        ),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(),
+        managed_symbols=(),
+        model_state=state_view,
+    )
+    model = ReinforcementLearningPortfolioConstructionModel(
+        feature_schema="v2_state",
+        max_target_turnover_pct=0.15,
+    )
+
+    capped = model._cap_target_turnover(
+        context,
+        (
+            PortfolioAllocationTarget(symbol=samsung, target_percent=0.30, tag="test"),
+            PortfolioAllocationTarget(symbol=hynix, target_percent=0.20, tag="test"),
+        ),
+    )
+
+    by_key = {target.symbol.key: target for target in capped}
+    assert abs(by_key[samsung.key].target_percent - 0.25) < 1e-6
+    assert abs(by_key[hynix.key].target_percent - 0.10) < 1e-6
+    assert "turnover_cap" in by_key[samsung.key].tag
+    assert "turnover_cap" in by_key[hynix.key].tag
 
 
 def test_research_adaptive_allocator_builds_cash_aware_top_k_targets():
@@ -290,6 +545,89 @@ def test_research_adaptive_allocator_blocks_latest_flat_and_zeroes_held_symbol()
     assert by_symbol[held_missing.key].tag == "adaptive:research_adaptive_allocator:no_longer_in_target_portfolio"
 
 
+def test_research_adaptive_allocator_prioritizes_same_timestamp_flat_over_up():
+    module = _load("sleeves/LEaps/portfolios/research_adaptive_allocator.py")
+    now = datetime(2026, 5, 14)
+    held = Symbol("034020", "KRX")
+    portfolio = Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000})
+    portfolio.holdings[held.key] = Holding(held, quantity=10, average_price=50_000)
+    model = module.create_portfolio_model({"emit_zero_for_missing_held_targets": True})
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={held.key: Bar(held, now, 60_000, 60_000, 60_000, 60_000, 1_000_000)},
+        ),
+        portfolio=portfolio,
+        active_insights=(
+            Insight(
+                sleeve_id="LEaps",
+                symbol=held,
+                direction=InsightDirection.FLAT,
+                generated_at=now,
+                source_snapshot_id="test",
+                alpha_id="leaps-volatility-trailing-stop",
+                alpha_version="0.1.0",
+            ),
+            _allocator_insight(held, now, score=0.30, momentum=0.20),
+        ),
+        managed_symbols=(held,),
+    )
+
+    targets = model.create_targets(context)
+
+    assert len(targets) == 1
+    assert targets[0].symbol == held
+    assert targets[0].target_percent == 0.0
+    assert targets[0].tag == "adaptive:research_adaptive_allocator:no_longer_in_target_portfolio"
+
+
+def test_research_adaptive_allocator_applies_partial_trim_without_full_exit():
+    module = _load("sleeves/LEaps/portfolios/research_adaptive_allocator.py")
+    now = datetime(2026, 5, 14, 10, 5)
+    held = Symbol("005930", "KRX")
+    challenger = Symbol("000660", "KRX")
+    portfolio = Portfolio(cash=2_500_000, cash_by_currency={"KRW": 2_500_000})
+    portfolio.holdings[held.key] = Holding(held, quantity=100, average_price=75_000)
+    model = module.create_portfolio_model(
+        {
+            "top_k": 2,
+            "gross_exposure": 0.90,
+            "neutral_gross_exposure": 0.70,
+            "weak_gross_exposure": 0.35,
+            "cash_bias": 0.0,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.01,
+            "score_temperature": 0.35,
+            "emit_zero_for_missing_held_targets": True,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                held.key: Bar(held, now, 100_000, 100_000, 100_000, 100_000, 1_000_000),
+                challenger.key: Bar(challenger, now, 150_000, 150_000, 150_000, 150_000, 1_000_000),
+            },
+        ),
+        portfolio=portfolio,
+        active_insights=(
+            _allocator_insight(held, now - timedelta(minutes=1), score=0.36, momentum=0.24, momentum_5=0.04),
+            _partial_trim_insight(held, now, target_multiplier=0.50),
+            _allocator_insight(challenger, now, score=0.20, momentum=0.18, momentum_5=0.03),
+        ),
+        managed_symbols=(held,),
+    )
+
+    by_symbol = {target.symbol.key: target for target in model.create_targets(context)}
+
+    assert by_symbol[held.key].target_percent > 0.0
+    assert by_symbol[held.key].target_percent <= 0.40
+    assert "partial_trim=0.50" in by_symbol[held.key].tag
+    assert by_symbol[held.key].tag != "adaptive:research_adaptive_allocator:no_longer_in_target_portfolio"
+
+
 def test_research_adaptive_allocator_keeps_etf_safety_bucket_separate():
     module = _load("sleeves/LEaps/portfolios/research_adaptive_allocator.py")
     now = datetime(2026, 5, 15)
@@ -335,6 +673,608 @@ def test_research_adaptive_allocator_keeps_etf_safety_bucket_separate():
     assert by_symbol[cash_like.key].target_percent == 0.42
     assert by_symbol[inverse.key].target_percent == 0.08
     assert "etf_safety:cash_like" in by_symbol[cash_like.key].tag
+
+
+def test_research_adaptive_allocator_caps_inverse_to_stock_beta_exposure():
+    module = _load("sleeves/LEaps/portfolios/research_adaptive_allocator.py")
+    now = datetime(2026, 5, 15)
+    stock = Symbol("036930", "KRX")
+    cash_like = Symbol("488770", "KRX")
+    inverse = Symbol("114800", "KRX")
+    model = module.create_portfolio_model(
+        {
+            "top_k": 1,
+            "gross_exposure": 0.15,
+            "neutral_gross_exposure": 0.15,
+            "weak_gross_exposure": 0.15,
+            "cash_bias": 0.0,
+            "max_position_pct": 0.15,
+            "min_position_pct": 0.001,
+            "enable_etf_safety_bucket": True,
+            "etf_safety_max_total_pct": 0.80,
+            "inverse_hedge_stock_beta_assumption": 1.25,
+            "inverse_hedge_shock_buffer_pct": 0.02,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                stock.key: Bar(stock, now, 20_000, 20_000, 20_000, 20_000, 1_000_000),
+                cash_like.key: Bar(cash_like, now, 104_000, 104_000, 104_000, 104_000, 1_000_000),
+                inverse.key: Bar(inverse, now, 4_000, 4_000, 4_000, 4_000, 1_000_000),
+            },
+        ),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(
+            _allocator_insight(stock, now, score=0.50, momentum=0.30, breadth=0.75),
+            _etf_safety_insight(cash_like, now, target_pct=0.60, role="cash_like", stock_gross_cap=0.20),
+            _etf_safety_insight(inverse, now, target_pct=0.20, role="inverse", stock_gross_cap=0.20),
+        ),
+        managed_symbols=(),
+    )
+
+    by_symbol = {target.symbol.key: target for target in model.create_targets(context)}
+
+    assert abs(by_symbol[stock.key].target_percent - 0.075) < 1e-9
+    assert abs(by_symbol[inverse.key].target_percent - 0.11375) < 1e-9
+    assert abs(by_symbol[cash_like.key].target_percent - 0.68625) < 1e-9
+    assert "inverse_cap=0.114" in by_symbol[inverse.key].tag
+    assert "inverse_realloc=0.086" in by_symbol[cash_like.key].tag
+
+
+def test_research_adaptive_allocator_does_not_open_inverse_without_stock_exposure():
+    module = _load("sleeves/LEaps/portfolios/research_adaptive_allocator.py")
+    now = datetime(2026, 5, 15)
+    cash_like = Symbol("488770", "KRX")
+    inverse = Symbol("114800", "KRX")
+    model = module.create_portfolio_model(
+        {
+            "enable_etf_safety_bucket": True,
+            "etf_safety_max_total_pct": 0.80,
+            "inverse_hedge_stock_beta_assumption": 1.25,
+            "inverse_hedge_shock_buffer_pct": 0.02,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=DataSlice(
+            time=now,
+            bars={
+                cash_like.key: Bar(cash_like, now, 104_000, 104_000, 104_000, 104_000, 1_000_000),
+                inverse.key: Bar(inverse, now, 4_000, 4_000, 4_000, 4_000, 1_000_000),
+            },
+        ),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(
+            _etf_safety_insight(cash_like, now, target_pct=0.60, role="cash_like", stock_gross_cap=0.20),
+            _etf_safety_insight(inverse, now, target_pct=0.20, role="inverse", stock_gross_cap=0.20),
+        ),
+        managed_symbols=(),
+    )
+
+    by_symbol = {target.symbol.key: target for target in model.create_targets(context)}
+
+    assert set(by_symbol) == {cash_like.key}
+    assert abs(by_symbol[cash_like.key].target_percent - 0.80) < 1e-9
+    assert "inverse_realloc=0.200" in by_symbol[cash_like.key].tag
+
+
+def test_v4_banded_momentum_retains_held_symbol_outside_entry_band():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    top_a = Symbol("000660", "KRX")
+    top_b = Symbol("011070", "KRX")
+    held = Symbol("005930", "KRX")
+    challenger = Symbol("036930", "KRX")
+    portfolio = Portfolio(cash=5_000_000, cash_by_currency={"KRW": 5_000_000})
+    portfolio.holdings[held.key] = Holding(held, quantity=100, average_price=50_000)
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 2,
+            "hold_top_n": 5,
+            "trim_top_n": 8,
+            "max_positions": 4,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.50,
+            "min_position_pct": 0.001,
+            "max_target_turnover_pct": None,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (top_a, top_b, held, challenger), close=50_000),
+        portfolio=portfolio,
+        active_insights=(
+            _allocator_insight(top_a, now, score=0.60, momentum=0.26),
+            _allocator_insight(top_b, now, score=0.55, momentum=0.24),
+            _allocator_insight(held, now, score=0.30, momentum=0.20),
+            _allocator_insight(challenger, now, score=0.20, momentum=0.18),
+        ),
+        managed_symbols=(held,),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    by_symbol = {target.symbol.key: target for target in model.create_targets(context)}
+
+    assert held.key in by_symbol
+    assert by_symbol[held.key].target_percent > 0.0
+    assert ":hold:" in by_symbol[held.key].tag
+
+
+def test_v4_banded_momentum_trims_held_symbol_between_hold_and_exit_bands():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    top_a = Symbol("000660", "KRX")
+    top_b = Symbol("011070", "KRX")
+    held = Symbol("005930", "KRX")
+    portfolio = Portfolio(cash=5_000_000, cash_by_currency={"KRW": 5_000_000})
+    portfolio.holdings[held.key] = Holding(held, quantity=100, average_price=50_000)
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "hold_top_n": 2,
+            "trim_top_n": 5,
+            "max_positions": 2,
+            "trim_multiplier": 0.50,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "max_target_turnover_pct": None,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (top_a, top_b, held), close=50_000),
+        portfolio=portfolio,
+        active_insights=(
+            _allocator_insight(top_a, now, score=0.60, momentum=0.26),
+            _allocator_insight(top_b, now, score=0.55, momentum=0.24),
+            _allocator_insight(held, now, score=0.30, momentum=0.20),
+        ),
+        managed_symbols=(held,),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    by_symbol = {target.symbol.key: target for target in model.create_targets(context)}
+
+    assert by_symbol[held.key].target_percent == 0.25
+    assert "rank_trim:3" in by_symbol[held.key].tag
+
+
+def test_v4_banded_momentum_hard_exit_bypasses_turnover_cap():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    held = Symbol("005930", "KRX")
+    portfolio = Portfolio(cash=5_000_000, cash_by_currency={"KRW": 5_000_000})
+    portfolio.holdings[held.key] = Holding(held, quantity=100, average_price=50_000)
+    model = module.create_portfolio_model(
+        {
+            "max_target_turnover_pct": 0.01,
+            "min_position_pct": 0.001,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (held,), close=50_000),
+        portfolio=portfolio,
+        active_insights=(
+            _allocator_insight(held, now, score=0.40, momentum=0.22),
+            Insight(
+                sleeve_id="LEaps",
+                symbol=held,
+                direction=InsightDirection.FLAT,
+                generated_at=now,
+                source_snapshot_id="test",
+                alpha_id="leaps-volatility-trailing-stop",
+                alpha_version="0.1.0",
+                reason="trailing_stop_triggered",
+            ),
+        ),
+        managed_symbols=(held,),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    targets = model.create_targets(context)
+
+    assert len(targets) == 1
+    assert targets[0].symbol == held
+    assert targets[0].target_percent == 0.0
+    assert "hard_exit" in targets[0].tag
+    assert "turnover_cap" not in targets[0].tag
+
+
+def test_v4_banded_momentum_persists_alpha_attribution_with_normalized_scores():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    high = Symbol("000660", "KRX")
+    low = Symbol("005930", "KRX")
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 2,
+            "max_positions": 2,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "max_target_turnover_pct": None,
+            "daily_turnover_budget_pct": None,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (high, low), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(
+            _allocator_insight(high, now, score=0.60, momentum=0.26),
+            _allocator_insight(low, now, score=0.20, momentum=0.18),
+            _allocator_insight(
+                high,
+                now,
+                score=0.30,
+                momentum=0.20,
+                alpha_id="leaps-kospi-pullback-reversion",
+            ),
+        ),
+        managed_symbols=(),
+        model_state=RuntimeModelStateView(InMemoryRuntimeStateStore(), default_sleeve_id="LEaps"),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    targets = model.create_targets(context)
+    patches = model.state_patches(context=context, targets=targets)
+    high_patch = next(patch for patch in patches if patch.key.symbol_key == high.key)
+    attribution = high_patch.value["attribution"]
+
+    assert attribution["regime"] in {"risk_on", "strong_risk_on"}
+    assert attribution["alpha_sources"]["leaps-kospi-conviction"]["normalized_score"] == 1.0
+    assert "leaps-kospi-pullback-reversion" in attribution["alpha_sources"]
+    assert attribution["components"]["multi_alpha"] > 0.0
+
+
+def test_v4_banded_momentum_partial_trim_blocks_new_entry():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    symbol = Symbol("000660", "KRX")
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "max_positions": 1,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "max_target_turnover_pct": None,
+            "daily_turnover_budget_pct": None,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (symbol,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(
+            _allocator_insight(symbol, now, score=0.60, momentum=0.26),
+            _partial_trim_insight(symbol, now, target_multiplier=0.50),
+        ),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    assert model.create_targets(context) == ()
+
+
+def test_v4_banded_momentum_turnover_caps_new_entries():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    first = Symbol("000660", "KRX")
+    second = Symbol("011070", "KRX")
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 2,
+            "max_positions": 2,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "max_target_turnover_pct": 0.10,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (first, second), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(
+            _allocator_insight(first, now, score=0.60, momentum=0.26),
+            _allocator_insight(second, now, score=0.55, momentum=0.24),
+        ),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    targets = model.create_targets(context)
+
+    assert abs(sum(target.target_percent for target in targets) - 0.10) < 1e-9
+    assert all("turnover_cap" in target.tag for target in targets)
+
+
+def test_v4_banded_momentum_respects_daily_turnover_budget_across_cycles():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    first = Symbol("000660", "KRX")
+    second = Symbol("011070", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "max_positions": 1,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "max_target_turnover_pct": 0.20,
+            "daily_turnover_budget_pct": 0.10,
+        }
+    )
+    first_context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (first,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(first, now, score=0.60, momentum=0.26),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+    first_targets = model.create_targets(first_context)
+    store.apply_patches(model.state_patches(context=first_context, targets=first_targets), applied_at=now)
+
+    second_context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now + timedelta(minutes=5), (second,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(second, now + timedelta(minutes=5), score=0.70, momentum=0.30),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+    second_targets = model.create_targets(second_context)
+
+    assert abs(sum(target.target_percent for target in first_targets) - 0.10) < 1e-9
+    assert len(second_targets) == 1
+    assert second_targets[0].symbol == second
+    assert second_targets[0].target_percent == 0.0
+    assert "turnover_cap=0.000" in second_targets[0].tag
+
+
+def test_v4_banded_momentum_holds_small_target_drift():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    symbol = Symbol("000660", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4-banded-momentum",
+                    namespace="position_state",
+                    symbol_key=symbol.key,
+                ),
+                value={
+                    "status": "hold",
+                    "target_percent": 0.20,
+                    "entered_at": (now - timedelta(days=2)).isoformat(),
+                    "updated_at": (now - timedelta(minutes=5)).isoformat(),
+                },
+                reason="seed_v4_target",
+            ),
+        ),
+        applied_at=now,
+    )
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "max_positions": 1,
+            "gross_exposure": 0.90,
+            "neutral_gross_exposure": 0.90,
+            "weak_gross_exposure": 0.90,
+            "max_position_pct": 0.22,
+            "min_position_pct": 0.001,
+            "target_drift_threshold_pct": 0.03,
+            "max_target_turnover_pct": 0.20,
+            "daily_turnover_budget_pct": 0.20,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (symbol,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(symbol, now, score=0.60, momentum=0.26),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+
+    targets = model.create_targets(context)
+
+    assert len(targets) == 1
+    assert targets[0].target_percent == 0.20
+    assert "drift_hold=0.200" in targets[0].tag
+
+
+def test_v4_banded_momentum_blocks_same_day_reentry_after_exit():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    symbol = Symbol("000660", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4-banded-momentum",
+                    namespace="position_state",
+                    symbol_key=symbol.key,
+                ),
+                value={
+                    "status": "hard_exit",
+                    "target_percent": 0.0,
+                    "entered_at": "",
+                    "updated_at": (now - timedelta(minutes=5)).isoformat(),
+                },
+                reason="seed_v4_exit",
+            ),
+        ),
+        applied_at=now,
+    )
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "max_positions": 1,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "reentry_cooldown_days": 1,
+            "max_target_turnover_pct": None,
+            "daily_turnover_budget_pct": None,
+        }
+    )
+    same_day_context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (symbol,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(symbol, now, score=0.60, momentum=0.26),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+    next_day_context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now + timedelta(days=1), (symbol,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(symbol, now + timedelta(days=1), score=0.60, momentum=0.26),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+
+    assert model.create_targets(same_day_context) == ()
+    assert model.create_targets(next_day_context)[0].target_percent > 0.0
+
+
+def test_v4_banded_momentum_uses_hard_exit_specific_cooldown():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    symbol = Symbol("000660", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4-banded-momentum",
+                    namespace="position_state",
+                    symbol_key=symbol.key,
+                ),
+                value={
+                    "status": "hard_exit",
+                    "target_percent": 0.0,
+                    "entered_at": "",
+                    "updated_at": (now - timedelta(days=5)).isoformat(),
+                },
+                reason="seed_v4_hard_exit",
+            ),
+        ),
+        applied_at=now,
+    )
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "max_positions": 1,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "reentry_cooldown_days": 1,
+            "hard_exit_cooldown_days": 7,
+            "max_target_turnover_pct": None,
+            "daily_turnover_budget_pct": None,
+        }
+    )
+    blocked_context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (symbol,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(symbol, now, score=0.60, momentum=0.26),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+    released_context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now + timedelta(days=7), (symbol,), close=50_000),
+        portfolio=Portfolio(cash=10_000_000, cash_by_currency={"KRW": 10_000_000}),
+        active_insights=(_allocator_insight(symbol, now + timedelta(days=7), score=0.60, momentum=0.26),),
+        managed_symbols=(),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+        model_state=state_view,
+    )
+
+    assert model.create_targets(blocked_context) == ()
+    assert model.create_targets(released_context)[0].target_percent > 0.0
+
+
+def test_v4_banded_momentum_blocks_add_outside_entry_band():
+    module = _load("sleeves/LEaps/portfolios/v4_banded_momentum.py")
+    now = datetime(2026, 5, 20, 10, 0)
+    top = Symbol("000660", "KRX")
+    held = Symbol("005930", "KRX")
+    portfolio = Portfolio(cash=9_000_000, cash_by_currency={"KRW": 9_000_000})
+    portfolio.holdings[held.key] = Holding(held, quantity=20, average_price=50_000)
+    model = module.create_portfolio_model(
+        {
+            "entry_top_n": 1,
+            "hold_top_n": 2,
+            "max_positions": 2,
+            "gross_exposure": 0.80,
+            "neutral_gross_exposure": 0.80,
+            "weak_gross_exposure": 0.80,
+            "max_position_pct": 0.80,
+            "min_position_pct": 0.001,
+            "add_requires_entry_band": True,
+            "add_requires_unrealized_profit": True,
+            "max_target_turnover_pct": None,
+            "daily_turnover_budget_pct": None,
+        }
+    )
+    context = PortfolioConstructionContext(
+        sleeve_id="LEaps",
+        data=_bars(now, (top, held), close=50_000),
+        portfolio=portfolio,
+        active_insights=(
+            _allocator_insight(top, now, score=0.60, momentum=0.26),
+            _allocator_insight(held, now, score=0.50, momentum=0.24),
+        ),
+        managed_symbols=(held,),
+        target_portfolio_value_by_currency={"KRW": 10_000_000},
+    )
+
+    by_symbol = {target.symbol.key: target for target in model.create_targets(context)}
+
+    assert by_symbol[held.key].target_percent == 0.10
+    assert "hold_no_add" in by_symbol[held.key].tag
 
 
 def test_kospi_conviction_alpha_filters_uncompensated_high_volatility():
@@ -426,6 +1366,139 @@ def test_kospi_pullback_reversion_alpha_emits_rebreak_setups():
     assert insights[0].metadata["pullback_from_high"] < 0.05
 
 
+def test_kospi_pullback_reversion_alpha_requires_stabilization_in_volatility():
+    module = _load("sleeves/LEaps/alphas/kospi_pullback_reversion.py")
+    now = datetime(2026, 5, 12)
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:005930": _values(
+                close=97_000,
+                fast=100_000,
+                slow=88_000,
+                momentum=0.18,
+                momentum_5=-0.025,
+                vol=0.14,
+                rolling_high=106_000,
+                rolling_low=94_000,
+            ),
+            "KRX:000660": _values(
+                close=100_000,
+                fast=99_500,
+                slow=90_000,
+                momentum=0.20,
+                momentum_5=0.035,
+                vol=0.14,
+                rolling_high=102_000,
+                rolling_low=93_000,
+            ),
+        },
+    )
+
+    insights = module.generate(
+        SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930", "KRX:000660"))
+    )
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:000660"]
+    assert insights[0].metadata["volatility_regime"] == "volatile_rebreak"
+
+
+def test_kospi_swing_rebalance_alpha_buys_pullbacks_in_uptrend():
+    module = _load("sleeves/LEaps/alphas/kospi_swing_rebalance.py")
+    now = datetime(2026, 5, 14)
+    values = _values(
+        close=100_000,
+        fast=99_000,
+        slow=90_000,
+        momentum=0.12,
+        momentum_5=0.025,
+        vol=0.05,
+        rolling_high=104_000,
+    )
+    values["sma_10_close"] = 98_000
+    snapshot = _snapshot(now, {"KRX:005930": values})
+
+    insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930",)))
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:005930"]
+    assert insights[0].direction is InsightDirection.UP
+    assert insights[0].alpha_id == "leaps-kospi-swing-rebalance"
+    assert insights[0].reason == "kospi_swing_buy_pullback_in_uptrend"
+    assert insights[0].metadata["portfolio_action"] == "buy_pullback"
+    assert 0.018 <= insights[0].metadata["pullback_from_high"] <= 0.085
+
+
+def test_kospi_swing_rebalance_alpha_partially_trims_ten_day_breaks():
+    module = _load("sleeves/LEaps/alphas/kospi_swing_rebalance.py")
+    now = datetime(2026, 5, 14)
+    values = _values(
+        close=99_000,
+        fast=100_500,
+        slow=90_000,
+        momentum=0.11,
+        momentum_5=-0.015,
+        vol=0.05,
+        rolling_high=104_000,
+    )
+    values["sma_10_close"] = 100_000
+    snapshot = _snapshot(now, {"KRX:005930": values})
+
+    insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930",)))
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:005930"]
+    assert insights[0].direction is InsightDirection.FLAT
+    assert insights[0].reason == "kospi_swing_partial_trim_ten_day_break"
+    assert insights[0].metadata["portfolio_action"] == "partial_trim"
+    assert insights[0].metadata["target_multiplier"] == 0.50
+
+
+def test_kospi_swing_rebalance_alpha_partially_trims_volatility_shocks():
+    module = _load("sleeves/LEaps/alphas/kospi_swing_rebalance.py")
+    now = datetime(2026, 5, 14)
+    values = _values(
+        close=100_000,
+        fast=101_000,
+        slow=90_000,
+        momentum=0.11,
+        momentum_5=-0.02,
+        vol=0.14,
+        rolling_high=111_000,
+    )
+    values["sma_10_close"] = 99_000
+    snapshot = _snapshot(now, {"KRX:005930": values})
+
+    insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930",)))
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:005930"]
+    assert insights[0].direction is InsightDirection.FLAT
+    assert insights[0].reason == "kospi_swing_partial_trim_volatility_shock"
+    assert insights[0].metadata["portfolio_action"] == "partial_trim"
+    assert insights[0].metadata["target_multiplier"] == 0.55
+
+
+def test_kospi_swing_rebalance_alpha_exits_twenty_day_breaks():
+    module = _load("sleeves/LEaps/alphas/kospi_swing_rebalance.py")
+    now = datetime(2026, 5, 14)
+    values = _values(
+        close=89_000,
+        fast=92_000,
+        slow=90_000,
+        momentum=0.05,
+        momentum_5=-0.03,
+        vol=0.06,
+        rolling_high=101_000,
+    )
+    values["sma_10_close"] = 92_000
+    snapshot = _snapshot(now, {"KRX:005930": values})
+
+    insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:005930",)))
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:005930"]
+    assert insights[0].direction is InsightDirection.FLAT
+    assert insights[0].reason == "kospi_swing_exit_20dma_break"
+    assert insights[0].metadata["portfolio_action"] == "exit"
+
+
 def test_us_stability_alpha_prefers_defensive_us_etfs():
     module = _load("sleeves/LEaps/alphas/us_stability_hedge.py")
     now = datetime(2026, 5, 8)
@@ -473,9 +1546,159 @@ def test_krx_etf_safety_alpha_moves_to_cash_and_inverse_after_shock():
     up_by_symbol = {insight.symbol.key: insight for insight in insights if insight.direction is InsightDirection.UP}
     assert set(up_by_symbol) == {"KRX:488770", "KRX:114800"}
     assert up_by_symbol["KRX:488770"].metadata["safety_regime"] == "shock"
-    assert up_by_symbol["KRX:488770"].metadata["target_bucket_pct"] == 0.42
-    assert up_by_symbol["KRX:114800"].metadata["target_bucket_pct"] == 0.08
-    assert up_by_symbol["KRX:488770"].metadata["stock_gross_cap"] == 0.45
+    assert up_by_symbol["KRX:488770"].metadata["target_bucket_pct"] == 0.60
+    assert up_by_symbol["KRX:114800"].metadata["target_bucket_pct"] == 0.20
+    assert up_by_symbol["KRX:114800"].metadata["inverse_policy_action"] == "full"
+    assert up_by_symbol["KRX:114800"].metadata["inverse_product_risk"] == "daily_reset_compounding_decay"
+    assert up_by_symbol["KRX:488770"].metadata["stock_gross_cap"] == 0.20
+
+
+def test_krx_etf_safety_alpha_decays_inverse_after_first_target_day():
+    module = _load("sleeves/LEaps/alphas/krx_etf_safety.py")
+    now = datetime(2026, 5, 16)
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            state_view.object_set(
+                {
+                    "target_active": True,
+                    "last_target_date": "2026-05-15",
+                    "target_day_count": 1,
+                    "adjusted_inverse_pct": 0.20,
+                    "policy_action": "full",
+                },
+                model_id=module.ALPHA_ID,
+                namespace=module.INVERSE_POLICY_NAMESPACE,
+                symbol_key=module.INVERSE_SYMBOL,
+                reason="seed_inverse_policy",
+                generated_at=now - timedelta(days=1),
+            ),
+        ),
+        applied_at=now - timedelta(days=1),
+    )
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:069500": _values(close=117_200, fast=120_000, slow=106_566, momentum=0.11, momentum_5=-0.061, vol=0.05, rolling_high=124_855),
+            "KRX:488770": _values(close=104_370, fast=104_300, slow=104_000, momentum=0.001, momentum_5=0.001, vol=0.001),
+            "KRX:114800": _values(close=4_000, fast=3_950, slow=3_900, momentum=0.02, momentum_5=0.01, vol=0.05),
+        },
+    )
+    context = SnapshotContext.from_indicator_snapshot(snapshot, model_state=state_view).with_input_symbols(
+        ("KRX:069500", "KRX:488770", "KRX:114800")
+    )
+
+    insights = module.generate(context)
+
+    up_by_symbol = {insight.symbol.key: insight for insight in insights if insight.direction is InsightDirection.UP}
+    assert up_by_symbol["KRX:114800"].metadata["target_bucket_pct"] == 0.10
+    assert up_by_symbol["KRX:114800"].metadata["inverse_target_day_count"] == 2
+    assert up_by_symbol["KRX:114800"].metadata["inverse_policy_action"] == "decayed"
+    assert up_by_symbol["KRX:488770"].metadata["target_bucket_pct"] == 0.70
+    patches = module.state_patches(context=context, insights=tuple(insights))
+    assert patches[0].value["target_day_count"] == 2
+    assert patches[0].value["adjusted_inverse_pct"] == 0.10
+
+
+def test_krx_etf_safety_alpha_blocks_inverse_after_max_target_days():
+    module = _load("sleeves/LEaps/alphas/krx_etf_safety.py")
+    now = datetime(2026, 5, 17)
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            state_view.object_set(
+                {
+                    "target_active": True,
+                    "last_target_date": "2026-05-16",
+                    "target_day_count": 2,
+                    "adjusted_inverse_pct": 0.10,
+                    "policy_action": "decayed",
+                },
+                model_id=module.ALPHA_ID,
+                namespace=module.INVERSE_POLICY_NAMESPACE,
+                symbol_key=module.INVERSE_SYMBOL,
+                reason="seed_inverse_policy",
+                generated_at=now - timedelta(days=1),
+            ),
+        ),
+        applied_at=now - timedelta(days=1),
+    )
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:069500": _values(close=117_200, fast=120_000, slow=106_566, momentum=0.11, momentum_5=-0.061, vol=0.05, rolling_high=124_855),
+            "KRX:488770": _values(close=104_370, fast=104_300, slow=104_000, momentum=0.001, momentum_5=0.001, vol=0.001),
+            "KRX:114800": _values(close=4_000, fast=3_950, slow=3_900, momentum=0.02, momentum_5=0.01, vol=0.05),
+        },
+    )
+    context = SnapshotContext.from_indicator_snapshot(snapshot, model_state=state_view).with_input_symbols(
+        ("KRX:069500", "KRX:488770", "KRX:114800")
+    )
+
+    insights = module.generate(context)
+
+    up_by_symbol = {insight.symbol.key: insight for insight in insights if insight.direction is InsightDirection.UP}
+    flat_by_symbol = {insight.symbol.key: insight for insight in insights if insight.direction is InsightDirection.FLAT}
+    assert "KRX:114800" not in up_by_symbol
+    assert up_by_symbol["KRX:488770"].metadata["target_bucket_pct"] == 0.80
+    assert flat_by_symbol["KRX:114800"].reason == "krx_etf_safety_inverse_holding_limit"
+    assert flat_by_symbol["KRX:114800"].metadata["inverse_policy_action"] == "blocked_max_target_days"
+
+
+def test_krx_etf_safety_alpha_rejects_leveraged_etfs_as_flat():
+    module = _load("sleeves/LEaps/alphas/krx_etf_safety.py")
+    now = datetime(2026, 5, 15)
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:069500": _values(close=117_200, fast=120_000, slow=106_566, momentum=0.11, momentum_5=-0.061, vol=0.05, rolling_high=124_855),
+            "KRX:122630": _values(close=65_000, fast=64_000, slow=63_000, momentum=0.04, momentum_5=0.02, vol=0.08),
+        },
+    )
+
+    insights = module.generate(
+        SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:069500", "KRX:122630"))
+    )
+
+    flat_by_symbol = {insight.symbol.key: insight for insight in insights if insight.direction is InsightDirection.FLAT}
+    assert flat_by_symbol["KRX:122630"].reason == "leveraged_etf_disabled_for_safety_bucket"
+    assert flat_by_symbol["KRX:122630"].metadata["leveraged_etf_policy"] == "blocked"
+    assert flat_by_symbol["KRX:122630"].metadata["product_risk"] == "daily_reset_compounding_decay"
+
+
+def test_krx_etf_safety_alpha_uses_live_close_for_intraday_shock_without_rewriting_daily_reference():
+    module = _load("sleeves/LEaps/alphas/krx_etf_safety.py")
+    now = datetime(2026, 5, 15, 10, 45)
+    benchmark_values = _values(
+        close=124_800,
+        fast=120_000,
+        slow=106_566,
+        momentum=0.11,
+        momentum_5=0.02,
+        vol=0.05,
+        rolling_high=124_855,
+    )
+    benchmark_values["live_close"] = 117_200
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:069500": benchmark_values,
+            "KRX:488770": _values(close=104_370, fast=104_300, slow=104_000, momentum=0.001, momentum_5=0.001, vol=0.001),
+            "KRX:114800": _values(close=4_000, fast=3_950, slow=3_900, momentum=0.02, momentum_5=0.01, vol=0.05),
+        },
+    )
+
+    insights = module.generate(
+        SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:069500", "KRX:488770", "KRX:114800"))
+    )
+
+    up_by_symbol = {insight.symbol.key: insight for insight in insights if insight.direction is InsightDirection.UP}
+    assert up_by_symbol["KRX:488770"].metadata["safety_regime"] == "shock"
+    assert up_by_symbol["KRX:488770"].metadata["benchmark_close"] == 124_800
+    assert up_by_symbol["KRX:488770"].metadata["benchmark_live_close"] == 117_200
+    assert up_by_symbol["KRX:488770"].metadata["benchmark_pullback_from_high"] > 0.055
 
 
 def test_krx_etf_safety_selection_selects_domestic_etfs_not_stocks():
@@ -563,7 +1786,7 @@ def test_stock_momentum_selection_rejects_high_volatility_without_exception():
     assert result.rejected["KRX:005930"] == ("volatility_filter",)
 
 
-def test_stock_momentum_selection_boosts_leading_sectors():
+def test_stock_momentum_selection_ignores_sector_metadata():
     module = _load("sleeves/LEaps/selections/stock_momentum.py")
     now = datetime(2026, 5, 8)
     universe = parse_universe_definition(
@@ -590,12 +1813,39 @@ def test_stock_momentum_selection_boosts_leading_sectors():
         UniverseSelectionContext(sleeve_id="LEaps", universe=universe, indicator_snapshot=snapshot)
     )
 
-    assert [symbol.key for symbol in result.selected_symbols] == ["KRX:000660", "KRX:005930"]
-    assert result.candidates["KRX:005930"].metadata["sector"] == "technology"
-    assert (
-        result.candidates["KRX:005930"].metadata["sector_relative_strength"]
-        > result.candidates["KRX:068270"].metadata["sector_relative_strength"]
+    assert [symbol.key for symbol in result.selected_symbols] == ["KRX:000660", "KRX:068270"]
+    assert "sector" not in result.candidates["KRX:005930"].metadata
+    assert "sector_relative_strength" not in result.candidates["KRX:005930"].metadata
+
+
+def test_stock_momentum_selection_does_not_emit_sector_bonus_for_unknown_sector():
+    module = _load("sleeves/LEaps/selections/stock_momentum.py")
+    now = datetime(2026, 5, 8)
+    universe = parse_universe_definition(
+        {
+            "id": "kr-unknown-sector-test",
+            "market": "KRX",
+            "symbols": [
+                {"ticker": "005930", "market": "KRX", "asset_type": "stock", "sector": "technology"},
+                {"ticker": "011070", "market": "KRX", "asset_type": "stock"},
+            ],
+        }
     )
+    snapshot = _snapshot(
+        now,
+        {
+            "KRX:005930": _values(close=80_000, fast=82_000, slow=75_000, momentum=0.06, momentum_5=0.03, momentum_60=0.10, vol=0.03),
+            "KRX:011070": _values(close=100_000, fast=112_000, slow=90_000, momentum=0.30, momentum_5=0.10, momentum_60=0.25, vol=0.05),
+        },
+    )
+
+    result = module.StockMomentumSelectionModel(max_active_symbols=2).select(
+        UniverseSelectionContext(sleeve_id="LEaps", universe=universe, indicator_snapshot=snapshot)
+    )
+
+    assert "sector" not in result.candidates["KRX:011070"].metadata
+    assert "sector_relative_strength" not in result.candidates["KRX:011070"].metadata
+    assert "sector_relative_strength" not in result.candidates["KRX:005930"].metadata
 
 
 def test_kospi_growth_us_hedge_risk_applies_currency_limits():
@@ -962,6 +2212,569 @@ def test_kospi_growth_risk_intraday_guard_blocks_stock_entries_but_allows_cash_l
     assert batch.decisions[1].metadata["market_regime"]["by_currency"]["KRW"]["overlay"] == "intraday_risk_off"
 
 
+def test_kospi_growth_risk_intraday_guard_smoothly_caps_entries_when_enabled():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 15, 10, 0)
+    stock = Symbol("005930", "KRX")
+    cash_like = Symbol("488770", "KRX")
+    guard = Symbol("069500", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={
+            stock.key: Bar(stock, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            cash_like.key: Bar(cash_like, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            guard.key: Bar(guard, now, 98_500, 98_500, 98_500, 98_500, 1000),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"risk_on": 1.0}},
+            "intraday_market_guard_enabled": True,
+            "intraday_guard_symbol": guard.key,
+            "intraday_entry_freeze_return_pct": -0.01,
+            "intraday_risk_off_return_pct": -0.02,
+            "intraday_entry_freeze_cap_pct_by_currency": {"KRW": 0.45},
+            "intraday_risk_off_cap_pct_by_currency": {"KRW": 0.25},
+            "intraday_guard_smoothing_enabled": True,
+            "intraday_guard_cap_curve": "linear",
+            "intraday_guard_hard_entry_freeze": False,
+            "intraday_guard_exempt_symbols": [cash_like.key],
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+            targets=(PortfolioTarget(stock, 8), PortfolioTarget(cash_like, 2)),
+            active_insights=(
+                _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.08),
+                _intraday_guard_reference_insight(cash_like, now, guard_symbol=guard.key, reference_price=100_000),
+            ),
+        )
+    )
+
+    approved = {decision.original_target.symbol.key: decision.approved_target.quantity for decision in batch.decisions}
+    regime = batch.decisions[0].metadata["market_regime"]["by_currency"]["KRW"]
+    assert approved == {stock.key: 3, cash_like.key: 2}
+    assert batch.decisions[0].reason == "currency_policy_clamped"
+    assert regime["overlay"] == "entry_freeze"
+    assert regime["entry_freeze"] is False
+    assert regime["hard_entry_freeze"] is False
+    assert regime["smoothing_enabled"] is True
+    assert regime["max_total_exposure_pct"] == pytest.approx(0.35)
+
+
+def test_kospi_growth_risk_intraday_guard_releases_probe_cap_after_confirmed_rebound():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 15, 13, 0)
+    stock = Symbol("005930", "KRX")
+    cash_like = Symbol("488770", "KRX")
+    guard = Symbol("069500", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="intraday_guard",
+                    symbol_key=guard.key,
+                ),
+                value={
+                    "session_date": now.date().isoformat(),
+                    "session_high_price": 100_000,
+                    "session_low_price": 96_000,
+                    "current_price": 96_600,
+                    "recovery_count": 1,
+                    "overlay": "intraday_risk_off",
+                },
+                reason="seed_intraday_recovery",
+            ),
+        ),
+        applied_at=now,
+    )
+    data = DataSlice(
+        time=now,
+        bars={
+            stock.key: Bar(stock, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            cash_like.key: Bar(cash_like, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            guard.key: Bar(guard, now, 97_000, 97_000, 97_000, 97_000, 1000),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"risk_on": 1.0}},
+            "intraday_market_guard_enabled": True,
+            "intraday_guard_symbol": guard.key,
+            "intraday_entry_freeze_return_pct": -0.01,
+            "intraday_risk_off_return_pct": -0.02,
+            "intraday_entry_freeze_cap_pct_by_currency": {"KRW": 0.45},
+            "intraday_risk_off_cap_pct_by_currency": {"KRW": 0.25},
+            "intraday_guard_smoothing_enabled": True,
+            "intraday_guard_hard_entry_freeze": False,
+            "intraday_guard_recovery_enabled": True,
+            "intraday_guard_recovery_from_low_pct": 0.006,
+            "intraday_guard_recovery_confirmation_cycles": 2,
+            "intraday_guard_recovery_cap_pct_by_currency": {"KRW": 0.45},
+            "intraday_guard_exempt_symbols": [cash_like.key],
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+            targets=(PortfolioTarget(stock, 8),),
+            active_insights=(
+                _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.08),
+                _intraday_guard_reference_insight(cash_like, now, guard_symbol=guard.key, reference_price=100_000),
+            ),
+            model_state=state_view,
+        )
+    )
+
+    decision = batch.decisions[0]
+    regime = decision.metadata["market_regime"]["by_currency"]["KRW"]
+    assert decision.reason == "currency_policy_clamped"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 4
+    assert regime["overlay"] == "entry_freeze"
+    assert regime["trigger"] == "recovery_from_session_low"
+    assert regime["underlying_trigger"] == "reference_return"
+    assert regime["max_total_exposure_pct"] == pytest.approx(0.45)
+    assert regime["recovery_release_active"] is True
+    assert batch.state_patches[0].value["session_low_price"] == 96_000
+    assert batch.state_patches[0].value["recovery_count"] == 2
+
+
+def test_kospi_growth_risk_intraday_guard_waits_for_recovery_confirmation():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 15, 13, 1)
+    stock = Symbol("005930", "KRX")
+    cash_like = Symbol("488770", "KRX")
+    guard = Symbol("069500", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="intraday_guard",
+                    symbol_key=guard.key,
+                ),
+                value={
+                    "session_date": now.date().isoformat(),
+                    "session_high_price": 100_000,
+                    "session_low_price": 96_000,
+                    "current_price": 96_600,
+                    "recovery_count": 0,
+                    "overlay": "intraday_risk_off",
+                },
+                reason="seed_intraday_recovery",
+            ),
+        ),
+        applied_at=now,
+    )
+    data = DataSlice(
+        time=now,
+        bars={
+            stock.key: Bar(stock, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            cash_like.key: Bar(cash_like, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            guard.key: Bar(guard, now, 97_000, 97_000, 97_000, 97_000, 1000),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"risk_on": 1.0}},
+            "intraday_market_guard_enabled": True,
+            "intraday_guard_symbol": guard.key,
+            "intraday_entry_freeze_return_pct": -0.01,
+            "intraday_risk_off_return_pct": -0.02,
+            "intraday_entry_freeze_cap_pct_by_currency": {"KRW": 0.45},
+            "intraday_risk_off_cap_pct_by_currency": {"KRW": 0.25},
+            "intraday_guard_smoothing_enabled": True,
+            "intraday_guard_hard_entry_freeze": False,
+            "intraday_guard_recovery_enabled": True,
+            "intraday_guard_recovery_from_low_pct": 0.006,
+            "intraday_guard_recovery_confirmation_cycles": 2,
+            "intraday_guard_recovery_cap_pct_by_currency": {"KRW": 0.45},
+            "intraday_guard_exempt_symbols": [cash_like.key],
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+            targets=(PortfolioTarget(stock, 8),),
+            active_insights=(
+                _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.08),
+                _intraday_guard_reference_insight(cash_like, now, guard_symbol=guard.key, reference_price=100_000),
+            ),
+            model_state=state_view,
+        )
+    )
+
+    decision = batch.decisions[0]
+    regime = decision.metadata["market_regime"]["by_currency"]["KRW"]
+    assert decision.reason == "currency_policy_clamped"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 2
+    assert regime["overlay"] == "intraday_risk_off"
+    assert regime["trigger"] == "reference_return"
+    assert regime["max_total_exposure_pct"] == pytest.approx(0.25)
+    assert regime["recovery_release_active"] is False
+    assert batch.state_patches[0].value["recovery_count"] == 1
+
+
+def test_kospi_growth_risk_symbol_guard_blocks_adding_to_losing_holding():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 30)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 101_000, 98_000, 98_000, 1000)},
+    )
+    portfolio = Portfolio(
+        cash=1_000_000,
+        cash_by_currency={"KRW": 1_000_000},
+        holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_entry_block_intraday_return_pct": -0.025,
+            "symbol_entry_block_high_drawdown_pct": -0.04,
+            "symbol_entry_block_unrealized_loss_pct": -0.015,
+            "symbol_reduce_half_unrealized_loss_pct": -0.035,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(PortfolioTarget(stock, 15),),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_entry_block"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 10
+    assert decision.metadata["trigger"] == "unrealized_loss"
+    assert decision.metadata["unrealized_pnl_pct"] == pytest.approx(-0.02)
+
+
+def test_kospi_growth_risk_symbol_guard_reduces_half_on_deeper_loss():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 35)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 100_000, 96_000, 96_000, 1000)},
+    )
+    portfolio = Portfolio(
+        cash=1_000_000,
+        cash_by_currency={"KRW": 1_000_000},
+        holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_reduce_half_unrealized_loss_pct": -0.035,
+            "symbol_exit_unrealized_loss_pct": -0.06,
+            "symbol_reduce_fraction": 0.5,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(PortfolioTarget(stock, 15),),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_reduce_half"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 5
+    assert decision.metadata["trigger"] == "unrealized_loss"
+    assert batch.state_patches[0].key.namespace == "symbol_guard"
+    assert batch.state_patches[0].value["anchor_quantity"] == 10
+
+
+def test_kospi_growth_risk_symbol_guard_tightens_low_volatility_loss_guard():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 35)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 100_000, 97_000, 97_000, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_reduce_half_unrealized_loss_pct": -0.035,
+            "symbol_exit_unrealized_loss_pct": -0.06,
+            "symbol_reduce_fraction": 0.5,
+            "symbol_guard_volatility_adjusted_enabled": True,
+            "symbol_guard_reference_volatility_pct": 0.04,
+            "symbol_guard_min_volatility_multiplier": 0.75,
+            "symbol_guard_max_volatility_multiplier": 1.75,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=1_000_000,
+                cash_by_currency={"KRW": 1_000_000},
+                holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+            ),
+            targets=(PortfolioTarget(stock, 15),),
+            active_insights=(
+                _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.02),
+            ),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_reduce_half"
+    assert decision.metadata["volatility_multiplier"] == pytest.approx(0.75)
+    assert decision.metadata["thresholds"]["reduce_half_unrealized_loss_pct"] == pytest.approx(-0.02625)
+
+
+def test_kospi_growth_risk_symbol_guard_allows_wider_noise_for_high_volatility_holding():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 35)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 100_000, 96_000, 96_000, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_reduce_half_unrealized_loss_pct": -0.035,
+            "symbol_exit_unrealized_loss_pct": -0.06,
+            "symbol_reduce_fraction": 0.5,
+            "symbol_guard_volatility_adjusted_enabled": True,
+            "symbol_guard_reference_volatility_pct": 0.04,
+            "symbol_guard_min_volatility_multiplier": 0.75,
+            "symbol_guard_max_volatility_multiplier": 1.75,
+        }
+    )
+
+    context = RiskManagementContext(
+        sleeve_id="LEaps",
+        data=data,
+        portfolio=Portfolio(
+            cash=1_000_000,
+            cash_by_currency={"KRW": 1_000_000},
+            holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+        ),
+        targets=(PortfolioTarget(stock, 10),),
+        active_insights=(
+            _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.08),
+        ),
+    )
+    batch = model.manage_risk(context)
+
+    decision = batch.decisions[0]
+    assert decision.reason == "approved"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 10
+    metrics = model._symbol_guard_metrics(context, PortfolioTarget(stock, 10), 96_000, 10)
+    assert metrics["volatility_multiplier"] == pytest.approx(1.75)
+    assert metrics["thresholds"]["reduce_half_unrealized_loss_pct"] == pytest.approx(-0.06125)
+
+
+def test_kospi_growth_risk_symbol_guard_caps_high_volatility_entry_looseness():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 35)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 100_000, 96_700, 96_700, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_entry_block_intraday_return_pct": -0.025,
+            "symbol_guard_volatility_adjusted_enabled": True,
+            "symbol_guard_reference_volatility_pct": 0.04,
+            "symbol_guard_min_volatility_multiplier": 0.75,
+            "symbol_guard_max_volatility_multiplier": 1.75,
+            "symbol_guard_entry_max_volatility_multiplier": 1.25,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(cash=1_000_000, cash_by_currency={"KRW": 1_000_000}),
+            targets=(PortfolioTarget(stock, 5),),
+            active_insights=(
+                _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.08),
+            ),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_entry_block"
+    assert decision.metadata["trigger"] == "intraday_return"
+    assert decision.metadata["entry_volatility_multiplier"] == pytest.approx(1.25)
+    assert decision.metadata["thresholds"]["entry_block_intraday_return_pct"] == pytest.approx(-0.03125)
+
+
+def test_kospi_growth_risk_symbol_guard_does_not_repeat_half_reduce_after_state_mark():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 36)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 100_000, 96_000, 96_000, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_reduce_half_unrealized_loss_pct": -0.035,
+            "symbol_exit_unrealized_loss_pct": -0.06,
+            "symbol_reduce_fraction": 0.5,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    first = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=1_000_000,
+                cash_by_currency={"KRW": 1_000_000},
+                holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+            ),
+            targets=(PortfolioTarget(stock, 15),),
+            model_state=state_view,
+        )
+    )
+    store.apply_patches(first.state_patches, applied_at=now)
+
+    second = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=1_000_000,
+                cash_by_currency={"KRW": 1_000_000},
+                holdings={stock.key: Holding(stock, quantity=5, average_price=100_000)},
+            ),
+            targets=(PortfolioTarget(stock, 15),),
+            model_state=state_view,
+        )
+    )
+
+    decision = second.decisions[0]
+    assert decision.reason == "symbol_guard_reduce_half"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 5
+    assert decision.metadata["already_reduced"] is True
+    assert decision.metadata["anchor_quantity"] == 10
+
+
+def test_kospi_growth_risk_symbol_guard_exits_on_twenty_day_break():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 40)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 101_000, 99_400, 99_400, 1000)},
+    )
+    portfolio = Portfolio(
+        cash=1_000_000,
+        cash_by_currency={"KRW": 1_000_000},
+        holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_exit_sma20_buffer_pct": -0.005,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(PortfolioTarget(stock, 10),),
+            active_insights=(
+                Insight(
+                    sleeve_id="LEaps",
+                    symbol=stock,
+                    direction=InsightDirection.UP,
+                    generated_at=now,
+                    source_snapshot_id="test",
+                    alpha_id="leaps-kospi-swing-rebalance",
+                    alpha_version="0.1.0",
+                    metadata={"sma20": 100_000.0, "market_breadth": 0.7, "momentum": 0.2, "volatility": 0.08},
+                ),
+            ),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_exit"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 0
+    assert decision.metadata["trigger"] == "sma20_break"
+
+
 def test_kospi_growth_risk_intraday_high_drawdown_blocks_reversal_entries():
     module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
     now = datetime(2026, 5, 15, 10, 5)
@@ -1034,6 +2847,148 @@ def test_kospi_growth_risk_intraday_high_drawdown_blocks_reversal_entries():
     assert regime["by_currency"]["KRW"]["overlay"] == "intraday_risk_off"
     assert batch.state_patches[0].key.namespace == "intraday_guard"
     assert batch.state_patches[0].value["session_high_price"] == 105_000
+
+
+def test_kospi_growth_risk_intraday_guard_caps_stocks_without_blocking_safety_hedges():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 15, 10, 30)
+    stock = Symbol("005930", "KRX")
+    cash_like = Symbol("488770", "KRX")
+    inverse = Symbol("114800", "KRX")
+    guard = Symbol("069500", "KRX")
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="intraday_guard",
+                    symbol_key=guard.key,
+                ),
+                value={
+                    "session_date": now.date().isoformat(),
+                    "session_high_price": 105_000,
+                },
+                reason="seed_intraday_guard_high",
+            ),
+        )
+    )
+    data = DataSlice(
+        time=now,
+        bars={
+            stock.key: Bar(stock, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            cash_like.key: Bar(cash_like, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            inverse.key: Bar(inverse, now, 100_000, 100_000, 100_000, 100_000, 1000),
+            guard.key: Bar(guard, now, 102_000, 102_000, 102_000, 102_000, 1000),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"risk_on": 1.0}},
+            "intraday_market_guard_enabled": True,
+            "intraday_guard_symbol": guard.key,
+            "intraday_guard_high_drawdown_enabled": True,
+            "intraday_guard_high_risk_off_return_pct": -0.012,
+            "intraday_risk_off_cap_pct_by_currency": {"KRW": 0.25},
+            "intraday_guard_exempt_symbols": [cash_like.key, inverse.key],
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=1_000_000,
+                cash_by_currency={"KRW": 1_000_000},
+                holdings={stock.key: Holding(stock, quantity=8, average_price=100_000)},
+            ),
+            targets=(PortfolioTarget(cash_like, 4), PortfolioTarget(inverse, 2), PortfolioTarget(stock, 8)),
+            active_insights=(
+                _regime_insight(stock, now, breadth=0.70, momentum=0.20, volatility=0.08),
+                _intraday_guard_reference_insight(cash_like, now, guard_symbol=guard.key, reference_price=100_000),
+            ),
+            model_state=state_view,
+        )
+    )
+
+    approved = {decision.original_target.symbol.key: decision.approved_target.quantity for decision in batch.decisions}
+    regime = batch.decisions[0].metadata["market_regime"]
+    assert approved == {cash_like.key: 4, inverse.key: 2, stock.key: 4}
+    assert regime["by_currency"]["KRW"]["overlay"] == "intraday_risk_off"
+    assert regime["by_currency"]["KRW"]["max_total_exposure_pct"] == 0.25
+    assert batch.decisions[2].reason == "currency_policy_clamped"
+
+
+def test_kospi_growth_risk_intraday_cap_deleverages_existing_holdings_without_new_targets():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 14, 50)
+    weak = Symbol("011070", "KRX")
+    strong = Symbol("032830", "KRX")
+    guard = Symbol("069500", "KRX")
+    cash_like = Symbol("488770", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={
+            weak.key: Bar(weak, now, 790_000, 790_000, 790_000, 790_000, 1000),
+            strong.key: Bar(strong, now, 313_500, 313_500, 313_500, 313_500, 1000),
+            guard.key: Bar(guard, now, 117_840, 116_480, 111_755, 114_750, 1000),
+        },
+    )
+    portfolio = Portfolio(
+        cash=9_351_007,
+        cash_by_currency={"KRW": 9_351_007},
+        holdings={
+            weak.key: Holding(weak, quantity=2, average_price=809_000),
+            strong.key: Holding(strong, quantity=8, average_price=312_375),
+        },
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "regime_exposure_enabled": True,
+            "regime_total_exposure_pct_by_currency": {"KRW": {"strong_risk_on": 1.0}},
+            "intraday_market_guard_enabled": True,
+            "intraday_guard_symbol": guard.key,
+            "intraday_entry_freeze_return_pct": -0.01,
+            "intraday_risk_off_return_pct": -0.02,
+            "intraday_entry_freeze_cap_pct_by_currency": {"KRW": 0.45},
+            "intraday_risk_off_cap_pct_by_currency": {"KRW": 0.25},
+            "intraday_guard_smoothing_enabled": True,
+            "intraday_guard_hard_entry_freeze": False,
+            "intraday_guard_exempt_symbols": [cash_like.key],
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(),
+            active_insights=(
+                _regime_insight(weak, now, breadth=0.70, momentum=0.20, volatility=0.08),
+                _regime_insight(strong, now, breadth=0.70, momentum=0.22, volatility=0.08),
+                _intraday_guard_reference_insight(cash_like, now, guard_symbol=guard.key, reference_price=117_840),
+            ),
+        )
+    )
+
+    assert len(batch.decisions) == 1
+    decision = batch.decisions[0]
+    assert decision.original_target.symbol == weak
+    assert decision.original_target.tag == "risk:exposure_cap_deleverage"
+    assert decision.reason == "currency_policy_clamped"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 1
+    assert decision.metadata["max_total_exposure_pct"] == 0.25
 
 
 def test_leaps_execution_tags_orders_by_currency():
@@ -1206,7 +3161,12 @@ def test_leaps_execution_blocks_after_hours_single_price_by_default():
     assert orders == []
 
 
-def _snapshot(now: datetime, values: dict[str, dict[str, float]]) -> IndicatorSnapshot:
+def _snapshot(
+    now: datetime,
+    values: dict[str, dict[str, float]],
+    *,
+    symbol_metadata: dict[str, dict[str, Any]] | None = None,
+) -> IndicatorSnapshot:
     return IndicatorSnapshot(
         snapshot_id="indicator-test",
         sleeve_id="LEaps",
@@ -1222,6 +3182,7 @@ def _snapshot(now: datetime, values: dict[str, dict[str, float]]) -> IndicatorSn
             for symbol, indicator_values in values.items()
         },
         source_snapshot_id="test",
+        symbol_metadata=symbol_metadata or {},
     )
 
 
@@ -1281,6 +3242,8 @@ def _allocator_insight(
     trend: float = 0.14,
     volatility: float = 0.08,
     breadth: float = 0.70,
+    alpha_id: str = "leaps-kospi-conviction",
+    confidence: float = 0.8,
 ) -> Insight:
     return Insight(
         sleeve_id="LEaps",
@@ -1289,9 +3252,9 @@ def _allocator_insight(
         generated_at=now,
         expires_at=now + timedelta(days=3),
         source_snapshot_id="test",
-        alpha_id="leaps-kospi-conviction",
+        alpha_id=alpha_id,
         alpha_version="0.1.0",
-        confidence=0.8,
+        confidence=confidence,
         score=score,
         metadata={
             "market_breadth": breadth,
@@ -1299,6 +3262,39 @@ def _allocator_insight(
             "momentum_5": momentum_5,
             "trend_strength": trend,
             "volatility": volatility,
+        },
+    )
+
+
+def _bars(now: datetime, symbols: tuple[Symbol, ...], *, close: float) -> DataSlice:
+    return DataSlice(
+        time=now,
+        bars={
+            symbol.key: Bar(symbol, now, close, close, close, close, 1_000_000)
+            for symbol in symbols
+        },
+    )
+
+
+def _partial_trim_insight(symbol: Symbol, now: datetime, *, target_multiplier: float) -> Insight:
+    return Insight(
+        sleeve_id="LEaps",
+        symbol=symbol,
+        direction=InsightDirection.FLAT,
+        generated_at=now,
+        expires_at=now + timedelta(days=1),
+        source_snapshot_id="test",
+        alpha_id="leaps-kospi-swing-rebalance",
+        alpha_version="0.1.0",
+        confidence=0.8,
+        score=0.2,
+        metadata={
+            "portfolio_action": "partial_trim",
+            "target_multiplier": target_multiplier,
+            "momentum": 0.12,
+            "momentum_5": -0.01,
+            "trend_strength": 0.10,
+            "volatility": 0.08,
         },
     )
 

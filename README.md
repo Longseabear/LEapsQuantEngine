@@ -12,6 +12,8 @@ See [docs/model-authoring-guide.md](docs/model-authoring-guide.md) for writing u
 
 See [docs/runtime-cadence-resolution.md](docs/runtime-cadence-resolution.md) for daily indicator resolution, alpha cadence, portfolio target persistence, and urgent exit rules.
 
+See [docs/lean-core-hardening.md](docs/lean-core-hardening.md) for portfolio mutation audit, lineage summaries, market calendars, security properties, universe cadence, transaction costs, and model-state responsibility boundaries.
+
 See [docs/backtesting-guide.md](docs/backtesting-guide.md) for sleeve-specific backtest usage, warmup rules, debug options, fundamentals artifacts, fee/slippage simulation, and multi-market research caveats.
 
 See [docs/krx-market-open-runbook.md](docs/krx-market-open-runbook.md) for the morning KRX live-start procedure, service checks, guarded live loop command, Telegram note, and emergency stop steps.
@@ -101,7 +103,7 @@ Implemented now:
 - Orders: global order coordination, `OrderTicket`, `OrderEvent`, append-only order runtime state, open-ticket polling, execution-history reconciliation, simulated fills, multi-sleeve order orchestration, paper broker gateway, and a StockProgram-style broker-engine gateway.
 - Operations: `runtime-run-multi-once --order-batch-output` is the default live/paper orchestration path for active sleeves. It collects one union live market snapshot, runs each sleeve's framework separately, and writes a submit-ready order-intent artifact. `runtime-run-once` remains useful for single-sleeve diagnostics. `order-runtime-paper-smoke` runs paper submit -> supervisor poll -> final status from an artifact. `order-runtime-submit` commits `OrderIntentBatch` files into tickets and broker submit events behind explicit guards. `order-runtime-status` reads the order runtime store and virtual sleeve account store into an agent/operator status report without touching the broker. `order-runtime-supervise` runs a bounded open-ticket poll plus execution-history reconciliation, can expire rolled-over `day` tickets, can cancel stale tickets when explicitly requested, and returns a final status report. Order runtime commands route through sleeve-level broker account profiles.
 - Runtime: config validation, broker account profiles, runtime bootstrap, one-cycle single-sleeve diagnostics, multi-sleeve live runner with cycle-boundary hot reload and per-sleeve schedule gating, logging, and summary reports.
-- Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills and report metrics.
+- Backtesting: classic `Algorithm.on_data` backtest plus framework alpha replay with immediate fills, report metrics, and point-in-time temporal feature windows for alpha-gated PPO research.
 
 Not complete yet:
 
@@ -226,6 +228,16 @@ Read the current order runtime and sleeve virtual-account state:
 $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli order-runtime-status configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation --summary-only
 ```
+
+Start a read-only operator dashboard over the same local snapshots:
+
+```powershell
+$env:PYTHONPATH='src'
+py -3 -m leaps_quant_engine.cli operator-ui configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --sleeve-id us_etf_rotation
+```
+
+`operator-ui` serves local runtime/order/journal snapshots only. It does not
+call KIS, market-data providers, or broker gateways.
 
 Run one bounded order maintenance pass:
 

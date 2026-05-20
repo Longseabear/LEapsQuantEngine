@@ -12,6 +12,7 @@ from leaps_quant_engine.market_rules import (
     round_krx_price_to_tick,
     round_overseas_price_to_tick,
 )
+from leaps_quant_engine.security import SymbolProperties, symbol_properties_from_metadata
 
 
 class BrokerExecutionError(RuntimeError):
@@ -206,7 +207,7 @@ class BrokerEngineExecutionGateway:
     submit_operation: str = "place_domestic_cash_order"
     cancel_operation: str = "revise_or_cancel_domestic_order"
     order_division: str = "00"
-    exchange_scope: str = "KRX"
+    exchange_scope: str = "SOR"
     use_command_queue: bool = True
     use_hashkey: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -225,10 +226,11 @@ class BrokerEngineExecutionGateway:
             )
         else:
             operation = self.submit_operation
+            exchange_scope = _domestic_exchange_scope(ticket, fallback=self.exchange_scope)
             arguments = _domestic_order_arguments(
                 ticket,
                 order_division=self.order_division,
-                exchange_scope=self.exchange_scope,
+                exchange_scope=exchange_scope,
                 use_hashkey=self.use_hashkey,
             )
         metadata = self._command_metadata(ticket, desired_action="submit")
@@ -286,10 +288,11 @@ class BrokerEngineExecutionGateway:
             )
         else:
             operation = self.cancel_operation
+            exchange_scope = _domestic_exchange_scope(ticket, fallback=self.exchange_scope)
             arguments = _domestic_cancel_arguments(
                 ticket,
                 order_division=self.order_division,
-                exchange_scope=self.exchange_scope,
+                exchange_scope=exchange_scope,
                 use_hashkey=self.use_hashkey,
             )
         metadata = self._command_metadata(ticket, desired_action="cancel")
@@ -375,6 +378,7 @@ class BrokerEngineExecutionGateway:
             if _is_overseas_ticket(ticket)
             else _domestic_order_division(ticket, fallback=self.order_division)
         )
+        exchange_scope = "" if _is_overseas_ticket(ticket) else _domestic_exchange_scope(ticket, fallback=self.exchange_scope)
         return {
             "consumer_id": self.consumer_id,
             "desired_action": desired_action,
@@ -388,6 +392,7 @@ class BrokerEngineExecutionGateway:
             "order_session": order_session,
             "market_session_phase": str(ticket.metadata.get("market_session_phase") or order_session),
             "order_division": order_division,
+            "exchange_scope": exchange_scope,
             **dict(self.metadata),
         }
 
@@ -403,6 +408,7 @@ def _domestic_order_arguments(
         raise BrokerExecutionError("Cannot submit a ticket with no remaining quantity.")
     if ticket.symbol.market.upper() not in {"KR", "KRX"}:
         raise BrokerExecutionError("BrokerEngineExecutionGateway currently supports domestic KRX tickets only.")
+    _validate_ticket_symbol_properties(ticket, _ticket_symbol_properties(ticket))
     return {
         "side": ticket.side.value,
         "symbol": ticket.symbol.ticker,
@@ -422,6 +428,7 @@ def _overseas_order_arguments(
 ) -> dict[str, Any]:
     if ticket.remaining_quantity <= 0:
         raise BrokerExecutionError("Cannot submit a ticket with no remaining quantity.")
+    _validate_ticket_symbol_properties(ticket, _ticket_symbol_properties(ticket))
     exchange = _overseas_order_exchange(ticket)
     return {
         "side": ticket.side.value,
@@ -530,6 +537,35 @@ def _overseas_order_division(ticket: OrderTicket, *, fallback: str) -> str:
     return _OVERSEAS_ORDER_DIVISION_BY_STYLE.get((ticket.order_type, ticket.time_in_force), fallback)
 
 
+def _domestic_exchange_scope(ticket: OrderTicket, *, fallback: str) -> str:
+    properties = _ticket_symbol_properties(ticket)
+    explicit = (
+        ticket.metadata.get("exchange_scope")
+        or ticket.metadata.get("kis_exchange_scope")
+        or ticket.metadata.get("domestic_exchange_scope")
+        or ticket.metadata.get("venue_policy")
+        or ticket.metadata.get("venue")
+        or ticket.metadata.get("market_venue")
+    )
+    return _normalize_domestic_exchange_scope(explicit or properties.default_exchange_scope or fallback)
+
+
+def _normalize_domestic_exchange_scope(value: Any) -> str:
+    text = str(value or "SOR").strip().upper()
+    aliases = {
+        "AUTO": "SOR",
+        "BEST": "SOR",
+        "BEST_EXECUTION": "SOR",
+        "SMART": "SOR",
+        "BROKER_DEFAULT": "SOR",
+        "PRIMARY": "KRX",
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in {"KRX", "NXT", "SOR"}:
+        raise BrokerExecutionError(f"Unsupported domestic exchange scope: {value}.")
+    return normalized
+
+
 def _ticket_order_session(ticket: OrderTicket) -> str:
     return str(ticket.metadata.get("order_session") or ticket.metadata.get("market_session_phase") or "").strip()
 
@@ -544,10 +580,12 @@ def _overseas_order_price(ticket: OrderTicket, *, allow_zero: bool = False, exch
 
 
 def _overseas_order_exchange(ticket: OrderTicket) -> str:
+    properties = _ticket_symbol_properties(ticket)
     explicit = str(
         ticket.metadata.get("order_exchange")
         or ticket.metadata.get("kis_order_exchange")
         or ticket.metadata.get("exchange")
+        or properties.overseas_order_exchange
         or ""
     ).strip().upper()
     if explicit:
@@ -583,6 +621,28 @@ def _normalize_overseas_order_exchange(value: str) -> str:
 
 def _is_overseas_ticket(ticket: OrderTicket) -> bool:
     return ticket.symbol.market.upper() not in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _ticket_symbol_properties(ticket: OrderTicket) -> SymbolProperties:
+    metadata = dict(ticket.metadata)
+    nested = metadata.get("symbol_properties")
+    if isinstance(nested, Mapping):
+        metadata = {**dict(nested), **metadata}
+    return symbol_properties_from_metadata(ticket.symbol.key, metadata)
+
+
+def _validate_ticket_symbol_properties(ticket: OrderTicket, properties: SymbolProperties) -> None:
+    quantity = ticket.remaining_quantity
+    if properties.lot_size > 0 and quantity < properties.lot_size:
+        raise BrokerExecutionError(
+            f"Order quantity {quantity} is below symbol lot size {properties.lot_size} for {ticket.symbol.key}."
+        )
+    if properties.quantity_step > 0:
+        units = quantity / properties.quantity_step
+        if abs(units - round(units)) > 1e-9:
+            raise BrokerExecutionError(
+                f"Order quantity {quantity} is not aligned to symbol quantity step {properties.quantity_step}."
+            )
 
 
 def _domestic_order_price(ticket: OrderTicket) -> int:

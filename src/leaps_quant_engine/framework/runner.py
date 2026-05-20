@@ -97,6 +97,8 @@ class FrameworkCycleResult:
         return self.order_sizing_batch.targets
 
     def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
+        from leaps_quant_engine.lineage import build_cycle_lineage_summary
+
         new_insights = self.new_insight_batch.to_dict() if include_details else {
             "batch_id": self.new_insight_batch.batch_id,
             "sleeve_id": self.new_insight_batch.sleeve_id,
@@ -181,6 +183,7 @@ class FrameworkCycleResult:
             },
             "timings": self.timings.to_dict(),
             "stage_decisions": dict(self.stage_decisions),
+            "lineage": build_cycle_lineage_summary(self).to_dict(),
         }
 
 
@@ -292,6 +295,8 @@ class FrameworkRunner:
             )
         else:
             insight_batch = self.alpha_runtime.run(context, symbols_by_alpha=alpha_symbols_by_model)
+            if not context.allows_new_entries:
+                insight_batch = _suppress_new_entry_insights_for_freshness(insight_batch, context)
         alpha_ms = _elapsed_ms(started)
         stage_decisions: dict[str, Any] = {
             "alpha": dict(insight_batch.metadata),
@@ -331,7 +336,7 @@ class FrameworkRunner:
                 metadata={"portfolio_skipped_reason": "snapshot_quality_invalid"},
             )
         else:
-            portfolio_should_run = self._last_portfolio_target_batch is None or cadence_due(
+            portfolio_should_run = cadence_due(
                 portfolio_cadence,
                 data.time,
                 self._last_portfolio_run_at,
@@ -352,14 +357,24 @@ class FrameworkRunner:
             self._last_portfolio_target_batch = portfolio_target_batch
             self._last_portfolio_run_at = data.time
         elif not invalid_snapshot:
-            reused_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
-            portfolio_target_batch = self._advance_portfolio_blend(
-                portfolio_context,
-                reused_batch,
-                previous_batch=self._last_portfolio_target_batch,
-                market_session=market_session,
-            )
-            self._last_portfolio_target_batch = portfolio_target_batch
+            if self._last_portfolio_target_batch is None:
+                portfolio_target_batch = PortfolioTargetBatch(
+                    sleeve_id=self.sleeve_id,
+                    generated_at=data.time,
+                    targets=(),
+                    model_name=type(self.portfolio_model).__name__,
+                    reason="portfolio_cadence_not_due",
+                    metadata={"portfolio_skipped_reason": "cadence_not_due"},
+                )
+            else:
+                reused_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
+                portfolio_target_batch = self._advance_portfolio_blend(
+                    portfolio_context,
+                    reused_batch,
+                    previous_batch=self._last_portfolio_target_batch,
+                    market_session=market_session,
+                )
+                self._last_portfolio_target_batch = portfolio_target_batch
         portfolio_ms = _elapsed_ms(started)
         stage_decisions["portfolio"] = {
             "cadence": portfolio_cadence,
@@ -560,6 +575,26 @@ def _snapshot_quality_invalid(context: SnapshotContext) -> bool:
         context.quality_report is not None
         and context.quality_report.status is SnapshotQualityStatus.INVALID
     )
+
+
+def _suppress_new_entry_insights_for_freshness(
+    insight_batch: InsightBatch,
+    context: SnapshotContext,
+) -> InsightBatch:
+    retained = tuple(insight for insight in insight_batch.insights if insight.direction.value != "up")
+    suppressed = len(insight_batch.insights) - len(retained)
+    if suppressed <= 0:
+        return insight_batch
+    metadata = dict(insight_batch.metadata)
+    metadata.update(
+        {
+            "freshness_suppressed_new_entry_count": suppressed,
+            "freshness_suppressed_reason": "snapshot_allows_new_entries_false",
+            "snapshot_quality": context.quality_report.status.value if context.quality_report is not None else None,
+            "snapshot_quality_reasons": list(context.quality_report.reasons) if context.quality_report is not None else [],
+        }
+    )
+    return replace(insight_batch, insights=retained, metadata=metadata)
 
 
 def _reuse_portfolio_target_batch(batch: PortfolioTargetBatch, generated_at: datetime) -> PortfolioTargetBatch:

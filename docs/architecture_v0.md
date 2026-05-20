@@ -88,7 +88,9 @@ flowchart LR
 - `VirtualSleeveAccountStore` is the v0 live/paper account projection. It implements `PortfolioProvider`, reads current sleeve portfolios from local state, registers order ownership before broker fills arrive, records raw broker fills, and applies fill allocations idempotently back into sleeve cash/holdings.
 - KIS account holdings are reconciliation inputs only. Sleeve ownership should be recovered from order/fill lineage or explicit operator allocation. Unknown broker executions are recorded as unallocated raw fills first; they should not silently become strategy holdings.
 - `FillAllocation` is the lightweight replacement for the legacy order-chain-lot structure. One broker fill can be partially or fully split across virtual sleeves by quantity, preserving the broker fill as history and deriving each sleeve portfolio as a projection. This gives us the cost-basis traceability we need without coupling LEAN-style alpha/portfolio/risk/execution models to an order-chain object graph.
+- `PortfolioMutationRecord` and `FillApplicationReport` are the audit surface for fill-driven portfolio changes. Existing portfolio mutation behavior remains fill-based, but callers that need diagnostics can now see before/after cash, quantity, average price, fee, estimated realized PnL, and order/ticket/event ids for each applied fill.
 - `KISVirtualAccountSync` is the read-only broker-engine bridge for real account data. It fetches KIS balance, holdings, and execution history through broker-engine operations, converts executions into `VirtualFillEvent` records, applies owned/explicitly assigned fills to `VirtualSleeveAccountStore`, and records unknown fills for later allocation. It does not let deterministic portfolio construction read raw KIS positions.
+- KIS execution costs are preserved when present. `VirtualFillEvent.fee` carries the actual total cash charge and `metadata.transaction_costs` records fee, commission, tax, and regulatory components. Simulated backtest fee/slippage models remain separate and must not overwrite broker-reported costs.
 - Cash follows the same projection rule. KIS balance is stored as an account cash snapshot. Strategy sleeve cash is internal allocation state, and the residual broker cash is assigned to `default sleeve`. Explicit cash transfers move cash between virtual sleeves without touching broker state. A negative sleeve cash balance is allowed as an operational signal that positions were allocated before funding was moved.
 - Operationally, account sync should be incremental and projection-based. Old broker fills remain audit history, but runtime cycles should read the materialized sleeve portfolio, fill allocation status, and reconciliation report instead of replaying the entire execution history. If the raw ledger grows large, reconciled historical fills can be archived behind a position checkpoint while preserving open/unallocated fills and the current sleeve projections.
 - `EqualWeightPortfolioConstructionModel` converts active up insights plus the sleeve portfolio projection into quantity targets and can emit flatten targets when held or previously managed symbols lose active insight support.
@@ -112,6 +114,9 @@ flowchart LR
 - Runtime cycles emit a compact `engine_status` log line for operating agents. This line is intended to answer "is the sleeve healthy, what snapshot did it use, what did the framework decide, and did it create order intents?" without forcing the agent to reconstruct state from many debug logs.
 - `bootstrap_sleeve_runtime(...)` converts a validated `RuntimeConfigSnapshot` into executable runtime objects: coarse universe, provider adapters, optional fine refresh, active selection, alpha runtime, and `BackgroundSnapshotWorker`.
 - Swing strategy indicators should default to confirmed daily resolution. They update only after the daily bar closes and remain fixed during the next intraday session.
+- Market-data snapshots are lane-separated. Quote, minute, and confirmed daily
+  bars must be published as separate `MarketDataSnapshot` records and produce
+  lane-tagged `IndicatorSnapshot` records.
 - Intraday decisions should compare fixed daily indicators against moving live snapshot values such as current price, current volume, and intraday return.
 - Provisional daily indicators may be introduced later, but they must be explicitly named and replayable so they are not confused with confirmed daily indicators.
 
@@ -134,6 +139,7 @@ flowchart LR
 - `leaps_quant_engine.live_snapshot`: one-shot live snapshot runner.
 - `leaps_quant_engine.snapshot_worker`: bounded/background snapshot worker.
 - `leaps_quant_engine.warmup`: one-shot daily indicator warmup runner and readiness report.
+- `leaps_quant_engine.temporal_features`: point-in-time daily feature windows attached to snapshots for temporal PPO and other alpha-gated sequence models.
 - `leaps_quant_engine.adapters.kis`: local broker/market-data-engine adapters.
 - `leaps_quant_engine.logging`: JSON/rotating logging setup.
 

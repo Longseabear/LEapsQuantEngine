@@ -2,7 +2,7 @@ param(
     [string]$Config,
     [string]$SleeveId,
     [int]$IntervalSeconds = 300,
-    [double]$MaxSubmitNotional = 2500,
+    [Nullable[double]]$MaxSubmitNotional = $null,
     [string]$OrderBatchOutput = "data/runtime/live_candidate_orders.json",
     [string]$Journal = "data/cycle-journal/live_order_loop.jsonl",
     [string]$LogPath = "data/runtime/live-order-loop/live_order_loop.log",
@@ -133,6 +133,14 @@ function Test-FlagEnabled {
     return $Value -notmatch '^(false|0|no)$'
 }
 
+function Format-SubmitNotionalCap {
+    param([Nullable[double]]$Value)
+    if ($null -eq $Value) {
+        return "none"
+    }
+    return "$Value"
+}
+
 function Get-OrderSymbolMarketScope {
     param([string]$Symbol)
     $upper = $Symbol.ToUpperInvariant()
@@ -223,22 +231,77 @@ function Save-SubmitState {
 
 function Get-SubmitReportStatus {
     param([object[]]$SubmitOutput)
+    $summary = Get-SubmitReportSummary -SubmitOutput $SubmitOutput
+    return [string]$summary.status
+}
+
+function Get-JsonInt {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+    if ($null -eq $Object) {
+        return 0
+    }
+    if ($Object.PSObject.Properties.Name -notcontains $Name) {
+        return 0
+    }
+    try {
+        return [int]$Object.$Name
+    } catch {
+        return 0
+    }
+}
+
+function Get-SubmitReportSummary {
+    param([object[]]$SubmitOutput)
+    $summary = @{
+        status = ""
+        ticket_count = 0
+        rejected_event_count = 0
+    }
     if ($null -eq $SubmitOutput -or $SubmitOutput.Count -eq 0) {
-        return ""
+        return [pscustomobject]$summary
     }
     $text = ($SubmitOutput | ForEach-Object { [string]$_ }) -join "`n"
     $start = $text.IndexOf("{")
     $end = $text.LastIndexOf("}")
     if ($start -lt 0 -or $end -lt $start) {
-        return ""
+        return [pscustomobject]$summary
     }
     try {
         $payload = $text.Substring($start, $end - $start + 1) | ConvertFrom-Json
-        return [string]$payload.status
+        $summary.status = [string]$payload.status
+        $orchestration = $payload.orchestration
+        $summary.ticket_count = Get-JsonInt -Object $orchestration -Name "ticket_count"
+        $summary.rejected_event_count = Get-JsonInt -Object $orchestration -Name "rejected_event_count"
     } catch {
         Write-LoopLog "submit status parse failed: $($_.Exception.Message)"
-        return ""
     }
+    return [pscustomobject]$summary
+}
+
+function Test-SubmitStateShouldSave {
+    param(
+        [int]$SubmitExit,
+        [int]$OrderCount,
+        [object]$SubmitSummary
+    )
+    if ($SubmitExit -ne 0 -or $OrderCount -le 0) {
+        return $false
+    }
+    if ($SubmitSummary.status -notin @("submitted", "submitted_with_warnings", "ok")) {
+        return $false
+    }
+    if ($SubmitSummary.ticket_count -le 0) {
+        Write-LoopLog "submit state not saved: no broker tickets created"
+        return $false
+    }
+    if ($SubmitSummary.ticket_count -gt 0 -and $SubmitSummary.rejected_event_count -ge $SubmitSummary.ticket_count) {
+        Write-LoopLog "submit state not saved: all broker tickets rejected ticket_count=$($SubmitSummary.ticket_count) rejected_event_count=$($SubmitSummary.rejected_event_count)"
+        return $false
+    }
+    return $true
 }
 
 function Invoke-OrderRuntimeSupervise {
@@ -272,7 +335,7 @@ function Invoke-OrderRuntimeSupervise {
     Write-LoopLog "$Phase order-runtime-supervise exit=$LASTEXITCODE"
 }
 
-Write-LoopLog "live order loop started config=$Config sleeve=$SleeveId interval=${IntervalSeconds}s max_notional=$MaxSubmitNotional submit_state=$SubmitStatePath framework_state=$frameworkStateRelativePath submit_once_per_day=$SubmitOncePerDay guard_mode=engine_target_lineage reconcile_every_cycles=$ReconcileEveryCycles require_supported_submit_session=$RequireSupportedSubmitSession stale_after_seconds=$StaleAfterSeconds cancel_stale=$CancelStaleOpenTickets expire_day=$ExpireDayOpenTickets"
+Write-LoopLog "live order loop started config=$Config sleeve=$SleeveId interval=${IntervalSeconds}s max_notional=$(Format-SubmitNotionalCap $MaxSubmitNotional) submit_state=$SubmitStatePath framework_state=$frameworkStateRelativePath submit_once_per_day=$SubmitOncePerDay guard_mode=engine_target_lineage reconcile_every_cycles=$ReconcileEveryCycles require_supported_submit_session=$RequireSupportedSubmitSession stale_after_seconds=$StaleAfterSeconds cancel_stale=$CancelStaleOpenTickets expire_day=$ExpireDayOpenTickets"
 Write-LoopLog "submit guard note: date-level buy block is disabled; order-runtime-submit uses target_quantity/open_ticket/fill state guards"
 Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath"
 $skipReconcileEnabled = Test-FlagEnabled -Value $SkipReconcile
@@ -332,9 +395,11 @@ while ($true) {
                     "--commit",
                     "--confirm-live-submit",
                     "--summary-only",
-                    "--max-submit-notional", $MaxSubmitNotional,
                     "--poll-after-submit"
                 )
+                if ($null -ne $MaxSubmitNotional) {
+                    $submitArgs += @("--max-submit-notional", $MaxSubmitNotional)
+                }
                 if ($orderCount -gt 0) {
                     $submitArgs += "--notify"
                     $notifyThisCycle = $true
@@ -342,9 +407,10 @@ while ($true) {
                 $submitOutput = py @submitArgs 2>&1
                 $submitOutput | Out-File -FilePath $logFullPath -Append -Encoding utf8
                 $submitExit = $LASTEXITCODE
-                $submitStatus = Get-SubmitReportStatus -SubmitOutput $submitOutput
-                Write-LoopLog "order-runtime-submit exit=$submitExit status=$submitStatus"
-                if ($submitExit -eq 0 -and $orderCount -gt 0 -and $submitStatus -in @("submitted", "submitted_with_warnings", "ok")) {
+                $submitSummary = Get-SubmitReportSummary -SubmitOutput $submitOutput
+                $submitStatus = [string]$submitSummary.status
+                Write-LoopLog "order-runtime-submit exit=$submitExit status=$submitStatus ticket_count=$($submitSummary.ticket_count) rejected_event_count=$($submitSummary.rejected_event_count)"
+                if (Test-SubmitStateShouldSave -SubmitExit $submitExit -OrderCount $orderCount -SubmitSummary $submitSummary) {
                     Save-SubmitState -Today $today -BatchHash $batchHash -OrderCount $orderCount
                     Write-LoopLog "submit state saved state=$submitStateFullPath order_count=$orderCount batch_hash=$batchHash"
                 } elseif ($orderCount -gt 0) {

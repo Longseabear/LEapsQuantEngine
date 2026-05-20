@@ -33,6 +33,8 @@ from leaps_quant_engine.framework.portfolio_model_loader import (
 )
 from leaps_quant_engine.framework.risk import (
     BasicRiskManagementModel,
+    DailyLossLimitRiskModel,
+    MaxDrawdownRiskModel,
     PassThroughRiskManagementModel,
     RiskDecision,
     RiskDecisionBatch,
@@ -51,11 +53,13 @@ from leaps_quant_engine.framework.state import FileFrameworkRunnerStateStore, Fr
 
 __all__ = [
     "BasicRiskManagementModel",
+    "DailyLossLimitRiskModel",
     "EqualWeightPortfolioConstructionModel",
     "FileFrameworkRunnerStateStore",
     "FrameworkCycleResult",
     "FrameworkRunnerState",
     "FrameworkRunner",
+    "MaxDrawdownRiskModel",
     "PassThroughRiskManagementModel",
     "DEFAULT_PORTFOLIO_BLEND_MODEL_ID",
     "PortfolioBlendDecision",

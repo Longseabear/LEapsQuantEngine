@@ -17,6 +17,34 @@ def test_market_data_engine_rate_limit_is_configurable_from_env(monkeypatch, tmp
     assert client.rate_limit_per_second == 18
 
 
+def test_kis_direct_real_rate_limit_default_matches_kis_policy(monkeypatch, tmp_path):
+    monkeypatch.delenv("LEAPS_ENV_FILE", raising=False)
+    monkeypatch.delenv("STOCKPROGRAM_ENV_FILE", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ENGINE_ENV_FILE", raising=False)
+    monkeypatch.delenv("KIS_API_RATE_LIMIT_PER_SECOND", raising=False)
+    monkeypatch.setenv("KIS_APP_KEY", "key")
+    monkeypatch.setenv("KIS_APP_SECRET", "secret")
+
+    settings = load_kis_settings(tmp_path / "missing.env")
+
+    assert settings.rate_limit_per_second == 18
+
+
+def test_kis_direct_mock_rate_limit_default_matches_kis_policy(monkeypatch, tmp_path):
+    monkeypatch.delenv("LEAPS_ENV_FILE", raising=False)
+    monkeypatch.delenv("STOCKPROGRAM_ENV_FILE", raising=False)
+    monkeypatch.delenv("MARKET_DATA_ENGINE_ENV_FILE", raising=False)
+    monkeypatch.delenv("KIS_API_RATE_LIMIT_PER_SECOND", raising=False)
+    monkeypatch.setenv("KIS_APP_KEY", "key")
+    monkeypatch.setenv("KIS_APP_SECRET", "secret")
+    monkeypatch.setenv("KIS_MOCK", "true")
+
+    settings = load_kis_settings(tmp_path / "missing.env")
+
+    assert settings.mock is True
+    assert settings.rate_limit_per_second == 1
+
+
 def test_load_kis_settings_falls_back_to_default_scoped_credentials(monkeypatch, tmp_path):
     monkeypatch.delenv("KIS_APP_KEY", raising=False)
     monkeypatch.delenv("KIS_CANO", raising=False)
@@ -43,7 +71,7 @@ def test_market_data_live_provider_clamps_override_to_kis_limit(monkeypatch, tmp
 
     provider = MarketDataEngineLiveQuoteProvider.from_env(rate_limit_per_second=30)
 
-    assert provider.client.rate_limit_per_second == 20
+    assert provider.client.rate_limit_per_second == 18
 
 
 def test_kis_account_env_prefix_matches_stockprogram_normalization():

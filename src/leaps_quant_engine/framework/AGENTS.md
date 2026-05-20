@@ -50,6 +50,9 @@ InsightManager
 - Run every framework cycle, even when alpha emits no new insights.
 - Approve, reject, or clamp quantity targets with auditable reasons.
 - Handle sleeve-level risk first; account-level collision and cash coordination belongs later in order orchestration.
+- Stateful risk such as daily loss limits and max drawdown is a model concern
+  backed by `RuntimeStateStore`. Core guards remain responsible for oversell,
+  cash, route/session, idempotency, and missing-price safety.
 
 ## Runner
 

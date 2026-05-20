@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEAN Strategy Research"
+  short_description: "Find QuantConnect/LEAN strategies, backtests, and model ideas."
+  default_prompt: "Use $lean-strategy-research to compare recent QuantConnect LEAN strategies and summarize model logic, backtest stats, and adaptation notes."

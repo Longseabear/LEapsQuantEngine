@@ -4,7 +4,12 @@
 
 The new engine must not call KIS directly from algorithms, alpha models, universe selection, portfolio, risk, execution model logic, or indicators.
 
-KIS access now goes through the engine-owned adapter boundary. The default boundary is the in-process `KISDirectClient`; the old broker-engine and market-data-engine servers remain reference/compatibility concepts, not required runtime servers.
+KIS access now goes through the engine-owned adapter boundary. The current
+single-process boundary is the in-process `KISDirectClient`; multi-process
+live operation should route through one local KIS gateway/rate-limit boundary
+instead of letting every process spend the same AppKey quota independently. The
+old broker-engine and market-data-engine servers remain reference/compatibility
+concepts, not required runtime servers.
 
 ```text
 new engine core
@@ -17,18 +22,30 @@ This keeps the most important StockProgram lesson without requiring separate loc
 
 ## Why The Adapter Boundary Is Mandatory
 
-KIS has a low request throughput budget. Treat the AppKey as a shared rate-limited lane. The practical operating rule is:
+KIS has a low request throughput budget. Treat the AppKey as a shared
+rate-limited lane. The current operating limits are 18 REST calls per second
+for real trading and 1 REST call per second for paper trading. KIS can return
+`EGW00201` for per-second transaction count excess. The quota is managed at the
+AppKey lane, so different AppKeys can have independent REST budgets. Do not
+treat one AppKey's capacity as free capacity for every local process; it is the
+conservative upper bound for that shared KIS REST lane unless the operator
+configures a stricter API-specific policy.
+
+The practical operating rule is:
 
 - never let multiple local processes independently spend the same KIS quota
 - never let alpha/universe code call KIS directly
 - route broker-backed quotes, account reads, order actions, and historical KIS calls through the adapter boundary
 - keep adapter rate limits at or below the KIS limit, with headroom for retries and operational calls
+- keep bulk collection lower priority than live order submit, order status,
+  account sync, and execution reconciliation
 
 StockProgram remains the reference for the operational details:
 
 - `broker-engine` owns direct KIS REST/websocket communication
 - `BrokerEngineService` owns per-lane `RateLimitedSession`
-- lane key is based on KIS base URL, AppKey, and mock/real mode
+- lane key is based on KIS base URL, AppKey, and mock/real mode; account id is
+  metadata for routing and reporting, not the primary quota key
 - `/broker/call` exposes whitelisted broker operations
 - `/broker/commands` handles command queue/idempotency for submitted order workflows
 
@@ -70,6 +87,7 @@ StockProgram has separate historical operations and cache wrappers:
 - `get_or_cache_domestic_minute_bars`
 - `get_overseas_daily_ohlcv`
 - `get_overseas_intraday_bars`
+- `get_or_cache_overseas_minute_bars`
 
 The new engine should preserve this split:
 
@@ -94,7 +112,99 @@ absorbing a clearly invalid current-day/reference row. More nuanced corporate
 action adjustment belongs in a dedicated history repair layer, not in alpha or
 portfolio models.
 
-## KIS Throughput Strategy
+## KIS Throughput And Gateway Strategy
+
+`KISDirectClient` caps its default per-process query/request lanes at 18/sec
+for real trading and 1/sec for paper trading. Live runtime configs should use
+18/sec only when calls are coordinated through one AppKey-level gateway/lane.
+Use a lower explicit value for any temporary process that bypasses the shared
+lane. This cap prevents a newly started CLI, MCP server, or collector from
+defaulting to an unsafe high-rate burst.
+
+For one live runner process, in-process rate limiting is acceptable. Once the
+engine runs a live loop, report loop, collector, MCP server, and manual CLIs at
+the same time, the correct shape is a local KIS gateway:
+
+```text
+live runtime / reports / collector / MCP / CLI
+  -> KIS Gateway
+  -> shared lane queues and cache
+  -> KISDirectClient
+  -> KIS
+```
+
+The gateway is not a load balancer that increases throughput. It is a shared
+pacer and request coordinator:
+
+- one token bucket per KIS lane, keyed by base URL, AppKey, mock/real, and
+  operation class
+- account id can be part of operation routing and audit metadata, but it must
+  not accidentally merge or split quota lanes without the AppKey
+- high priority for order submit, cancel/replace, order status, fills, account
+  sync, and risk-critical quote checks
+- normal priority for active-universe live quotes
+- low priority for minute collectors, bulk history refresh, research cache
+  warming, and agent diagnostics
+- short TTL coalescing for identical quote/minute/history requests
+- whole-lane backoff and warning metrics on `EGW00201`
+
+Until that gateway is active, do not run multiple aggressive KIS callers in
+parallel. Bulk cache builders should run off-hours or with an explicit low rate
+limit.
+
+Runtime cycles must not wait for the gateway to finish polling every symbol.
+Collectors update snapshots in the background; cycles read the latest immutable
+snapshot and act according to freshness quality. The default engine thresholds
+are:
+
+- latest quote: fresh at 10 seconds or less during regular sessions
+- extended-session quote: fresh at 30 seconds or less
+- confirmed 1-minute bar: fresh when the latest completed minute bar is present;
+  one missing bar is degraded, not fresh
+- account/cash/holdings: fresh at 60 seconds or less
+- open-ticket order status: fresh at 10 seconds or less
+- no-open-ticket order status: fresh at 60 seconds or less
+- confirmed daily: fresh when the expected last confirmed trading day is present
+
+Freshness is resolution-aware. A 09:31:20 KST cycle expects the confirmed
+09:30 1-minute bar; a 09:29 bar is degraded or stale depending on policy. A
+live quote can be fresh without being a confirmed minute bar, and a minute bar
+must never advance confirmed daily indicators.
+
+Gateway commands:
+
+```powershell
+py -3 -m leaps_quant_engine.cli kis-gateway-serve --host 127.0.0.1 --port 8766
+```
+
+```powershell
+py -3 -m leaps_quant_engine.cli kis-gateway-health --base-url http://127.0.0.1:8766
+```
+
+The health endpoint is:
+
+```text
+GET /health
+```
+
+The gateway is a FastAPI service served by uvicorn. Local OpenAPI docs are
+available at `/docs` while the service is running.
+
+`/health` is intentionally low risk. It does not submit orders and does not
+perform a live KIS probe. It reports local gateway uptime, AppKey-lane
+fingerprint, real/mock mode, effective query/request rate limits, and call
+counters. The app key itself is never returned.
+
+The initial call endpoint is:
+
+```text
+POST /call
+{"operation": "get_stock_price", "arguments": {"market": "domestic", "symbol": "005930"}}
+```
+
+Only engine-owned tools should call `/call`. Strategies and models still use
+normalized market-data, account, and broker ports; they must not call the
+gateway directly.
 
 Do not design universe or alpha around polling hundreds of symbols live.
 
@@ -242,10 +352,11 @@ The cache-first daily history benchmark path exists. The next slice is a long-ru
 ```text
 BackgroundSnapshotWorker
   - reads active universe symbols
-  - uses MarketDataEngineLiveQuoteProvider with configured pacing
+  - uses `kis-gateway` live market data when runtime config selects it
   - closes MarketDataSnapshot at cycle boundaries
   - updates IndicatorEngine
   - publishes IndicatorSnapshot
+  - appends market snapshots to the configured snapshot store
   - logs collection/update/failure/freshness metrics
 ```
 
@@ -263,6 +374,54 @@ IndicatorSnapshot
 This gives the engine a live path where strategies consume the last complete snapshot instead of directly polling broker-backed data.
 
 Indicator plans should be attached to universe definitions and registered in memory before the runtime starts consuming `DataSlice` events.
+
+## Runtime Gateway Wiring
+
+Live runtime config can select the local KIS Gateway explicitly:
+
+```json
+{
+  "market_data": {
+    "provider": "kis-gateway",
+    "source": "kis-gateway",
+    "history_provider": "kis-cache",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 18,
+    "gateway_base_url": "http://127.0.0.1:8766",
+    "snapshot_store_path": "../../data/market-data-snapshots/live_multi_sleeve.jsonl"
+  }
+}
+```
+
+In this mode `bootstrap_sleeve_runtime(...)` and the multi-sleeve runner build
+their live quote provider with `KISGatewayClient`. Backtests stay isolated:
+`runtime-backtest-daily` injects its replay/cache provider through
+`RuntimeBootstrapDependencies`, so it does not require a running Gateway unless
+a caller deliberately provides one.
+
+`runtime-preflight --strict-live` and `runtime-health` include
+`kis_gateway_liveness` whenever the provider is `kis-gateway`. A failed Gateway
+health check is a live-start blocker under strict preflight.
+
+## Snapshot Store
+
+`FileMarketDataSnapshotStore` is an append-only JSONL store for the latest
+runtime market snapshots. Each record contains:
+
+- normalized bars by symbol
+- the snapshot lane: `quote`, `minute`, `daily_confirmed`, or `unknown`
+- source and snapshot id
+- per-sleeve snapshot quality when available
+- optional runtime metadata
+
+The store is diagnostic and replay-supporting state, not a strategy data source
+inside alpha models. Models still consume immutable `SnapshotContext` objects
+published at cycle boundaries.
+
+Snapshot lanes are intentionally strict. A single `MarketDataSnapshot` cannot
+mix quote/minute/daily-confirmed bars; the caller must create separate snapshots
+per lane. This mirrors LEAN's separate subscriptions/consolidated bars and keeps
+daily indicators from sharing an event stream with live quote updates.
 
 ## Logging And Debugging
 
@@ -309,7 +468,9 @@ Supported MCP tools include:
 - `get_or_cache_daily_ohlcv`
 - `get_overseas_daily_ohlcv`
 - `get_intraday_bars`
+- `get_overseas_intraday_bars`
 - `get_or_cache_domestic_minute_bars`
+- `get_or_cache_overseas_minute_bars`
 - `build_whitelist_live_facts`
 - `get_market_session_status`
 

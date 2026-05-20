@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 import importlib.util
 from pathlib import Path
 
@@ -8,6 +8,7 @@ from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightDirection
 from leaps_quant_engine.backtesting import (
     BacktestMetrics,
     VirtualMarketDataProvider,
+    build_replay_feed,
     build_minute_replay_feed_from_bars,
     load_minute_replay_feed,
     run_framework_backtest,
@@ -20,11 +21,26 @@ from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.models import Bar, OrderSide, Symbol
 from leaps_quant_engine.portfolio import Portfolio
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, StatePatch
+from leaps_quant_engine.temporal_features import TemporalFeatureWindowConfig, TemporalFeatureWindowProvider
 from leaps_quant_engine.universe.loader import parse_universe_definition
 from leaps_quant_engine.universe.selection import build_universe_selection_result
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_build_replay_feed_can_stamp_daily_bars_at_market_open_time():
+    symbol = Symbol("005930", "KRX")
+    provider = VirtualMarketDataProvider.from_bars(
+        [
+            Bar(symbol, datetime(2026, 5, 8), 100, 101, 99, 100, 1000, resolution="daily"),
+        ]
+    )
+
+    feed = build_replay_feed(provider, [symbol], daily_bar_time=dt_time(9, 0))
+
+    assert feed[0].time == datetime(2026, 5, 8, 9, 0)
+    assert feed[0].bars[symbol.key].time == datetime(2026, 5, 8, 9, 0)
 
 
 class EntryThenFlatAlpha:
@@ -154,6 +170,36 @@ class CloseValueAlpha:
         ]
 
 
+class TemporalWindowEchoAlpha:
+    alpha_id = "temporal-window-echo"
+    version = "1.0"
+
+    def generate(self, context):
+        symbol_key = context.symbol_keys[0]
+        rows = context.metadata_value(symbol_key, "rl_temporal_features")
+        if not isinstance(rows, (list, tuple)) or not rows:
+            return []
+        return [
+            Insight(
+                sleeve_id=context.sleeve_id,
+                symbol=context.symbol(symbol_key),
+                direction=InsightDirection.UP,
+                generated_at=context.as_of,
+                expires_at=context.as_of + timedelta(days=1),
+                source_snapshot_id=context.source_snapshot_id,
+                alpha_id=self.alpha_id,
+                alpha_version=self.version,
+                weight=1.0,
+                reason="temporal_window_seen",
+                metadata={
+                    "window_len": len(rows),
+                    "feature_schema": context.metadata_value(symbol_key, "rl_temporal_feature_schema"),
+                    "last_return_1": rows[-1]["return_1"],
+                },
+            )
+        ]
+
+
 def _bar(symbol: Symbol, day: int, close: float) -> Bar:
     return Bar(
         symbol=symbol,
@@ -266,6 +312,43 @@ def test_framework_backtest_replays_indicators_alpha_and_metrics():
     assert result.metrics.trade_count == 1
     assert result.metrics.order_count == 2
     assert result.to_report(include_orders=False)["order_count"] == 2
+
+
+def test_framework_backtest_enriches_alpha_context_with_temporal_feature_window():
+    symbol = Symbol("005930", "KRX")
+    universe = parse_universe_definition(
+        {
+            "id": "temporal-framework-backtest",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "close", "type": "close", "period": 1}],
+        }
+    )
+    bars = [_bar(symbol, day, 100.0 + day) for day in range(90)]
+    provider = VirtualMarketDataProvider.from_bars(bars)
+    runner = FrameworkRunner(
+        sleeve_id="framework-kor",
+        alpha_runtime=AlphaRuntime(active_models=(TemporalWindowEchoAlpha(),)),
+    )
+    temporal_provider = TemporalFeatureWindowProvider(TemporalFeatureWindowConfig(lookback_window=64))
+
+    result = run_framework_backtest(
+        universe,
+        provider,
+        sleeve_id="framework-kor",
+        framework_runner=runner,
+        portfolio=Portfolio(cash=1_000),
+        start=bars[84].time,
+        end=bars[85].time,
+        warmup_start=bars[0].time,
+        temporal_feature_provider=temporal_provider,
+    )
+
+    first_insight = result.framework_cycles[0].new_insight_batch.insights[0]
+    assert result.warmup_data_slice_count == 84
+    assert first_insight.metadata["window_len"] == 64
+    assert first_insight.metadata["feature_schema"] == "v2_temporal"
+    assert first_insight.metadata["last_return_1"] == pytest.approx((bars[84].close / bars[83].close) - 1.0)
 
 
 def test_framework_backtest_can_replay_model_state_patches():

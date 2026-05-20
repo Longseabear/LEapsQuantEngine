@@ -170,8 +170,6 @@ $args = @(
   '-Config', 'configs/runtime/live_multi_sleeve.json',
   '-SleeveIds', 'LEaps', 'us_etf_rotation',
   '-IntervalSeconds', '60',
-  '-DomesticMaxSubmitNotional', '7000000',
-  '-OverseasMaxSubmitNotional', '2500',
   '-OrderBatchOutput', 'data/runtime/live-order-loop/multi_sleeve_candidate_orders.json',
   '-Journal', 'data/cycle-journal/live_multi_sleeve.jsonl',
   '-LogPath', 'data/runtime/live-order-loop/multi_sleeve.log',
@@ -186,8 +184,12 @@ $args = @(
 Start-Process -FilePath powershell -ArgumentList $args -WindowStyle Hidden -PassThru
 ```
 
-`DomesticMaxSubmitNotional` and `OverseasMaxSubmitNotional` are intentionally
-separate because KRW and USD notionals are not comparable.
+Submit notional caps are not enabled by default. Strategy size should be
+controlled by portfolio/risk models plus engine guards for cash, oversell,
+route/session support, and idempotency. If an operator wants a temporary
+blast-radius guard, pass `DomesticMaxSubmitNotional` or
+`OverseasMaxSubmitNotional` explicitly; keep them separate because KRW and USD
+notionals are not comparable.
 
 The loop drains `data/runtime/control/live.jsonl` at cycle boundaries. Use
 `runtime-control-submit --command reload-sleeve`, `activate-sleeve`, or
@@ -205,6 +207,13 @@ The skipped sleeve is not passed to `runtime-run-multi-once`, so its market data
 is not collected and its alpha/portfolio/risk/execution stack is not called
 outside its scheduled strategy window. `order-runtime-supervise` can still
 inspect active sleeves for open-ticket maintenance.
+
+After the schedule window, the loop also applies each sleeve's
+`worker.cycle_interval_seconds` from runtime config. This lets one
+multi-sleeve process keep different runtime cadences without duplicating market
+data work. The process `-IntervalSeconds` is only the supervisor wake-up tick;
+set it less than or equal to the fastest sleeve cadence you need. Skips appear
+in the log as `cadence_wait:<seconds>`.
 
 5. Watch the first cycles.
 

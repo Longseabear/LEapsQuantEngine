@@ -6,6 +6,10 @@ This document records what is currently implemented and what should come next. I
 
 Model authoring contracts for universe selection, alpha, portfolio construction, risk, and execution live in `docs/model-authoring-guide.md`.
 
+LEAN hardening contracts for fill audit, lineage, calendar/session reporting,
+security properties, active universe cadence, transaction costs, and model-state
+ownership live in `docs/lean-core-hardening.md`.
+
 ## Implemented
 
 ### Core Engine
@@ -23,7 +27,19 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
   changes, but `FrameworkRunner` commits them only after a successful cycle.
   `InMemoryRuntimeStateStore` and `SQLiteRuntimeStateStore` are implemented;
   `runtime-run-once` and `runtime-run-multi-once` can attach SQLite with
-  `--runtime-state`. See `docs/runtime-state.md`.
+  `--runtime-state`. `RuntimeModelStateView` also exposes JSON object helper
+  methods such as `object_get`, `object_set`, `object_merge`, and
+  `object_delete`. See `docs/runtime-state.md`.
+- Market calendar support exists for `domestic/KRX` and `overseas/US`.
+  Runtime health and preflight report current session state, next open/close,
+  and degraded quality when optional holiday JSON files are missing. Weekend
+  and regular/extended session rules are built in; holiday accuracy depends on
+  configured calendar artifacts.
+- `SymbolProperties` and `SecurityCatalog` resolve symbol-level execution
+  properties from universe metadata plus defaults. Domestic KRX orders default
+  to broker `SOR`, while explicit `KRX`/`NXT`/`SOR` metadata can override.
+  Engine guard and broker submit validation use lot size, quantity step,
+  sessions, and exchange metadata before a live KIS call is attempted.
 
 ### Backtesting
 
@@ -45,6 +61,11 @@ Model authoring contracts for universe selection, alpha, portfolio construction,
   - fill metadata records `fee`, `commission`, `taxes`, `regulatory_fee`, and
     `fee_model`; backtest metrics report `fee_cost` and
     `total_friction_cost`
+- Live execution-history sync preserves actual broker costs when KIS/broker
+  payloads include fee, commission, tax, regulatory fee, or total cost fields.
+  Those values are stored on `VirtualFillEvent.fee` and
+  `metadata.transaction_costs`; live/paper sync does not overwrite them with
+  simulated estimates.
 - `run_framework_backtest(...)` for LEAN-style alpha framework replay:
   - historical `DataSlice`
   - `IndicatorEngine`
@@ -304,6 +325,18 @@ The LEaps workspace config now uses `configs/universes/leaps_kr_research_core.js
 a KRX research universe. The active thesis is KRW/KOSPI upside:
 `leaps-kospi-conviction` emits concentrated KRX growth insights,
 `leaps-kospi-pullback-reversion` adds pullback/rebreak timing insights, and
+`leaps-kospi-swing-rebalance` adds choppy-uptrend behavior by buying controlled
+pullbacks, partially trimming 10-day moving-average breaks or near-high
+overextension, and fully exiting 20-day moving-average breaks. Its trim/exit
+signals are FLAT insights consumed by portfolio construction; the alpha still
+does not create orders or touch broker state.
+`leaps-krx-etf-safety` has also been tightened for crash days: shock regimes
+now target a much larger cash-like plus KODEX Inverse safety book, and
+`risks/kospi_growth_us_hedge.py` treats the KODEX 200 intraday high-watermark
+guard as a stock-risk cap rather than a cap on cash-like/inverse protection.
+The universe includes optional `live_close` so the ETF safety alpha can detect
+an intraday KODEX 200 shock without letting minute bars advance confirmed daily
+SMA/ROC indicators.
 `leaps-volatility-trailing-stop` remains the exit/risk-reduction alpha. US ETF
 rotation/stability is handled by the separate `us_etf_rotation` sleeve. The
 default sleeve is still present in the same config with zero cash and no alpha
@@ -442,6 +475,28 @@ This direct-weight allocator is conceptually closer to the intended RL portfolio
 role and now improves held-out Sharpe, MDD, and turnover versus the previous
 direct-weight baseline. The trade-off is lower total return than the more
 aggressive top-16 search winner.
+
+Temporal PPO support has been added as a research-only path under
+`feature_schema=v2_temporal`. It trains on real
+`[lookback_window, top_k, feature_dim]` observations through
+`TemporalPortfolioFeaturesExtractor`. Runtime inference is now explicitly
+alpha-gated. When a runtime portfolio config uses `feature_schema=v2_temporal`
+or `feature_schema=v2_temporal_residual`, `TemporalFeatureWindowProvider`
+prepares point-in-time daily windows and attaches them to `SnapshotContext`
+symbol metadata as `rl_temporal_features`. LEaps alpha modules pass those
+windows through to UP insights, and the portfolio model only builds temporal
+PPO observations from active UP insights carrying that metadata. If alpha emits
+no signal, or emits a signal without the point-in-time feature window, temporal
+PPO fails closed and creates no new entry target. This avoids the bad shortcut
+of repeating the latest top-k token 64 times or letting PPO scan the universe
+without an alpha signal.
+
+`feature_schema=v2_temporal_residual` is the next alpha-score research variant.
+It adds residual momentum, market beta, and trend quality to the temporal
+observation, and uses a large-cap core reserve so stable leaders are not pushed
+out purely by high-beta momentum spikes. It remains research-only until it wins
+held-out shape metrics; the runtime can now supply the required temporal
+feature windows.
 
 ```powershell
 $env:PYTHONPATH='src'
@@ -1063,7 +1118,11 @@ Current v0 behavior:
   normal order lifecycle events.
 - `BrokerEngineExecutionGateway` rounds domestic limit prices to the side-safe
   KRX tick grid before submission: buys round up, sells round down. Market
-  orders submit with price `0`.
+  orders submit with price `0`. Domestic live orders default to KIS
+  `exchange_scope=SOR` so regular-session Korean orders can use broker-side
+  smart routing between supported venues. A ticket can still override the venue
+  with metadata such as `exchange_scope=KRX` or `exchange_scope=NXT` when a
+  model or operator has a venue-specific reason.
 - `EngineGuard` now checks whole-share quantity, route-supported order style,
   optional orderable market session, and off-tick KRX limit prices. Off-tick
   prices are warnings because the broker gateway can side-safe round them.
@@ -1629,7 +1688,11 @@ py -3 -m leaps_quant_engine.cli --log-level INFO --log-json --log-file logs/live
 - Freshness/degraded-state reporting exists. Alpha can see quality through `SnapshotContext`, and `BasicRiskManagementModel` can block new entries when the active snapshot is not fresh. More nuanced degraded/stale handling is still open.
 - `PortfolioConstructionEngine` exists with Python Portfolio Construction Model loading and a v0 equal-weight allocation model. `OrderSizingEngine` now owns integer quantity conversion, rounding-loss visibility, and rebalance noise filtering before risk and execution. Risk and execution now have deterministic models and sleeve-level Python module loading. The order lifecycle, broker gateway, order runtime store, open-ticket polling worker, execution-history reconcile worker, broker-engine submission path, and multi-sleeve live orchestration path exist. Production daemon packaging and richer model-driven cancel/replace policy remain open.
 - Framework alpha backtesting exists, but n-1 minute delayed indicator snapshot modeling is not implemented yet.
-- Universe selection exists, but is not yet automatically scheduled into the live worker loop.
+- Active universe cadence is implemented for `startup_only`, `once_per_day`,
+  and interval aliases. `RuntimeSleeveRuntime` persists the selected active
+  universe in `RuntimeStateStore`, refreshes only when cadence is due or forced,
+  and swaps the `BackgroundSnapshotWorker` universe at cycle boundaries while
+  preserving forced operational symbols.
 - `OrderTicket` / `OrderEvent` exists with paper and broker-engine submission boundaries. Duplicate submit and common fill double-apply paths are guarded, but cancel/replace is still minimal. Broker fill polling remains intentionally conservative and is reconciled through execution-history/event sync.
 - Telegram notification delivery and inbound update fetching exist in the new
   engine. Operator command handling, approval requests, and webhook processing

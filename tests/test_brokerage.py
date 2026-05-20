@@ -1,7 +1,10 @@
 from datetime import datetime
 
+import pytest
+
 from leaps_quant_engine.brokerage import (
     BrokerEngineExecutionGateway,
+    BrokerExecutionError,
     BrokerExecutionService,
     PaperBrokerExecutionGateway,
 )
@@ -98,7 +101,7 @@ def test_broker_engine_gateway_enqueues_domestic_order_with_stockprogram_dedupe_
         "quantity": 2,
         "price": 70_000,
         "order_division": "00",
-        "exchange_scope": "KRX",
+        "exchange_scope": "SOR",
         "use_hashkey": False,
     }
     assert command["metadata"]["consumer_id"] == "test-consumer"
@@ -107,12 +110,91 @@ def test_broker_engine_gateway_enqueues_domestic_order_with_stockprogram_dedupe_
     assert command["metadata"]["chain_id"] == ticket.ticket_id
     assert command["metadata"]["strategy_leg_id"] == "LEaps"
     assert command["metadata"]["intent_id"] == ticket.order_intent_id
+    assert command["metadata"]["exchange_scope"] == "SOR"
 
     submitted_ticket = ticket.apply_event(event)
     accepted = gateway.poll(submitted_ticket, occurred_at=datetime(2026, 5, 9, 9, 34))
 
     assert accepted[0].event_type is OrderEventType.ACCEPTED
     assert accepted[0].broker_order_id == "001:00012345"
+
+
+def test_broker_engine_gateway_allows_domestic_exchange_scope_override():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 9, 9, 30),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.BUY,
+                2,
+                70_000,
+                metadata={"exchange_scope": "KRX"},
+            ),
+        ),
+        batch_id="batch-krx",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 9, 9, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 9, 9, 32))
+
+    command = client.enqueued[0]
+    assert command["arguments"]["exchange_scope"] == "KRX"
+    assert command["metadata"]["exchange_scope"] == "KRX"
+
+
+def test_broker_engine_gateway_uses_symbol_properties_exchange_scope_default():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 9, 9, 30),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.BUY,
+                2,
+                70_000,
+                metadata={"symbol_properties": {"default_exchange_scope": "KRX"}},
+            ),
+        ),
+        batch_id="batch-krx-properties",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 9, 9, 31)).tickets[0]
+    client = _FakeBrokerEngineQueueClient()
+    gateway = BrokerEngineExecutionGateway(client=client)
+
+    gateway.submit(ticket, occurred_at=datetime(2026, 5, 9, 9, 32))
+
+    assert client.enqueued[0]["arguments"]["exchange_scope"] == "KRX"
+
+
+def test_broker_engine_gateway_rejects_quantity_not_aligned_to_symbol_step():
+    symbol = Symbol("005930", "KRX")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 9, 9, 30),
+        order_intents=(
+            OrderIntent(
+                "LEaps",
+                symbol,
+                OrderSide.BUY,
+                1,
+                70_000,
+                metadata={"symbol_properties": {"quantity_step": 2}},
+            ),
+        ),
+        batch_id="batch-step",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 9, 9, 31)).tickets[0]
+    gateway = BrokerEngineExecutionGateway(client=_FakeBrokerEngineQueueClient())
+
+    with pytest.raises(BrokerExecutionError, match="quantity step"):
+        gateway.submit(ticket, occurred_at=datetime(2026, 5, 9, 9, 32))
 
 
 def test_broker_engine_gateway_maps_market_ioc_ticket_to_domestic_order_division():

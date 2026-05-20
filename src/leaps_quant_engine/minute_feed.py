@@ -238,7 +238,8 @@ class YFinanceMinuteBarProvider:
             self.output_market_by_key.get(symbol.key, symbol.market),
         )
         bars_by_time: dict[datetime, Bar] = {}
-        for chunk_start, chunk_end in _chunk_time_range(start, end, max_days=self.max_request_days):
+        max_request_days = self._max_request_days_for_interval(interval)
+        for chunk_start, chunk_end in _chunk_time_range(start, end, max_days=max_request_days):
             if self.sleep_seconds > 0:
                 time.sleep(self.sleep_seconds)
             frame = self._download_frame(yf, request_ticker, start=chunk_start, end=chunk_end, interval=interval)
@@ -278,6 +279,17 @@ class YFinanceMinuteBarProvider:
             ):
                 bars_by_time[bar.time] = bar
         return [bars_by_time[time_key] for time_key in sorted(bars_by_time)]
+
+    def _max_request_days_for_interval(self, interval: str) -> int:
+        try:
+            interval_minutes = _interval_to_minutes(interval)
+        except ValueError:
+            return self.max_request_days
+        if interval_minutes >= 60:
+            return max(self.max_request_days, 90)
+        if interval_minutes >= 5:
+            return max(self.max_request_days, 30)
+        return self.max_request_days
 
     def _download_frame(self, yf_module, ticker: str, *, start: datetime, end: datetime, interval: str):
         request_start = start.date().isoformat()

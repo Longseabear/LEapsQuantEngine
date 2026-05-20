@@ -322,12 +322,74 @@ def test_portfolio_blend_retarget_keeps_original_deadline():
     transition = blend["active_transition"]
     assert blend["status"] == "retargeted"
     assert blend["started_at"] == start_time.isoformat()
+    assert blend["deadline_at"] == datetime(2026, 5, 15, 10, 5).isoformat()
+    assert blend["from_elapsed_minutes"] == pytest.approx(30.0)
     assert blend["elapsed_minutes"] == pytest.approx(30.0)
     assert blend["progress"] == pytest.approx(0.5)
     assert transition["started_at"] == start_time.isoformat()
+    assert transition["deadline_at"] == datetime(2026, 5, 15, 10, 5).isoformat()
     assert transition["duration_minutes"] == 60
+    assert transition["from_elapsed_minutes"] == pytest.approx(30.0)
     assert transition["reason"] == "retarget_during_active_blend"
-    assert retargeted.targets[0].target_percent == pytest.approx(0.30)
+    assert retargeted.targets[0].target_percent == pytest.approx(0.50)
+
+
+def test_portfolio_blend_repeated_retargets_do_not_extend_deadline_or_jump_target():
+    symbol = Symbol("005930", "KRX")
+    store = InMemoryRuntimeStateStore()
+    engine = PortfolioBlendEngine(
+        PortfolioBlendPolicy(
+            enabled=True,
+            duration_minutes=60,
+            target_drift_threshold_pct=0.01,
+            clock="wall_time",
+        )
+    )
+    seed_time = datetime(2026, 5, 15, 9, 0)
+    seed = engine.apply(_context(symbol, seed_time, store), _batch(symbol, seed_time, 0.20))
+    store.apply_patches(seed.state_patches, applied_at=seed_time)
+
+    start_time = datetime(2026, 5, 15, 9, 5)
+    started = engine.apply(
+        _context(symbol, start_time, store),
+        _batch(symbol, start_time, 0.80),
+        previous_batch=_batch(symbol, seed_time, 0.20),
+    )
+    store.apply_patches(started.state_patches, applied_at=start_time)
+
+    first_retarget_time = datetime(2026, 5, 15, 9, 20)
+    first_retarget = engine.apply(
+        _context(symbol, first_retarget_time, store),
+        _batch(symbol, first_retarget_time, 0.40),
+        previous_batch=_batch(symbol, start_time, 0.80),
+    )
+    store.apply_patches(first_retarget.state_patches, applied_at=first_retarget_time)
+
+    second_retarget_time = datetime(2026, 5, 15, 9, 50)
+    second_retarget = engine.apply(
+        _context(symbol, second_retarget_time, store),
+        _batch(symbol, second_retarget_time, 0.10),
+        previous_batch=_batch(symbol, first_retarget_time, 0.40),
+    )
+    store.apply_patches(second_retarget.state_patches, applied_at=second_retarget_time)
+
+    deadline_time = datetime(2026, 5, 15, 10, 5)
+    completed = engine.apply(
+        _context(symbol, deadline_time, store),
+        _batch(symbol, deadline_time, 0.10),
+        previous_batch=_batch(symbol, second_retarget_time, 0.10),
+    )
+
+    deadline = datetime(2026, 5, 15, 10, 5).isoformat()
+    assert first_retarget.targets[0].target_percent == pytest.approx(0.35)
+    assert first_retarget.metadata["portfolio_blend"]["deadline_at"] == deadline
+    assert first_retarget.metadata["portfolio_blend"]["from_elapsed_minutes"] == pytest.approx(15.0)
+    assert second_retarget.targets[0].target_percent == pytest.approx(0.3833333333)
+    assert second_retarget.metadata["portfolio_blend"]["deadline_at"] == deadline
+    assert second_retarget.metadata["portfolio_blend"]["from_elapsed_minutes"] == pytest.approx(45.0)
+    assert completed.targets[0].target_percent == pytest.approx(0.10)
+    assert completed.metadata["portfolio_blend"]["status"] == "completed"
+    assert completed.metadata["portfolio_blend"]["deadline_at"] == deadline
 
 
 def test_framework_runner_advances_active_blend_between_portfolio_rebalance_runs():

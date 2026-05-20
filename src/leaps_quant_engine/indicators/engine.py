@@ -144,6 +144,7 @@ class IndicatorEngine:
         as_of: datetime | None = None,
         created_at: datetime | None = None,
         quality_report: SnapshotQualityReport | None = None,
+        lane: str = "unknown",
     ) -> IndicatorSnapshot:
         registry = self._registry(sleeve_id)
         symbols = self.symbols_for_sleeve(sleeve_id)
@@ -169,6 +170,7 @@ class IndicatorEngine:
             symbols=tuple(symbol.key for symbol in symbols),
             values=values,
             quality_report=quality_report,
+            lane=lane,
             symbol_metadata={
                 symbol.key: dict(self.latest_bar_metadata_by_sleeve.get(sleeve_id, {}).get(symbol.key, {}))
                 for symbol in symbols

@@ -131,6 +131,101 @@ def test_virtual_sleeve_account_routes_fill_by_order_ownership(tmp_path):
     assert reloaded.quantity(symbol) == 3
 
 
+def test_virtual_sleeve_account_apply_fill_with_report_records_mutation(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
+    store.initialize_sleeve("LEaps", cash=1_000_000)
+    symbol = Symbol("005930", "KRX")
+
+    report = store.apply_fill_with_report(
+        VirtualFillEvent(
+            fill_id="fill-audit-1",
+            order_id="intent-1",
+            sleeve_id="LEaps",
+            broker_order_id="001:0001",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=2,
+            fill_price=70_000,
+            fee=100,
+            filled_at=datetime(2026, 5, 9, 9, 1),
+        ),
+        order_intent_id="intent-1",
+        ticket_id="ticket:intent-1",
+        event_id="event-1",
+    )
+
+    assert report.applied is True
+    assert report.portfolio is not None
+    assert report.portfolio.cash == 859_900
+    assert report.mutation is not None
+    assert report.mutation.before_cash == 1_000_000
+    assert report.mutation.after_cash == 859_900
+    assert report.mutation.before_quantity == 0
+    assert report.mutation.after_quantity == 2
+    assert report.mutation.before_average_price == 0
+    assert report.mutation.after_average_price == 70_000
+    assert report.mutation.fee == 100
+    assert report.mutation.realized_pnl_estimate == 0
+    assert report.mutation.order_intent_id == "intent-1"
+    assert report.mutation.ticket_id == "ticket:intent-1"
+    assert report.mutation.event_id == "event-1"
+
+    duplicate = store.apply_fill_with_report(
+        VirtualFillEvent(
+            fill_id="fill-audit-1",
+            order_id="intent-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=2,
+            fill_price=70_000,
+            filled_at=datetime(2026, 5, 9, 9, 1),
+        )
+    )
+
+    assert duplicate.applied is False
+    assert duplicate.reason == "duplicate_fill_id"
+
+
+def test_virtual_sleeve_account_sell_report_estimates_realized_pnl(tmp_path):
+    store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
+    store.initialize_sleeve("LEaps", cash=1_000_000)
+    symbol = Symbol("005930", "KRX")
+    store.apply_fill(
+        VirtualFillEvent(
+            fill_id="buy-fill",
+            order_id="buy-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.BUY,
+            quantity=3,
+            fill_price=70_000,
+            filled_at=datetime(2026, 5, 9, 9, 1),
+        )
+    )
+
+    report = store.apply_fill_with_report(
+        VirtualFillEvent(
+            fill_id="sell-fill",
+            order_id="sell-1",
+            sleeve_id="LEaps",
+            symbol=symbol,
+            side=OrderSide.SELL,
+            quantity=2,
+            fill_price=72_000,
+            fee=50,
+            filled_at=datetime(2026, 5, 9, 10, 1),
+        )
+    )
+
+    assert report.mutation is not None
+    assert report.mutation.before_quantity == 3
+    assert report.mutation.after_quantity == 1
+    assert report.mutation.before_average_price == 70_000
+    assert report.mutation.after_average_price == 70_000
+    assert report.mutation.realized_pnl_estimate == 3_950
+
+
 def test_virtual_sleeve_account_tracks_position_state_from_fills_and_marks(tmp_path):
     store = VirtualSleeveAccountStore(tmp_path / "accounts.json")
     symbol = Symbol("005930", "KRX")

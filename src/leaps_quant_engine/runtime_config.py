@@ -58,14 +58,20 @@ class MarketDataRuntimeConfig:
     source: str = "market-data-engine"
     history_source: str = "kis-cache"
     rate_limit_per_second: int | None = None
+    gateway_base_url: str | None = None
+    snapshot_store_path: Path | None = None
 
     def __post_init__(self) -> None:
-        if self.provider != "market-data-engine":
+        if self.provider not in {"market-data-engine", "kis-gateway"}:
             raise ConfigurationValidationError(f"Unsupported market data provider: {self.provider}")
         if self.history_provider != "kis-cache":
             raise ConfigurationValidationError(f"Unsupported history provider: {self.history_provider}")
         if self.rate_limit_per_second is not None and self.rate_limit_per_second <= 0:
             raise ConfigurationValidationError("market_data.rate_limit_per_second must be positive.")
+        gateway_base_url = None if self.gateway_base_url is None else str(self.gateway_base_url).strip().rstrip("/")
+        if self.provider == "kis-gateway" and not gateway_base_url:
+            raise ConfigurationValidationError("market_data.gateway_base_url is required for kis-gateway provider.")
+        object.__setattr__(self, "gateway_base_url", gateway_base_url)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,6 +80,8 @@ class MarketDataRuntimeConfig:
             "source": self.source,
             "history_source": self.history_source,
             "rate_limit_per_second": self.rate_limit_per_second,
+            "gateway_base_url": self.gateway_base_url,
+            "snapshot_store_path": _path_to_config_str(self.snapshot_store_path),
         }
 
 
@@ -145,16 +153,20 @@ class ActiveUniverseRuntimeConfig:
         default_factory=lambda: ModuleReference("leaps_quant_engine.universe.selection:StaticUniverseSelectionModel")
     )
     selection_models: tuple[ModuleReference, ...] = ()
+    cadence: str = "startup_only"
 
     def __post_init__(self) -> None:
         if self.max_symbols < 0:
             raise ConfigurationValidationError("universe.active.max_symbols must be non-negative.")
+        if not self.cadence.strip():
+            raise ConfigurationValidationError("universe.active.cadence cannot be empty.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_symbols": self.max_symbols,
             "selection_model": self.selection_model.to_dict(),
             "selection_models": [model.to_dict() for model in self.selection_models],
+            "cadence": self.cadence,
         }
 
 
@@ -562,6 +574,8 @@ def _parse_market_data_runtime_config(payload: Mapping[str, Any]) -> MarketDataR
         source=str(payload.get("source", payload.get("provider", "market-data-engine"))).strip(),
         history_source=str(payload.get("history_source", payload.get("history_provider", "kis-cache"))).strip(),
         rate_limit_per_second=_optional_int(payload.get("rate_limit_per_second")),
+        gateway_base_url=_optional_text(payload.get("gateway_base_url", payload.get("kis_gateway_base_url"))),
+        snapshot_store_path=_optional_path(payload.get("snapshot_store_path")),
     )
 
 
@@ -643,6 +657,7 @@ def _parse_active_universe_runtime_config(payload: Mapping[str, Any]) -> ActiveU
             _parse_module_reference(item)
             for item in _list(payload.get("selection_models"), default=[])
         ),
+        cadence=str(payload.get("cadence", "startup_only")).strip(),
     )
 
 

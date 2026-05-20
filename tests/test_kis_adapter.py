@@ -103,6 +103,20 @@ class FakeMarketDataEngineClient:
                     },
                 ]
             }
+        if tool == "get_or_cache_overseas_minute_bars":
+            return {
+                "candles": [
+                    {
+                        "xymd": "20260508",
+                        "xhms": "093000",
+                        "open": "570.10",
+                        "high": "571.00",
+                        "low": "569.90",
+                        "last": "570.44",
+                        "evol": "1200",
+                    }
+                ]
+            }
         raise AssertionError(tool)
 
 
@@ -294,6 +308,39 @@ def test_cached_kis_provider_loads_domestic_minute_history_from_cache_tool():
             "trade_date": "2026-05-08",
             "start_time": "09:00:00",
             "end_time": "09:01:00",
+            "interval_minutes": 1,
+            "refresh": True,
+        },
+    )
+
+
+def test_cached_kis_provider_loads_overseas_minute_history_from_cache_tool():
+    provider = KISCachedMarketDataProvider(
+        client=FakeMarketDataEngineClient(),
+        exchange_by_symbol={"US:SMH": "NAS"},
+    )
+
+    bars = provider.get_cached_minute_history(
+        Symbol("SMH", "US"),
+        trade_date=datetime(2026, 5, 8),
+        start_time="09:30:00",
+        end_time="09:30:00",
+        interval_minutes=1,
+        refresh=True,
+    )
+
+    assert [bar.time for bar in bars] == [datetime(2026, 5, 8, 9, 30)]
+    assert bars[0].close == 570.44
+    assert bars[0].volume == 1200
+    assert bars[0].resolution == "minute"
+    assert provider.client.calls[0] == (
+        "get_or_cache_overseas_minute_bars",
+        {
+            "symbol": "SMH",
+            "exchange": "NAS",
+            "trade_date": "2026-05-08",
+            "start_time": "09:30:00",
+            "end_time": "09:30:00",
             "interval_minutes": 1,
             "refresh": True,
         },

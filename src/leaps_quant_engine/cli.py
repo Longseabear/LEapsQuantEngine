@@ -24,12 +24,18 @@ from leaps_quant_engine.account_sync import KISAccountClient
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader, SnapshotContext
 from leaps_quant_engine.backtesting import (
     build_minute_replay_feed_from_bars,
+    load_compiled_minute_replay_cache,
+    load_daily_warmup_bars_for_backtest,
+    load_daily_warmup_cache,
     load_minute_replay_feed,
+    minute_replay_source_signature,
     run_framework_backtest,
     run_framework_replay,
     simulated_fill_model_for_costs,
     universe_with_default_indicator_resolution,
     warm_up_daily_indicators_for_backtest,
+    write_compiled_minute_replay_cache,
+    write_daily_warmup_cache,
 )
 from leaps_quant_engine.benchmark import run_daily_indicator_benchmark
 from leaps_quant_engine.broker_routing import (
@@ -50,6 +56,13 @@ from leaps_quant_engine.fundamentals import (
 )
 from leaps_quant_engine.logging import configure_logging
 from leaps_quant_engine.indicators import IndicatorEngine
+from leaps_quant_engine.kis_gateway import (
+    DEFAULT_KIS_GATEWAY_HOST,
+    DEFAULT_KIS_GATEWAY_PORT,
+    KISGatewayService,
+    fetch_kis_gateway_health,
+    run_kis_gateway_http_server,
+)
 from leaps_quant_engine.live_snapshot import run_live_indicator_snapshot
 from leaps_quant_engine.market_rules import synthetic_domestic_market_session, synthetic_us_market_session
 from leaps_quant_engine.minute_feed import (
@@ -99,6 +112,7 @@ from leaps_quant_engine.runtime_recovery import build_recovery_account_report, b
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, SQLiteRuntimeStateStore, fork_sqlite_runtime_state
 from leaps_quant_engine.rl import train_ppo_portfolio_constructor
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
+from leaps_quant_engine.temporal_features import temporal_feature_provider_from_portfolio_parameters
 from leaps_quant_engine.sleeve_workspace import (
     describe_sleeve_alpha_modules,
     describe_sleeve_execution_model,
@@ -247,6 +261,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     sleeve_execution_set.add_argument("--sleeve-id", required=True)
 
     subparsers.add_parser("kis-health")
+
+    kis_gateway_serve = subparsers.add_parser("kis-gateway-serve")
+    kis_gateway_serve.add_argument("--host", default=DEFAULT_KIS_GATEWAY_HOST)
+    kis_gateway_serve.add_argument("--port", type=int, default=DEFAULT_KIS_GATEWAY_PORT)
+    kis_gateway_serve.add_argument("--cache-dir", type=Path)
+
+    kis_gateway_health = subparsers.add_parser("kis-gateway-health")
+    kis_gateway_health.add_argument("--base-url", default=f"http://{DEFAULT_KIS_GATEWAY_HOST}:{DEFAULT_KIS_GATEWAY_PORT}")
+    kis_gateway_health.add_argument("--timeout-seconds", type=float, default=5.0)
 
     kis_quote = subparsers.add_parser("kis-quote")
     kis_quote.add_argument("symbol")
@@ -415,11 +438,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_health.add_argument("--account-store", type=Path)
     runtime_health.add_argument("--order-store", type=Path)
     runtime_health.add_argument("--journal", type=Path)
+    runtime_health.add_argument("--runtime-state", type=Path)
     runtime_health.add_argument("--broker", default="paper", choices=("broker-engine", "paper"))
     runtime_health.add_argument("--max-cycle-age-seconds", type=float, default=300.0)
     runtime_health.add_argument("--max-open-ticket-age-seconds", type=float, default=600.0)
     runtime_health.add_argument("--recent-events", type=int, default=10)
     runtime_health.add_argument("--summary-only", action="store_true")
+
+    operator_ui = subparsers.add_parser("operator-ui")
+    operator_ui.add_argument("config", type=Path)
+    operator_ui.add_argument("--sleeve-id", action="append", default=[])
+    operator_ui.add_argument("--account-id")
+    operator_ui.add_argument("--account-store", type=Path)
+    operator_ui.add_argument("--order-store", type=Path)
+    operator_ui.add_argument("--journal", type=Path)
+    operator_ui.add_argument("--recent-events", type=int, default=10)
+    operator_ui.add_argument("--host", default="127.0.0.1")
+    operator_ui.add_argument("--port", type=int, default=8765)
+    operator_ui.add_argument("--snapshot-only", action="store_true")
 
     runtime_preflight = subparsers.add_parser("runtime-preflight")
     runtime_preflight.add_argument("config", type=Path)
@@ -484,6 +520,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     framework_backtest.add_argument("--start")
     framework_backtest.add_argument("--end")
     framework_backtest.add_argument("--warmup-start")
+    framework_backtest.add_argument("--daily-bar-time")
     framework_backtest.add_argument("--cash", type=float, default=100_000.0)
     framework_backtest.add_argument("--slippage-bps", type=float, default=0.0)
     framework_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
@@ -493,6 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     framework_backtest.add_argument("--fundamentals-market")
     framework_backtest.add_argument("--fundamental-name", action="append", default=[])
     framework_backtest.add_argument("--journal", type=Path)
+    framework_backtest.add_argument("--journal-mode", choices=("auto", "full", "light"), default="auto")
     framework_backtest.add_argument("--include-insights", action="store_true")
     framework_backtest.add_argument("--summary-only", action="store_true")
 
@@ -502,6 +540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_backtest.add_argument("--start")
     runtime_backtest.add_argument("--end")
     runtime_backtest.add_argument("--warmup-start")
+    runtime_backtest.add_argument("--daily-bar-time")
     runtime_backtest.add_argument("--cash", type=float)
     runtime_backtest.add_argument("--currency")
     runtime_backtest.add_argument("--slippage-bps", type=float, default=0.0)
@@ -512,6 +551,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_backtest.add_argument("--fundamentals-market")
     runtime_backtest.add_argument("--fundamental-name", action="append", default=[])
     runtime_backtest.add_argument("--journal", type=Path)
+    runtime_backtest.add_argument("--journal-mode", choices=("auto", "full", "light"), default="auto")
     runtime_backtest.add_argument("--include-insights", action="store_true")
     runtime_backtest.add_argument("--summary-only", action="store_true")
 
@@ -520,6 +560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_minute_backtest.add_argument("--sleeve-id", required=True)
     runtime_minute_backtest.add_argument("--minute-feed", type=Path)
     runtime_minute_backtest.add_argument("--minute-cache-root", type=Path)
+    runtime_minute_backtest.add_argument("--compiled-replay-cache", type=Path)
+    runtime_minute_backtest.add_argument("--refresh-compiled-replay-cache", action="store_true")
     runtime_minute_backtest.add_argument("--start")
     runtime_minute_backtest.add_argument("--end")
     runtime_minute_backtest.add_argument("--warmup-start")
@@ -529,10 +571,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_minute_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
     runtime_minute_backtest.add_argument("--daily-source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
     runtime_minute_backtest.add_argument("--refresh-history", action="store_true")
+    runtime_minute_backtest.add_argument("--daily-warmup-cache", type=Path)
+    runtime_minute_backtest.add_argument("--refresh-daily-warmup-cache", action="store_true")
     runtime_minute_backtest.add_argument("--fundamentals-root", type=Path)
     runtime_minute_backtest.add_argument("--fundamentals-market")
     runtime_minute_backtest.add_argument("--fundamental-name", action="append", default=[])
     runtime_minute_backtest.add_argument("--journal", type=Path)
+    runtime_minute_backtest.add_argument("--journal-mode", choices=("auto", "full", "light"), default="auto")
     runtime_minute_backtest.add_argument("--include-insights", action="store_true")
     runtime_minute_backtest.add_argument("--summary-only", action="store_true")
 
@@ -543,7 +588,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     us_minute_feed.add_argument("--start", required=True)
     us_minute_feed.add_argument("--end", required=True)
     us_minute_feed.add_argument("--interval", default="1m")
-    us_minute_feed.add_argument("--provider", choices=("yfinance",), default="yfinance")
+    us_minute_feed.add_argument("--provider", choices=("yfinance", "kis-cache"), default="yfinance")
     us_minute_feed.add_argument("--timezone", default="America/New_York")
     us_minute_feed.add_argument("--include-prepost", action="store_true")
     us_minute_feed.add_argument("--include-session-metadata", action="store_true")
@@ -1068,6 +1113,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         provider = KISBrokerEngineMarketDataProvider.from_env()
         print(json.dumps(provider.health_check(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "kis-gateway-serve":
+        service = KISGatewayService.from_env(cache_dir=args.cache_dir)
+        run_kis_gateway_http_server(service, host=args.host, port=args.port)
+        return 0
+    if args.command == "kis-gateway-health":
+        print(
+            json.dumps(
+                fetch_kis_gateway_health(args.base_url, timeout_seconds=args.timeout_seconds),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "kis-quote":
         provider = KISBrokerEngineMarketDataProvider.from_env()
         bar = provider.get_latest_bar(Symbol(args.symbol, args.market))
@@ -1488,6 +1546,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         routes = _resolve_order_runtime_routes(snapshot, args.account_id, args.account_store, args.order_store, sleeve_ids)
         journal_path = _runtime_journal_path(snapshot, args.journal)
         journal_store = FileCycleJournalStore(journal_path) if journal_path is not None else None
+        runtime_state_store, _runtime_state_summary = _runtime_state_store_from_args(
+            snapshot,
+            args.runtime_state,
+            read_only=True,
+        )
         reports = []
         for route in routes:
             status_report = _build_order_runtime_status_for_route(
@@ -1502,10 +1565,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     sleeve_ids=sleeve_ids,
                     journal_store=journal_store,
                     order_status=status_report,
+                    runtime_state_store=runtime_state_store,
                     journal_path=journal_path,
                     broker=args.broker,
                     max_cycle_age_seconds=args.max_cycle_age_seconds,
                     max_open_ticket_age_seconds=args.max_open_ticket_age_seconds,
+                    kis_gateway_base_url=(
+                        snapshot.config.market_data.gateway_base_url
+                        if snapshot.config.market_data.provider == "kis-gateway"
+                        else None
+                    ),
                 )
             )
         if len(reports) == 1:
@@ -1525,6 +1594,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                     indent=2,
                 )
             )
+        return 0
+    if args.command == "operator-ui":
+        from leaps_quant_engine.operator_ui import build_operator_dashboard_snapshot, serve_operator_ui
+
+        if args.snapshot_only:
+            report = build_operator_dashboard_snapshot(
+                args.config,
+                sleeve_ids=tuple(args.sleeve_id),
+                account_id=args.account_id,
+                account_store_path=args.account_store,
+                order_store_path=args.order_store,
+                journal_path=args.journal,
+                recent_events=args.recent_events,
+                include_details=False,
+            )
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        serve_operator_ui(
+            args.config,
+            host=args.host,
+            port=args.port,
+            sleeve_ids=tuple(args.sleeve_id),
+            account_id=args.account_id,
+            account_store_path=args.account_store,
+            order_store_path=args.order_store,
+            journal_path=args.journal,
+            recent_events=args.recent_events,
+        )
         return 0
     if args.command == "runtime-preflight":
         snapshot = load_runtime_config_snapshot(args.config)
@@ -1793,6 +1890,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _attach_exchange_map(provider, universe)
         alpha_load = PythonAlphaLoader().load(args.alpha)
         journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
+        journal_mode = _resolve_backtest_journal_mode(args)
         universe_market = getattr(universe, "market", None)
         fundamentals_store = None
         fundamentals_report = None
@@ -1824,6 +1922,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             fundamental_store=fundamentals_store,
             fundamental_names=fundamental_names,
             fill_model=simulated_fill_model_for_costs(slippage_bps=args.slippage_bps, fee_model=args.fee_model),
+            cycle_journal_include_lineage=journal_mode == "full",
+            daily_bar_time=_parse_cli_time(args.daily_bar_time),
         )
         report = result.to_report(
             include_orders=not args.summary_only,
@@ -1831,11 +1931,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_selection_details=(not args.summary_only or args.include_insights),
         )
         report["source"] = args.source
+        if args.daily_bar_time:
+            report["daily_bar_time"] = args.daily_bar_time
         report["fill_model"] = {"slippage_bps": float(args.slippage_bps or 0.0), "fee_model": args.fee_model}
         if fundamentals_report is not None:
             report["fundamentals"] = fundamentals_report
         if args.journal is not None:
-            report["cycle_journal"] = {"path": str(args.journal.resolve())}
+            report["cycle_journal"] = {"path": str(args.journal.resolve()), "mode": journal_mode}
         report["alpha"] = {
             "alpha_id": alpha_load.alpha_id,
             "version": alpha_load.version,
@@ -1868,9 +1970,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             refresh_fine=False,
         )
         universe = runtime.coarse_universe
+        temporal_feature_provider = temporal_feature_provider_from_portfolio_parameters(sleeve_config.portfolio.parameters)
         _attach_exchange_map(provider, universe)
         universe_market = getattr(universe, "market", None)
         journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
+        journal_mode = _resolve_backtest_journal_mode(args)
         fundamentals_store = None
         fundamentals_report = None
         fundamental_names = tuple(args.fundamental_name) if args.fundamental_name else None
@@ -1903,6 +2007,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             selection_models=runtime.selection_models,
             alpha_input_selections=sleeve_config.alpha.input_selections,
             fill_model=simulated_fill_model_for_costs(slippage_bps=args.slippage_bps, fee_model=args.fee_model),
+            temporal_feature_provider=temporal_feature_provider,
+            cycle_journal_include_lineage=journal_mode == "full",
+            daily_bar_time=_parse_cli_time(args.daily_bar_time),
         )
         timings["framework_backtest_ms"] = _perf_elapsed_ms(backtest_started)
         report_started = perf_time.perf_counter()
@@ -1912,6 +2019,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_selection_details=(not args.summary_only or args.include_insights),
         )
         report["source"] = args.source
+        if args.daily_bar_time:
+            report["daily_bar_time"] = args.daily_bar_time
         report["fill_model"] = {"slippage_bps": float(args.slippage_bps or 0.0), "fee_model": args.fee_model}
         report["runtime"] = {
             "runtime_id": snapshot.config.runtime_id,
@@ -1945,7 +2054,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if fundamentals_report is not None:
             report["fundamentals"] = fundamentals_report
         if args.journal is not None:
-            report["cycle_journal"] = {"path": str(args.journal.resolve())}
+            report["cycle_journal"] = {"path": str(args.journal.resolve()), "mode": journal_mode}
         timings["report_generation_ms"] = _perf_elapsed_ms(report_started)
         timings["total_ms"] = _perf_elapsed_ms(command_started)
         report["timings"] = _merge_backtest_timings(timings, result)
@@ -1979,47 +2088,100 @@ def main(argv: Sequence[str] | None = None) -> int:
             preselect_warmup=False,
         )
         universe = universe_with_default_indicator_resolution(runtime.coarse_universe, default_resolution="daily")
+        temporal_feature_provider = temporal_feature_provider_from_portfolio_parameters(sleeve_config.portfolio.parameters)
         _attach_exchange_map(daily_provider, universe)
         start = _parse_cli_datetime(args.start)
         end = _parse_cli_datetime(args.end)
         timings["config_bootstrap_ms"] = _perf_elapsed_ms(setup_started)
         feed_started = perf_time.perf_counter()
         minute_cache_report = None
+        compiled_replay_cache_report = None
         minute_feed_path = args.minute_feed
-        if args.minute_cache_root is not None:
-            if start is None or end is None:
-                raise RuntimeError("--start and --end are required when using --minute-cache-root.")
-            cache_bars, minute_cache_report = load_minute_feed_cache_bars(
-                universe,
-                cache_root=args.minute_cache_root,
-                start=start,
-                end=end,
-            )
-            feed = build_minute_replay_feed_from_bars(cache_bars, start=start, end=end)
-        elif minute_feed_path is not None:
-            feed = load_minute_replay_feed(minute_feed_path, universe=universe, start=start, end=end)
+        feed_source = "minute-cache" if args.minute_cache_root is not None else "minute-feed"
+        compiled_cache_path = args.compiled_replay_cache
+        if (
+            compiled_cache_path is not None
+            and compiled_cache_path.exists()
+            and not args.refresh_compiled_replay_cache
+        ):
+            feed, compiled_replay_cache_report = load_compiled_minute_replay_cache(compiled_cache_path)
+            feed_source = "compiled-replay-cache"
         else:
-            raise RuntimeError("runtime-backtest-minute requires --minute-feed or --minute-cache-root.")
+            source_signature = None
+            if args.minute_cache_root is not None:
+                if start is None or end is None:
+                    raise RuntimeError("--start and --end are required when using --minute-cache-root.")
+                cache_bars, minute_cache_report = load_minute_feed_cache_bars(
+                    universe,
+                    cache_root=args.minute_cache_root,
+                    start=start,
+                    end=end,
+                )
+                feed = build_minute_replay_feed_from_bars(cache_bars, start=start, end=end)
+                source_signature = minute_replay_source_signature(args.minute_cache_root)
+            elif minute_feed_path is not None:
+                feed = load_minute_replay_feed(minute_feed_path, universe=universe, start=start, end=end)
+                source_signature = minute_replay_source_signature(minute_feed_path)
+            else:
+                raise RuntimeError(
+                    "runtime-backtest-minute requires --minute-feed, --minute-cache-root, "
+                    "or an existing --compiled-replay-cache."
+                )
+            if compiled_cache_path is not None:
+                compiled_replay_cache_report = write_compiled_minute_replay_cache(
+                    compiled_cache_path,
+                    feed,
+                    source=feed_source,
+                    source_signature=source_signature,
+                    start=start,
+                    end=end,
+                )
         timings["feed_load_ms"] = _perf_elapsed_ms(feed_started)
         indicator_engine = IndicatorEngine()
         indicator_engine.register_universe(args.sleeve_id, universe)
         warmup_start = _runtime_backtest_warmup_start(args, sleeve_config)
         warmup_end = _minute_backtest_warmup_end(feed, start=start)
         daily_warmup_bar_count = 0
+        daily_warmup_cache_report = None
         warmup_started = perf_time.perf_counter()
         if warmup_start is not None:
-            daily_warmup_bar_count = warm_up_daily_indicators_for_backtest(
-                indicator_engine,
-                sleeve_id=args.sleeve_id,
-                universe=universe,
-                provider=daily_provider,
-                start=warmup_start,
-                end=warmup_end,
-                refresh_history=args.refresh_history,
-            )
+            warmup_cache_path = args.daily_warmup_cache
+            if (
+                warmup_cache_path is not None
+                and warmup_cache_path.exists()
+                and not args.refresh_daily_warmup_cache
+            ):
+                daily_warmup_bars, daily_warmup_cache_report = load_daily_warmup_cache(warmup_cache_path)
+                _validate_daily_warmup_cache_report(
+                    daily_warmup_cache_report,
+                    expected_start=warmup_start,
+                    expected_end=warmup_end,
+                )
+            else:
+                daily_warmup_bars = load_daily_warmup_bars_for_backtest(
+                    daily_provider,
+                    universe,
+                    start=warmup_start,
+                    end=warmup_end,
+                    refresh_history=args.refresh_history,
+                )
+                if warmup_cache_path is not None:
+                    daily_warmup_cache_report = write_daily_warmup_cache(
+                        warmup_cache_path,
+                        daily_warmup_bars,
+                        source=args.daily_source,
+                        source_signature=f"{snapshot.version}:{universe.id}:{warmup_start.isoformat()}:{warmup_end.isoformat() if warmup_end else ''}",
+                        start=warmup_start,
+                        end=warmup_end,
+                    )
+            indicator_engine.warm_up(args.sleeve_id, daily_warmup_bars)
+            daily_warmup_bar_count = len(daily_warmup_bars)
+            if temporal_feature_provider is not None:
+                temporal_feature_provider.update(daily_warmup_bars)
         timings["daily_warmup_ms"] = _perf_elapsed_ms(warmup_started)
         universe_market = getattr(universe, "market", None)
         journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
+        journal_mode = _resolve_backtest_journal_mode(args)
         fundamentals_store = None
         fundamentals_report = None
         fundamental_names = tuple(args.fundamental_name) if args.fundamental_name else None
@@ -2049,6 +2211,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             account_id=sleeve_config.broker_account_id,
             market_scope=market_scope_from_market(universe_market) if universe_market else None,
             warmup_data_slice_count=daily_warmup_bar_count,
+            temporal_feature_provider=temporal_feature_provider,
+            cycle_journal_include_lineage=journal_mode == "full",
         )
         timings["framework_replay_ms"] = _perf_elapsed_ms(replay_started)
         report_started = perf_time.perf_counter()
@@ -2057,7 +2221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_insights=args.include_insights,
             include_selection_details=(not args.summary_only or args.include_insights),
         )
-        report["source"] = "minute-cache" if args.minute_cache_root is not None else "minute-feed"
+        report["source"] = feed_source
         report["daily_source"] = args.daily_source
         report["fill_model"] = {"slippage_bps": float(args.slippage_bps or 0.0), "fee_model": args.fee_model}
         report["runtime"] = {
@@ -2088,6 +2252,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         if minute_cache_report is not None:
             report["minute_cache"] = minute_cache_report.to_dict()
+        if compiled_replay_cache_report is not None:
+            report["compiled_replay_cache"] = compiled_replay_cache_report.to_dict()
+        if daily_warmup_cache_report is not None:
+            report["daily_warmup_cache"] = daily_warmup_cache_report.to_dict()
         report["alpha"] = {
             "alpha_ids": list(runtime.alpha_runtime.active_alpha_ids()),
             "input_selections": dict(sleeve_config.alpha.input_selections),
@@ -2102,7 +2270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if fundamentals_report is not None:
             report["fundamentals"] = fundamentals_report
         if args.journal is not None:
-            report["cycle_journal"] = {"path": str(args.journal.resolve())}
+            report["cycle_journal"] = {"path": str(args.journal.resolve()), "mode": journal_mode}
         timings["report_generation_ms"] = _perf_elapsed_ms(report_started)
         timings["total_ms"] = _perf_elapsed_ms(command_started)
         report["timings"] = _merge_backtest_timings(timings, result)
@@ -2117,17 +2285,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         end = _parse_cli_minute_end(args.end)
         if end < start:
             raise RuntimeError("--end must be greater than or equal to --start.")
-        if args.provider != "yfinance":
+        if args.provider not in {"yfinance", "kis-cache"}:
             raise RuntimeError(f"Unsupported US minute feed provider: {args.provider}")
         requested_symbols = tuple(args.symbol or ())
         if args.max_symbols is not None and not requested_symbols:
             requested_symbols = tuple(symbol.key for symbol in universe.symbols[: max(int(args.max_symbols), 0)])
-        provider = YFinanceMinuteBarProvider(
-            timezone=args.timezone,
-            include_prepost=args.include_prepost,
-            annotate_sessions=args.include_session_metadata,
-            sleep_seconds=float(args.sleep_seconds or 0.0),
-        )
+        if args.provider == "kis-cache":
+            provider = KISCachedMinuteBarProvider(
+                provider=KISCachedMarketDataProvider.from_env(
+                    exchange_by_symbol=_kis_exchange_map_for_universe(universe)
+                ),
+                refresh=False,
+                daily_start_time=None,
+                daily_end_time=None,
+            )
+        else:
+            provider = YFinanceMinuteBarProvider(
+                timezone=args.timezone,
+                include_prepost=args.include_prepost,
+                annotate_sessions=args.include_session_metadata,
+                sleep_seconds=float(args.sleep_seconds or 0.0),
+            )
         report_obj = download_us_minute_feed(
             universe,
             provider=provider,
@@ -2186,14 +2364,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         timezone_name = args.timezone or _default_minute_timezone_for_market(universe.market)
         include_session_metadata = bool(args.include_session_metadata or args.include_extended_hours)
         if args.provider == "kis-cache":
-            if market_scope_from_market(universe.market) != "domestic":
-                raise RuntimeError("--provider kis-cache for minute-cache-build currently supports domestic/KRX universes only.")
             daily_start_time, daily_end_time = _minute_cache_session_time_bounds(
                 universe.market,
                 include_extended_hours=args.include_extended_hours,
             )
             provider = KISCachedMinuteBarProvider(
-                provider=KISCachedMarketDataProvider.from_env(),
+                provider=KISCachedMarketDataProvider.from_env(
+                    exchange_by_symbol=_kis_exchange_map_for_universe(universe)
+                ),
                 refresh=args.refresh_provider_cache,
                 daily_start_time=daily_start_time,
                 daily_end_time=daily_end_time,
@@ -2367,6 +2545,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             allocation_mode=str(portfolio_parameters.get("allocation_mode", "exposure")),
             initial_cash=args.training_cash,
+            feature_schema=str(portfolio_parameters.get("feature_schema", "legacy")),
+            lookback_window=int(portfolio_parameters.get("lookback_window", 20)),
+            rollout_length=(
+                int(portfolio_parameters["rollout_length"])
+                if portfolio_parameters.get("rollout_length") is not None
+                else None
+            ),
+            random_rollout=bool(portfolio_parameters.get("random_rollout", False)),
+            max_target_turnover_pct=(
+                float(portfolio_parameters["max_target_turnover_pct"])
+                if portfolio_parameters.get("max_target_turnover_pct") is not None
+                else None
+            ),
+            attention_features_dim=int(portfolio_parameters.get("attention_features_dim", 64)),
+            attention_embed_dim=int(portfolio_parameters.get("attention_embed_dim", 32)),
+            attention_num_heads=int(portfolio_parameters.get("attention_num_heads", 4)),
+            attention_num_layers=(
+                int(portfolio_parameters["attention_num_layers"])
+                if portfolio_parameters.get("attention_num_layers") is not None
+                else None
+            ),
         )
         payload = {
             "status": "trained",
@@ -2763,6 +2962,18 @@ def _parse_cli_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(text)
 
 
+def _parse_cli_time(value: str | None) -> clock_time | None:
+    if not value:
+        return None
+    text = value.strip()
+    for pattern in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, pattern).time()
+        except ValueError:
+            continue
+    raise RuntimeError(f"Time must be HH:MM or HH:MM:SS: {value}")
+
+
 def _parse_cli_minute_start(value: str) -> datetime:
     parsed = _parse_cli_datetime(value)
     if parsed is None:
@@ -2949,6 +3160,20 @@ def _default_minute_timezone_for_market(market: str) -> str:
     return "UTC"
 
 
+def _kis_exchange_map_for_universe(universe) -> dict[str, str]:
+    exchange_by_symbol: dict[str, str] = {}
+    for symbol in universe.symbols:
+        market = symbol.market.strip().upper()
+        exchange = universe.properties_for(symbol).get("exchange")
+        if not exchange and market in {"NAS", "NYS", "AMS", "HKS", "TSE", "SHS", "SZS"}:
+            exchange = market
+        if exchange:
+            normalized = str(exchange).strip().upper()
+            exchange_by_symbol[symbol.key] = normalized
+            exchange_by_symbol[symbol.ticker] = normalized
+    return exchange_by_symbol
+
+
 def _runtime_backtest_warmup_start(args, sleeve_config) -> datetime | None:
     explicit = _parse_cli_datetime(getattr(args, "warmup_start", None))
     if explicit is not None:
@@ -2991,6 +3216,26 @@ def _merge_backtest_timings(timings: dict[str, float], result) -> dict[str, floa
     merged.update(timings)
     merged["framework_model_ms"] = round(float(getattr(result, "framework_total_ms", 0.0) or 0.0), 3)
     return {key: round(float(value), 3) for key, value in merged.items()}
+
+
+def _resolve_backtest_journal_mode(args) -> str:
+    mode = str(getattr(args, "journal_mode", "auto") or "auto").strip().lower()
+    if mode == "auto":
+        return "light" if bool(getattr(args, "summary_only", False)) else "full"
+    return mode
+
+
+def _validate_daily_warmup_cache_report(report, *, expected_start: datetime, expected_end: datetime | None) -> None:
+    if report.start is not None and report.start != expected_start:
+        raise RuntimeError(
+            "--daily-warmup-cache start does not match requested warmup window; "
+            "pass --refresh-daily-warmup-cache to rebuild it."
+        )
+    if report.end is not None and expected_end is not None and report.end != expected_end:
+        raise RuntimeError(
+            "--daily-warmup-cache end does not match requested warmup window; "
+            "pass --refresh-daily-warmup-cache to rebuild it."
+        )
 
 
 def _history_cache_report(provider) -> dict[str, object]:

@@ -31,11 +31,13 @@ class IndicatorSnapshot:
     source_snapshot_id: str | None = None
     quality_report: SnapshotQualityReport | None = None
     symbol_metadata: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    lane: str = "unknown"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbols", tuple(self.symbols))
         object.__setattr__(self, "values", _freeze_values(self.values))
         object.__setattr__(self, "symbol_metadata", _freeze_metadata(self.symbol_metadata))
+        object.__setattr__(self, "lane", _normalize_snapshot_lane(self.lane))
 
     def value(self, symbol_key: str, name: str, *, ready_only: bool = True) -> float | None:
         indicator_value = self.values.get(symbol_key, {}).get(name)
@@ -61,35 +63,58 @@ class IndicatorSnapshot:
 
 @dataclass(slots=True)
 class IndicatorSnapshotStore:
-    _active: IndicatorSnapshot | None = None
-    _pending: IndicatorSnapshot | None = None
+    _active_by_lane: dict[str, IndicatorSnapshot] = field(default_factory=dict)
+    _pending_by_lane: dict[str, IndicatorSnapshot] = field(default_factory=dict)
+    _active_lane: str | None = None
+    _pending_lane: str | None = None
     _lock: Lock = field(default_factory=Lock)
 
     def publish_active(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self._lock:
-            self._active = snapshot
-            self._pending = None
+            lane = _normalize_snapshot_lane(snapshot.lane)
+            self._active_by_lane[lane] = snapshot
+            self._pending_by_lane.pop(lane, None)
+            self._active_lane = lane
+            if self._pending_lane == lane:
+                self._pending_lane = None
             return snapshot
 
     def publish_pending(self, snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
         with self._lock:
-            self._pending = snapshot
+            lane = _normalize_snapshot_lane(snapshot.lane)
+            self._pending_by_lane[lane] = snapshot
+            self._pending_lane = lane
             return snapshot
 
-    def swap(self) -> IndicatorSnapshot | None:
+    def swap(self, lane: str | None = None) -> IndicatorSnapshot | None:
         with self._lock:
-            if self._pending is not None:
-                self._active = self._pending
-                self._pending = None
-            return self._active
+            target_lane = _normalize_snapshot_lane(lane) if lane is not None else self._pending_lane
+            if target_lane is not None and target_lane in self._pending_by_lane:
+                self._active_by_lane[target_lane] = self._pending_by_lane.pop(target_lane)
+                self._active_lane = target_lane
+                if self._pending_lane == target_lane:
+                    self._pending_lane = None
+            if target_lane is None:
+                return None
+            return self._active_by_lane.get(target_lane)
 
-    def active(self) -> IndicatorSnapshot | None:
+    def active(self, lane: str | None = None) -> IndicatorSnapshot | None:
         with self._lock:
-            return self._active
+            target_lane = _normalize_snapshot_lane(lane) if lane is not None else self._active_lane
+            if target_lane is None:
+                return None
+            return self._active_by_lane.get(target_lane)
 
-    def pending(self) -> IndicatorSnapshot | None:
+    def pending(self, lane: str | None = None) -> IndicatorSnapshot | None:
         with self._lock:
-            return self._pending
+            target_lane = _normalize_snapshot_lane(lane) if lane is not None else self._pending_lane
+            if target_lane is None:
+                return None
+            return self._pending_by_lane.get(target_lane)
+
+    def active_lanes(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._active_by_lane))
 
 
 def _freeze_values(
@@ -110,3 +135,16 @@ def _freeze_metadata(
         for symbol_key, symbol_metadata in metadata.items()
     }
     return MappingProxyType(frozen_symbols)
+
+
+def _normalize_snapshot_lane(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"", "any", "*"}:
+        return "unknown"
+    if text in {"live", "quote", "tick", "second"}:
+        return "quote"
+    if text in {"minute", "intraday"}:
+        return "minute"
+    if text in {"daily", "daily_confirmed", "confirmed_daily"}:
+        return "daily_confirmed"
+    return text

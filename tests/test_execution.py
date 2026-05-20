@@ -115,6 +115,39 @@ def test_market_execution_model_uses_market_order_without_limit_price():
     assert order.time_in_force is TimeInForce.IOC
 
 
+def test_execution_model_buy_window_blocks_new_buys_but_allows_sells():
+    symbol = Symbol("AAA", "US")
+    outside_window = datetime(2026, 5, 18, 15, 0)
+    data = DataSlice(
+        time=outside_window,
+        bars={symbol.key: Bar(symbol, outside_window, 100, 100, 100, 100, 1000)},
+    )
+    model = ImmediateExecutionModel(buy_window="09:05-14:50 America/New_York")
+
+    buy_batch = ExecutionEngine(model=model).execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=outside_window,
+            portfolio=Portfolio(cash=1_000),
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 3, "entry"),),
+        )
+    )
+    sell_batch = ExecutionEngine(model=model).execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=outside_window,
+            portfolio=Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=3, average_price=90.0)}),
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 0, "exit"),),
+        )
+    )
+
+    assert buy_batch.order_intents == ()
+    assert buy_batch.metadata["approved_target_count"] == 1
+    assert sell_batch.order_intents[0].side is OrderSide.SELL
+
+
 def test_sliced_execution_model_splits_large_delta_into_child_orders():
     symbol = Symbol("AAA", "US")
     data = _slice(symbol, 100.0)

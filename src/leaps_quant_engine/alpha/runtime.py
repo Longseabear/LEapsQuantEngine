@@ -108,7 +108,9 @@ class AlphaRuntime:
                         "alpha_version": getattr(model, "version", ""),
                         "sleeve_id": context.sleeve_id,
                         "cadence": cadence,
-                        "last_run_at": last_run_by_alpha_id[alpha_id].isoformat(),
+                        "last_run_at": last_run_by_alpha_id[alpha_id].isoformat()
+                        if alpha_id in last_run_by_alpha_id
+                        else None,
                     },
                 )
                 continue

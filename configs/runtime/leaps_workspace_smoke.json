@@ -3,11 +3,13 @@
   "mode": "live",
   "timezone": "Asia/Seoul",
   "market_data": {
-    "provider": "market-data-engine",
+    "provider": "kis-gateway",
     "history_provider": "kis-cache",
-    "source": "market-data-engine",
+    "source": "kis-gateway",
     "history_source": "kis-cache",
-    "rate_limit_per_second": 5
+    "rate_limit_per_second": 18,
+    "gateway_base_url": "http://127.0.0.1:8766",
+    "snapshot_store_path": "../../data/market-data-snapshots/leaps_workspace_smoke.jsonl"
   },
   "broker_accounts": [
     {

@@ -18,6 +18,17 @@ from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 
 
 ORDER_INTENT_BATCH_ARTIFACT_SCHEMA_VERSION = "order_intent_batches.v1"
+_ORDER_DROP_GUARD_REASONS = frozenset(
+    {
+        "target_quantity_already_covered_by_pending_orders",
+        "reserved_sell_quantity_exceeded",
+    }
+)
+_ORDER_CLAMP_GUARD_REASONS = frozenset(
+    {
+        "order_quantity_exceeds_unreserved_target_delta",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +119,7 @@ class OrderRuntimeSubmitter:
         generated_at = generated_at or datetime.now()
         batches_tuple = _enrich_batches_with_market_session(tuple(batches), self.market_session)
         coordination = self.coordinator.coordinate(batches_tuple, generated_at=generated_at)
-        errors, warnings = _validate_submit_request(
+        request_errors, warnings = _validate_submit_request(
             batches_tuple,
             broker=broker,
             commit=commit,
@@ -117,7 +128,7 @@ class OrderRuntimeSubmitter:
             max_submit_notional=max_submit_notional,
             allowed_symbols=allowed_symbols,
         )
-        errors = initial_errors + errors
+        errors = initial_errors + request_errors
         guard = self.engine_guard.evaluate(
             batches=batches_tuple,
             account_store=self.account_store,
@@ -130,6 +141,36 @@ class OrderRuntimeSubmitter:
             market_session=self.market_session,
             generated_at=generated_at,
         )
+
+        if commit and not errors and guard.blocked:
+            filtered_batches, dropped, adjusted = _repair_guard_rejected_order_intents(batches_tuple, guard)
+            if dropped or adjusted:
+                batches_tuple = filtered_batches
+                coordination = self.coordinator.coordinate(batches_tuple, generated_at=generated_at)
+                request_errors, request_warnings = _validate_submit_request(
+                    batches_tuple,
+                    broker=broker,
+                    commit=commit,
+                    confirm_live_submit=confirm_live_submit,
+                    allowed_sleeve_ids=allowed_sleeve_ids,
+                    max_submit_notional=max_submit_notional,
+                    allowed_symbols=allowed_symbols,
+                )
+                errors = initial_errors + request_errors
+                warnings = warnings + request_warnings + _dropped_order_warnings(dropped) + _adjusted_order_warnings(adjusted)
+                guard = self.engine_guard.evaluate(
+                    batches=batches_tuple,
+                    account_store=self.account_store,
+                    order_state_store=self.order_state_store,
+                    account_id=self.broker_account_id,
+                    market_scope=self.market_scope,
+                    broker=broker,
+                    commit=commit,
+                    require_orderable_session=self.require_orderable_session
+                    or (commit and broker == "broker-engine" and confirm_live_submit),
+                    market_session=self.market_session,
+                    generated_at=generated_at,
+                )
         errors = errors + guard.errors
         warnings = warnings + guard.warnings
         errors = tuple(dict.fromkeys(errors))
@@ -178,6 +219,171 @@ class OrderRuntimeSubmitter:
             errors=errors,
             warnings=warnings,
         )
+
+
+def _repair_guard_rejected_order_intents(
+    batches: tuple[OrderIntentBatch, ...],
+    guard: EngineGuardReport,
+) -> tuple[tuple[OrderIntentBatch, ...], tuple[EngineGuardDecisionDrop, ...], tuple[EngineGuardDecisionAdjustment, ...]]:
+    drop_keys: dict[tuple[str, str, str], EngineGuardDecisionDrop] = {}
+    clamp_limits: dict[tuple[str, str, str], EngineGuardDecisionAdjustment] = {}
+    for decision in guard.decisions:
+        if decision.status != "rejected":
+            continue
+        if not decision.sleeve_id or not decision.symbol or not decision.order_side:
+            continue
+        key = (decision.sleeve_id, decision.symbol, decision.order_side)
+        if decision.reason in _ORDER_DROP_GUARD_REASONS:
+            drop_keys.setdefault(
+                key,
+                EngineGuardDecisionDrop(
+                    sleeve_id=decision.sleeve_id,
+                    symbol=decision.symbol,
+                    order_side=decision.order_side,
+                    reason=decision.reason,
+                ),
+            )
+            continue
+        if decision.reason in _ORDER_CLAMP_GUARD_REASONS:
+            max_quantity = _clamp_quantity_from_guard_decision(decision.metadata, order_side=decision.order_side)
+            if max_quantity is not None:
+                clamp_limits.setdefault(
+                    key,
+                    EngineGuardDecisionAdjustment(
+                        sleeve_id=decision.sleeve_id,
+                        symbol=decision.symbol,
+                        order_side=decision.order_side,
+                        reason=decision.reason,
+                        max_quantity=max_quantity,
+                    ),
+                )
+    if not drop_keys and not clamp_limits:
+        return batches, (), ()
+
+    filtered_batches: list[OrderIntentBatch] = []
+    dropped: list[EngineGuardDecisionDrop] = []
+    dropped_keys: set[tuple[str, str, str]] = set()
+    adjusted: list[EngineGuardDecisionAdjustment] = []
+    remaining_by_key = {key: adjustment.max_quantity for key, adjustment in clamp_limits.items()}
+    for batch in batches:
+        kept_orders: list[OrderIntent] = []
+        for order in batch.order_intents:
+            key = (order.sleeve_id, order.symbol.key, order.side.value)
+            drop = drop_keys.get(key)
+            if drop is not None:
+                if key not in dropped_keys:
+                    dropped.append(drop)
+                    dropped_keys.add(key)
+                continue
+
+            adjustment = clamp_limits.get(key)
+            if adjustment is None:
+                kept_orders.append(order)
+                continue
+            remaining = remaining_by_key.get(key, 0)
+            if remaining <= 0:
+                if key not in dropped_keys:
+                    dropped.append(
+                        EngineGuardDecisionDrop(
+                            sleeve_id=order.sleeve_id,
+                            symbol=order.symbol.key,
+                            order_side=order.side.value,
+                            reason=adjustment.reason,
+                        )
+                    )
+                    dropped_keys.add(key)
+                continue
+            if order.quantity <= remaining:
+                kept_orders.append(order)
+                remaining_by_key[key] = remaining - order.quantity
+                continue
+            kept_orders.append(
+                replace(
+                    order,
+                    quantity=remaining,
+                    metadata={
+                        **dict(order.metadata),
+                        "engine_guard_original_quantity": order.quantity,
+                        "engine_guard_adjusted_quantity": remaining,
+                        "engine_guard_adjustment_reason": adjustment.reason,
+                    },
+                )
+            )
+            remaining_by_key[key] = 0
+            adjusted.append(
+                EngineGuardDecisionAdjustment(
+                    sleeve_id=adjustment.sleeve_id,
+                    symbol=adjustment.symbol,
+                    order_side=adjustment.order_side,
+                    reason=adjustment.reason,
+                    max_quantity=adjustment.max_quantity,
+                    original_quantity=order.quantity,
+                    adjusted_quantity=remaining,
+                )
+            )
+        if kept_orders:
+            filtered_batches.append(replace(batch, order_intents=tuple(kept_orders)))
+    return tuple(filtered_batches), tuple(dropped), tuple(adjusted)
+
+
+@dataclass(frozen=True, slots=True)
+class EngineGuardDecisionDrop:
+    sleeve_id: str
+    symbol: str
+    order_side: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class EngineGuardDecisionAdjustment:
+    sleeve_id: str
+    symbol: str
+    order_side: str
+    reason: str
+    max_quantity: int
+    original_quantity: int | None = None
+    adjusted_quantity: int | None = None
+
+
+def _dropped_order_warnings(dropped: tuple[EngineGuardDecisionDrop, ...]) -> tuple[str, ...]:
+    return tuple(
+        f"dropped_guard_rejected_order_intent:{drop.sleeve_id}:{drop.symbol}:{drop.order_side}:{drop.reason}"
+        for drop in dropped
+    )
+
+
+def _adjusted_order_warnings(adjusted: tuple[EngineGuardDecisionAdjustment, ...]) -> tuple[str, ...]:
+    return tuple(
+        "adjusted_guard_rejected_order_intent:"
+        f"{item.sleeve_id}:{item.symbol}:{item.order_side}:{item.reason}:"
+        f"{item.original_quantity}->{item.adjusted_quantity}"
+        for item in adjusted
+        if item.original_quantity is not None and item.adjusted_quantity is not None
+    )
+
+
+def _clamp_quantity_from_guard_decision(metadata: Mapping[str, Any], *, order_side: str) -> int | None:
+    unreserved_delta = _int_or_none(metadata.get("unreserved_delta"))
+    if unreserved_delta is None or unreserved_delta == 0:
+        return None
+    if order_side == OrderSide.BUY.value and unreserved_delta > 0:
+        return unreserved_delta
+    if order_side == OrderSide.SELL.value and unreserved_delta < 0:
+        return abs(unreserved_delta)
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_count(batches: tuple[OrderIntentBatch, ...]) -> int:
+    return sum(batch.order_count for batch in batches)
 
 
 def _enrich_batches_with_market_session(

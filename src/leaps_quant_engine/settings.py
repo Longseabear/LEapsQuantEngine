@@ -21,7 +21,7 @@ class KISSettings:
     cano: str | None = None
     account_product_code: str | None = None
     mock: bool = False
-    rate_limit_per_second: int = 15
+    rate_limit_per_second: int = 18
     market_data_engine_rate_limit_per_second: int = 15
     broker_engine_base_url: str = "http://127.0.0.1:8755"
     market_data_engine_base_url: str = "http://127.0.0.1:8765"
@@ -134,6 +134,7 @@ def _settings_from_env(
         raise ConfigurationError("KIS_APP_KEY is required.")
     if not app_secret:
         raise ConfigurationError("KIS_APP_SECRET is required.")
+    mock_value = _parse_bool(os.getenv("KIS_MOCK"), default=False) if mock is None else mock
 
     return KISSettings(
         app_key=app_key,
@@ -143,8 +144,8 @@ def _settings_from_env(
         hts_id=(hts_id or os.getenv("KIS_HTS_ID", "")).strip() or None,
         cano=(cano or "").strip() or None,
         account_product_code=(account_product_code or "").strip() or None,
-        mock=_parse_bool(os.getenv("KIS_MOCK"), default=False) if mock is None else mock,
-        rate_limit_per_second=_parse_positive_int("KIS_API_RATE_LIMIT_PER_SECOND", default=15),
+        mock=mock_value,
+        rate_limit_per_second=_parse_positive_int("KIS_API_RATE_LIMIT_PER_SECOND", default=1 if mock_value else 18),
         market_data_engine_rate_limit_per_second=_parse_positive_int(
             "MARKET_DATA_ENGINE_RATE_LIMIT_PER_SECOND",
             default=15,

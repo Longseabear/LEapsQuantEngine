@@ -473,8 +473,25 @@ class KISCachedMarketDataProvider(MarketDataProvider):
         interval_minutes: int = 1,
         refresh: bool = False,
     ) -> list[Bar]:
-        if _kis_market(symbol.market) != "domestic":
-            raise MarketDataError("Cached minute history is currently supported for domestic symbols only.")
+        if _kis_market(symbol.market) == "overseas":
+            exchange = _resolve_exchange(symbol, self.exchange_by_symbol)
+            result = self.client.call_tool(
+                "get_or_cache_overseas_minute_bars",
+                {
+                    "symbol": symbol.ticker,
+                    "exchange": exchange,
+                    "trade_date": trade_date.strftime("%Y-%m-%d"),
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "interval_minutes": interval_minutes,
+                    "refresh": refresh,
+                },
+            )
+            rows = _extract_history_rows(result)
+            return sorted(
+                (_row_to_bar(symbol, row, default_date=trade_date, resolution=DataResolution.MINUTE.value) for row in rows),
+                key=lambda bar: bar.time,
+            )
         result = self.client.call_tool(
             "get_or_cache_domestic_minute_bars",
             {
@@ -725,7 +742,7 @@ def _safe_market_data_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cap_kis_rate(value: int) -> int:
-    return min(max(int(value), 1), 20)
+    return min(max(int(value), 1), 18)
 
 
 def _latest_quote_arguments(
@@ -835,8 +852,8 @@ def _row_to_bar(
         open=_float_field(row, "open", "open_price", "stck_oprc", "ovrs_nmix_oprc"),
         high=_float_field(row, "high", "high_price", "stck_hgpr", "ovrs_nmix_hgpr"),
         low=_float_field(row, "low", "low_price", "stck_lwpr", "ovrs_nmix_lwpr"),
-        close=_float_field(row, "close", "close_price", "stck_clpr", "stck_prpr", "ovrs_nmix_prpr"),
-        volume=int(_first_present(row, ("volume", "cntg_vol", "acml_vol", "acml_vol_qty"), default=0)),
+        close=_float_field(row, "close", "close_price", "last", "stck_clpr", "stck_prpr", "ovrs_nmix_prpr"),
+        volume=int(_first_present(row, ("volume", "cntg_vol", "evol", "acml_vol", "acml_vol_qty"), default=0)),
         resolution=resolution,
     )
 
@@ -932,7 +949,7 @@ def _parse_row_datetime(row: dict[str, Any], *, default_date: datetime | None = 
         if value not in (None, ""):
             return _parse_date(str(value))
     date_value = _first_present(row, ("date", "trade_date", "stck_bsop_date", "xymd"), default=None)
-    time_value = _first_present(row, ("time", "stck_cntg_hour", "hour", "hhmmss"), default=None)
+    time_value = _first_present(row, ("time", "stck_cntg_hour", "hour", "hhmmss", "xhms", "local_time"), default=None)
     if date_value not in (None, "") and time_value not in (None, ""):
         return _combine_date_time(str(date_value), str(time_value))
     if time_value not in (None, "") and default_date is not None:

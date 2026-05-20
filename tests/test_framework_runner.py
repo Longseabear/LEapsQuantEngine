@@ -126,6 +126,30 @@ def _invalid_snapshot(as_of: datetime, symbol: Symbol) -> IndicatorSnapshot:
     )
 
 
+def _degraded_snapshot(as_of: datetime, symbol: Symbol) -> IndicatorSnapshot:
+    snapshot = _snapshot(as_of, symbol)
+    return IndicatorSnapshot(
+        snapshot_id=snapshot.snapshot_id,
+        sleeve_id=snapshot.sleeve_id,
+        universe_id=snapshot.universe_id,
+        as_of=snapshot.as_of,
+        created_at=snapshot.created_at,
+        symbols=snapshot.symbols,
+        source_snapshot_id=snapshot.source_snapshot_id,
+        values=snapshot.values,
+        quality_report=SnapshotQualityReport(
+            status=SnapshotQualityStatus.DEGRADED,
+            complete_ratio=1.0,
+            age_seconds=12.0,
+            collection_seconds=0.0,
+            requested_symbol_count=1,
+            collected_symbol_count=1,
+            failed_symbol_count=0,
+            reasons=("quote_stale_for_entry",),
+        ),
+    )
+
+
 def _slice(as_of: datetime, symbol: Symbol, close: float = 100.0) -> DataSlice:
     return DataSlice(
         time=as_of,
@@ -205,6 +229,37 @@ def test_framework_runner_turns_active_insight_into_order_intent():
     assert summary["portfolio_target_batch"]["target_count"] == 1
     assert summary["order_sizing"]["target_count"] == 1
     assert summary["active_insights"] == []
+
+
+def test_framework_runner_blocks_up_insights_when_snapshot_disallows_new_entries():
+    symbol = Symbol("NVDA", "US")
+    as_of = datetime(2026, 5, 9, 9, 30)
+    insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=as_of,
+        source_snapshot_id="market-0930",
+        alpha_id="one-shot",
+        alpha_version="1.0",
+        weight=0.5,
+    )
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(insight),)),
+        portfolio_model=EqualWeightPortfolioConstructionModel(),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+
+    result = runner.run_once(
+        indicator_snapshot=_degraded_snapshot(as_of, symbol),
+        data=_slice(as_of, symbol, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    assert result.new_insight_batch.insight_count == 0
+    assert result.order_intents == ()
+    assert result.stage_decisions["alpha"]["freshness_suppressed_new_entry_count"] == 1
 
 
 def test_framework_runner_scopes_alpha_with_selection_symbols():
@@ -412,6 +467,49 @@ def test_framework_runner_runs_portfolio_again_after_minute_rebalance_cadence():
     assert first.stage_decisions["portfolio"]["ran"] is True
     assert second.stage_decisions["portfolio"]["ran"] is False
     assert third.stage_decisions["portfolio"]["ran"] is True
+
+
+def test_framework_runner_waits_for_scheduled_portfolio_rebalance_time():
+    symbol = Symbol("NVDA", "US")
+    before_time = datetime(2026, 5, 18, 8, 54)
+    due_time = datetime(2026, 5, 18, 8, 55)
+    insight = Insight(
+        sleeve_id="us-live",
+        symbol=symbol,
+        direction=InsightDirection.UP,
+        generated_at=before_time,
+        expires_at=datetime(2026, 5, 19, 9, 30),
+        source_snapshot_id="market-0854",
+        alpha_id="cycle-alpha",
+        alpha_version="1.0",
+    )
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(insight),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="week_start_at 08:55 Asia/Seoul"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    portfolio = Portfolio(cash=1_000)
+
+    skipped = runner.run_once(
+        indicator_snapshot=_snapshot(before_time, symbol),
+        data=_slice(before_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+    due = runner.run_once(
+        indicator_snapshot=_snapshot(due_time, symbol),
+        data=_slice(due_time, symbol, close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert skipped.stage_decisions["portfolio"]["ran"] is False
+    assert skipped.portfolio_target_batch.metadata["portfolio_skipped_reason"] == "cadence_not_due"
+    assert skipped.order_intents == ()
+    assert due.stage_decisions["portfolio"]["ran"] is True
+    assert due.portfolio_target_batch.target_count == 1
 
 
 def test_framework_runner_restores_rebalance_state_across_run_once_processes(tmp_path):

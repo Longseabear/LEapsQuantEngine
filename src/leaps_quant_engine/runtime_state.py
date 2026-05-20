@@ -246,6 +246,145 @@ class RuntimeModelStateView:
             position_id=position_id,
         )
 
+    def object_get(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+        default: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record = self.get(
+            sleeve_id=sleeve_id,
+            model_id=model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+        )
+        if record is None:
+            return dict(default or {})
+        return dict(record.value)
+
+    def object_entries(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str | None = None,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(record.value)
+            for record in self.entries(
+                sleeve_id=sleeve_id,
+                model_id=model_id,
+                namespace=namespace,
+                symbol_key=symbol_key,
+                position_id=position_id,
+            )
+        )
+
+    def patch(
+        self,
+        value: Mapping[str, Any] | None = None,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+        operation: StatePatchOperation | str = StatePatchOperation.MERGE,
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return StatePatch(
+            key=self.key(
+                sleeve_id=sleeve_id,
+                model_id=model_id,
+                namespace=namespace,
+                symbol_key=symbol_key,
+                position_id=position_id,
+            ),
+            value=dict(value or {}),
+            operation=operation,
+            reason=reason,
+            generated_at=generated_at or datetime.now(),
+        )
+
+    def object_set(
+        self,
+        value: Mapping[str, Any],
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return self.patch(
+            value,
+            sleeve_id=sleeve_id,
+            model_id=model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+            operation=StatePatchOperation.SET,
+            reason=reason,
+            generated_at=generated_at,
+        )
+
+    def object_merge(
+        self,
+        value: Mapping[str, Any],
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return self.patch(
+            value,
+            sleeve_id=sleeve_id,
+            model_id=model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+            operation=StatePatchOperation.MERGE,
+            reason=reason,
+            generated_at=generated_at,
+        )
+
+    def object_delete(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return self.patch(
+            {},
+            sleeve_id=sleeve_id,
+            model_id=model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+            operation=StatePatchOperation.DELETE,
+            reason=reason,
+            generated_at=generated_at,
+        )
+
     def key(
         self,
         *,

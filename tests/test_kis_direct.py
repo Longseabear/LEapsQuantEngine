@@ -1,3 +1,5 @@
+import requests
+
 from leaps_quant_engine.adapters.kis_direct import KISDirectClient, KISDirectClientError, _TOKEN_CACHE
 from leaps_quant_engine.settings import KISSettings
 
@@ -251,6 +253,32 @@ class _FakeSession:
                     ],
                 }
             )
+        if url.endswith("/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"):
+            return _FakeResponse(
+                {
+                    "rt_cd": "0",
+                    "output2": [
+                        {
+                            "xymd": "20260515",
+                            "xhms": "093000",
+                            "open": "570.10",
+                            "high": "571.00",
+                            "low": "569.90",
+                            "last": "570.44",
+                            "evol": "1200",
+                        },
+                        {
+                            "xymd": "20260515",
+                            "xhms": "093100",
+                            "open": "570.44",
+                            "high": "571.20",
+                            "low": "570.00",
+                            "last": "571.00",
+                            "evol": "850",
+                        },
+                    ],
+                }
+            )
         raise AssertionError(url)
 
 
@@ -312,6 +340,41 @@ def test_direct_kis_daily_history_uses_local_file_cache(tmp_path):
     assert session.get_calls == []
 
 
+def test_direct_kis_overseas_minute_history_uses_local_file_cache(tmp_path):
+    _TOKEN_CACHE.clear()
+    session = _FakeSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+    args = {
+        "symbol": "SMH",
+        "exchange": "NAS",
+        "trade_date": "2026-05-15",
+        "start_time": "09:30:00",
+        "end_time": "09:30:00",
+        "interval_minutes": 1,
+        "refresh": True,
+    }
+
+    first = client.call_tool("get_or_cache_overseas_minute_bars", args)
+    session.get_calls.clear()
+    second = client.call_tool("get_or_cache_overseas_minute_bars", {**args, "refresh": False})
+
+    assert first["candles"] == [
+        {
+            "date": "20260515",
+            "time": "093000",
+            "local_date": "20260515",
+            "local_time": "093000",
+            "open_price": 570.10,
+            "high_price": 571.00,
+            "low_price": 569.90,
+            "close_price": 570.44,
+            "volume": 1200,
+        }
+    ]
+    assert second["candles"][0]["close_price"] == 570.44
+    assert session.get_calls == []
+
+
 def test_direct_kis_quote_retries_rate_limit_response(tmp_path, monkeypatch):
     class _RateLimitThenSuccessSession(_FakeSession):
         def __init__(self):
@@ -343,6 +406,155 @@ def test_direct_kis_quote_retries_rate_limit_response(tmp_path, monkeypatch):
 
     assert session.quote_attempts == 2
     assert result["last_price"] == 289500
+
+
+def test_direct_kis_client_clamps_real_query_and_request_lanes_to_18():
+    settings = KISSettings(app_key="key", app_secret="secret", rate_limit_per_second=500)
+
+    client = KISDirectClient.from_settings(settings)
+
+    assert client.rate_limit_per_second == 18
+    assert client.query_rate_limit_per_second == 18
+    assert client.request_rate_limit_per_second == 18
+
+
+def test_direct_kis_client_clamps_mock_query_and_request_lanes_to_1():
+    settings = KISSettings(app_key="key", app_secret="secret", mock=True, rate_limit_per_second=500)
+
+    client = KISDirectClient.from_settings(settings)
+
+    assert client.rate_limit_per_second == 1
+    assert client.query_rate_limit_per_second == 1
+    assert client.request_rate_limit_per_second == 1
+
+
+def test_direct_kis_order_retries_explicit_rate_limit_response(tmp_path, monkeypatch):
+    class _RateLimitThenSuccessSession(_FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.order_attempts = 0
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
+                self.order_attempts += 1
+                if self.order_attempts == 1:
+                    self.post_calls.append({"url": url, "json": dict(json or {}), "headers": dict(headers or {})})
+                    return _FakeResponse(
+                        {
+                            "rt_cd": "1",
+                            "msg_cd": "EGW00201",
+                            "msg1": "초당 거래건수를 초과하였습니다.",
+                        }
+                    )
+            return super().post(url, json=json, headers=headers, timeout=timeout)
+
+    monkeypatch.setattr("leaps_quant_engine.adapters.kis_direct.time.sleep", lambda seconds: None)
+    _TOKEN_CACHE.clear()
+    session = _RateLimitThenSuccessSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation(
+        "place_domestic_cash_order",
+        {
+            "side": "buy",
+            "symbol": "005930",
+            "quantity": 1,
+            "price": 70000,
+            "order_division": "00",
+        },
+    )
+
+    assert session.order_attempts == 2
+    assert result["order_no"] == "00012345"
+
+
+def test_direct_kis_domestic_order_falls_back_to_krx_when_sor_is_unavailable(tmp_path):
+    class _SorUnavailableThenSuccessSession(_FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.order_attempts = 0
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
+                self.order_attempts += 1
+                self.post_calls.append({"url": url, "json": dict(json or {}), "headers": dict(headers or {})})
+                if json["EXCG_ID_DVSN_CD"] == "SOR":
+                    return _FakeResponse(
+                        {
+                            "rt_cd": "1",
+                            "msg_cd": "APBK3009",
+                            "msg1": "SOR 시장에서 거래가 불가능한 종목입니다.",
+                        }
+                    )
+                return _FakeResponse(
+                    {
+                        "rt_cd": "0",
+                        "msg_cd": "ok",
+                        "msg1": "accepted",
+                        "output": {
+                            "KRX_FWDG_ORD_ORGNO": "001",
+                            "ODNO": "00054321",
+                            "ORD_TMD": "093001",
+                        },
+                    }
+                )
+            return super().post(url, json=json, headers=headers, timeout=timeout)
+
+    _TOKEN_CACHE.clear()
+    session = _SorUnavailableThenSuccessSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation(
+        "place_domestic_cash_order",
+        {
+            "side": "sell",
+            "symbol": "036930",
+            "quantity": 1,
+            "price": 155700,
+            "order_division": "00",
+            "exchange_scope": "SOR",
+        },
+    )
+
+    assert session.order_attempts == 2
+    assert session.post_calls[-2]["json"]["EXCG_ID_DVSN_CD"] == "SOR"
+    assert session.post_calls[-1]["json"]["EXCG_ID_DVSN_CD"] == "KRX"
+    assert result["order_no"] == "00054321"
+    assert result["exchange_scope"] == "KRX"
+
+
+def test_direct_kis_order_timeout_is_not_retried_to_avoid_duplicate_order(tmp_path):
+    class _TimeoutOrderSession(_FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.order_attempts = 0
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
+                self.order_attempts += 1
+                raise requests.Timeout("timed out")
+            return super().post(url, json=json, headers=headers, timeout=timeout)
+
+    _TOKEN_CACHE.clear()
+    session = _TimeoutOrderSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    try:
+        client.call_operation(
+            "place_domestic_cash_order",
+            {
+                "side": "buy",
+                "symbol": "005930",
+                "quantity": 1,
+                "price": 70000,
+                "order_division": "00",
+            },
+        )
+    except KISDirectClientError as exc:
+        assert "reconcile broker order status before retrying" in str(exc)
+    else:
+        raise AssertionError("order timeout should require reconciliation before retry")
+    assert session.order_attempts == 1
 
 
 def test_direct_kis_limit_order_rejects_zero_price(tmp_path):

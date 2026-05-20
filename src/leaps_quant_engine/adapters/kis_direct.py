@@ -19,6 +19,11 @@ class KISDirectClientError(RuntimeError):
     """Raised when the in-process KIS adapter cannot complete an operation."""
 
 
+_KIS_REAL_MAX_RATE_LIMIT_PER_SECOND = 18
+_KIS_MOCK_MAX_RATE_LIMIT_PER_SECOND = 1
+_KIS_RETRY_ATTEMPTS = 4
+
+
 @dataclass(frozen=True, slots=True)
 class KISAccessToken:
     token: str
@@ -35,15 +40,22 @@ class KISDirectClient:
     settings: KISSettings
     session: requests.Session = field(default_factory=requests.Session)
     cache_dir: Path = Path("data/kis-cache")
-    rate_limit_per_second: int = 10
-    _lock: Lock = field(default_factory=Lock)
-    _last_request_at: float = 0.0
+    rate_limit_per_second: int = _KIS_REAL_MAX_RATE_LIMIT_PER_SECOND
+    query_rate_limit_per_second: int | None = None
+    request_rate_limit_per_second: int | None = None
+    _query_lock: Lock = field(default_factory=Lock)
+    _request_lock: Lock = field(default_factory=Lock)
+    _last_query_request_at: float = 0.0
+    _last_request_request_at: float = 0.0
 
     @classmethod
     def from_settings(cls, settings: KISSettings) -> "KISDirectClient":
+        rate_limit = _clamp_rate_limit(settings.rate_limit_per_second, mock=settings.mock)
         return cls(
             settings=settings,
-            rate_limit_per_second=min(max(settings.rate_limit_per_second, 1), 20),
+            rate_limit_per_second=rate_limit,
+            query_rate_limit_per_second=rate_limit,
+            request_rate_limit_per_second=rate_limit,
         )
 
     def health_check(self) -> dict[str, Any]:
@@ -53,6 +65,8 @@ class KISDirectClient:
             "mock": self.settings.mock,
             "base_url": self.settings.base_url,
             "cache_dir": str(self.cache_dir),
+            "query_rate_limit_per_second": self._lane_rate_limit("query"),
+            "request_rate_limit_per_second": self._lane_rate_limit("request"),
             "supported_operations": sorted(_SUPPORTED_OPERATIONS),
         }
 
@@ -71,8 +85,12 @@ class KISDirectClient:
             return self._get_or_cache_daily_ohlcv(args)
         if operation == "get_or_cache_domestic_minute_bars":
             return self._get_or_cache_domestic_minute_bars(args)
+        if operation == "get_or_cache_overseas_minute_bars":
+            return self._get_or_cache_overseas_minute_bars(args)
         if operation == "get_intraday_bars":
             return self._get_domestic_intraday_bars(args)
+        if operation == "get_overseas_intraday_bars":
+            return self._get_overseas_intraday_bars(args)
         if operation == "get_domestic_news_titles":
             return self._get_domestic_news_titles(args)
         if operation == "get_overseas_news_titles":
@@ -179,6 +197,43 @@ class KISDirectClient:
                     "start_time": start_time,
                     "end_time": end_time,
                     "include_previous_data": args.get("include_previous_data", True),
+                }
+            )
+            _write_json(cache_path, payload)
+        filtered = dict(payload)
+        rows = _history_rows(filtered)
+        filtered["candles"] = [
+            row
+            for row in rows
+            if _row_date(row) == trade_date and start_time <= _row_time(row) <= end_time
+        ]
+        filtered["cache"] = {"path": str(cache_path), "refresh": refresh}
+        return filtered
+
+    def _get_or_cache_overseas_minute_bars(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = _required_text(args, "symbol").upper()
+        exchange = _required_exchange(args)
+        trade_date = _required_date(args, "trade_date")
+        start_time = _optional_time(args.get("start_time")) or "000000"
+        end_time = _optional_time(args.get("end_time")) or "235959"
+        interval_minutes = _positive_int(args.get("interval_minutes") or 1, "interval_minutes")
+        refresh = bool(args.get("refresh", False))
+        cache_path = (
+            self.cache_dir
+            / "minute"
+            / "overseas"
+            / exchange
+            / trade_date
+            / f"{symbol}_{interval_minutes}m.json"
+        )
+        if not refresh and cache_path.exists():
+            payload = _read_json(cache_path)
+        else:
+            payload = self._get_overseas_intraday_bars(
+                {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "interval_minutes": interval_minutes,
                 }
             )
             _write_json(cache_path, payload)
@@ -561,6 +616,56 @@ class KISDirectClient:
             "candles": candles,
         }
 
+    def _get_overseas_intraday_bars(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = _required_text(args, "symbol").upper()
+        exchange = _required_exchange(args)
+        interval_minutes = _positive_int(args.get("interval_minutes") or 1, "interval_minutes")
+        payload = self._get_json(
+            "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
+            tr_id="HHDFS76950200",
+            params={
+                "AUTH": "",
+                "EXCD": exchange,
+                "SYMB": symbol,
+                "NMIN": str(interval_minutes),
+                "PINC": "1",
+                "NEXT": "",
+                "NREC": str(args.get("record_count") or "120"),
+                "FILL": "",
+                "KEYB": "",
+            },
+            label=f"overseas intraday {exchange}:{symbol}",
+        )
+        rows = _required_sequence(payload, "output2")
+        candles: list[dict[str, Any]] = []
+        for row in rows:
+            row_date = str(row.get("xymd", "")).strip()
+            row_time = _optional_time(row.get("xhms")) or ""
+            if not row_date or not row_time:
+                continue
+            candles.append(
+                {
+                    "date": row_date,
+                    "time": row_time,
+                    "local_date": row_date,
+                    "local_time": row_time,
+                    "open_price": _to_float(row.get("open"), "open"),
+                    "high_price": _to_float(row.get("high"), "high"),
+                    "low_price": _to_float(row.get("low"), "low"),
+                    "close_price": _to_float(row.get("last"), "last"),
+                    "volume": _to_int(row.get("evol"), "evol"),
+                }
+            )
+        candles.sort(key=lambda row: (row["date"], row["time"]))
+        return {
+            "symbol": symbol,
+            "market": "overseas",
+            "exchange": exchange,
+            "interval_minutes": interval_minutes,
+            "candle_count": len(candles),
+            "candles": candles,
+        }
+
     def _get_account_balance_summary(self, args: Mapping[str, Any] | None = None) -> dict[str, Any]:
         market = _normalize_market((args or {}).get("market"))
         if market == "overseas":
@@ -843,13 +948,26 @@ class KISDirectClient:
             ("buy", True): "VTTC0012U",
             ("sell", True): "VTTC0011U",
         }[(side, self.settings.mock)]
-        payload = self._post_json(
-            "/uapi/domestic-stock/v1/trading/order-cash",
-            tr_id=tr_id,
-            body=body,
-            label="domestic stock order",
-            use_hashkey=bool(args.get("use_hashkey", False)),
-        )
+        try:
+            payload = self._post_json(
+                "/uapi/domestic-stock/v1/trading/order-cash",
+                tr_id=tr_id,
+                body=body,
+                label="domestic stock order",
+                use_hashkey=bool(args.get("use_hashkey", False)),
+            )
+        except KISDirectClientError as exc:
+            if body["EXCG_ID_DVSN_CD"] == "SOR" and _is_kis_sor_unavailable_error(str(exc)):
+                body = {**body, "EXCG_ID_DVSN_CD": "KRX"}
+                payload = self._post_json(
+                    "/uapi/domestic-stock/v1/trading/order-cash",
+                    tr_id=tr_id,
+                    body=body,
+                    label="domestic stock order fallback KRX",
+                    use_hashkey=bool(args.get("use_hashkey", False)),
+                )
+            else:
+                raise
         output = _required_mapping(payload, "output")
         return {
             "rt_cd": str(payload.get("rt_cd", "")).strip(),
@@ -1072,9 +1190,9 @@ class KISDirectClient:
         params: Mapping[str, Any],
         label: str,
     ) -> dict[str, Any]:
-        for attempt in range(4):
-            self._wait_for_turn()
+        for attempt in range(_KIS_RETRY_ATTEMPTS):
             headers = self._headers(tr_id=tr_id)
+            self._wait_for_turn("query")
             try:
                 response = self.session.get(
                     f"{self.settings.base_url.rstrip('/')}{path}",
@@ -1082,13 +1200,18 @@ class KISDirectClient:
                     params=dict(params),
                     timeout=10,
                 )
+            except requests.Timeout as exc:
+                if attempt < _KIS_RETRY_ATTEMPTS - 1:
+                    time.sleep(_retry_delay_seconds(attempt))
+                    continue
+                raise KISDirectClientError(f"{label} request timed out after retries.") from exc
             except requests.RequestException as exc:
                 raise KISDirectClientError(f"Failed to request {label} due to a network error.") from exc
             try:
                 return self._checked_payload(response, label=label)
             except KISDirectClientError as exc:
-                if attempt < 3 and _is_kis_rate_limit_error(str(exc)):
-                    time.sleep(1.5 * (attempt + 1))
+                if attempt < _KIS_RETRY_ATTEMPTS - 1 and _is_kis_rate_limit_error(str(exc)):
+                    time.sleep(_retry_delay_seconds(attempt))
                     continue
                 raise
         raise KISDirectClientError(f"{label} request failed after rate-limit retries.")
@@ -1102,42 +1225,62 @@ class KISDirectClient:
         label: str,
         use_hashkey: bool,
     ) -> dict[str, Any]:
-        self._wait_for_turn()
         body_dict = dict(body)
-        headers = self._headers(tr_id=tr_id, content_type=True)
-        if use_hashkey:
-            headers["hashkey"] = self._request_hashkey(body_dict)
-        try:
-            response = self.session.post(
-                f"{self.settings.base_url.rstrip('/')}{path}",
-                headers=headers,
-                json=body_dict,
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise KISDirectClientError(f"Failed to request {label} due to a network error.") from exc
-        return self._checked_payload(response, label=label)
+        for attempt in range(_KIS_RETRY_ATTEMPTS):
+            headers = self._headers(tr_id=tr_id, content_type=True)
+            if use_hashkey:
+                headers["hashkey"] = self._request_hashkey(body_dict)
+            self._wait_for_turn("request")
+            try:
+                response = self.session.post(
+                    f"{self.settings.base_url.rstrip('/')}{path}",
+                    headers=headers,
+                    json=body_dict,
+                    timeout=10,
+                )
+            except requests.Timeout as exc:
+                raise KISDirectClientError(
+                    f"Failed to request {label}: request timed out before broker confirmation; "
+                    "reconcile broker order status before retrying to avoid duplicate orders."
+                ) from exc
+            except requests.RequestException as exc:
+                raise KISDirectClientError(f"Failed to request {label} due to a network error.") from exc
+            try:
+                return self._checked_payload(response, label=label)
+            except KISDirectClientError as exc:
+                if attempt < _KIS_RETRY_ATTEMPTS - 1 and _is_kis_rate_limit_error(str(exc)):
+                    time.sleep(_retry_delay_seconds(attempt))
+                    continue
+                raise
+        raise KISDirectClientError(f"{label} request failed after rate-limit retries.")
 
     def _request_hashkey(self, payload: Mapping[str, Any]) -> str:
-        self._wait_for_turn()
-        try:
-            response = self.session.post(
-                f"{self.settings.base_url.rstrip('/')}/uapi/hashkey",
-                headers={
-                    "content-type": "application/json; charset=UTF-8",
-                    "appkey": self.settings.app_key,
-                    "appsecret": self.settings.app_secret,
-                },
-                json=dict(payload),
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise KISDirectClientError("Failed to request KIS hashkey due to a network error.") from exc
-        body = self._checked_payload(response, label="KIS hashkey", check_rt_cd=False)
-        hashkey = str(body.get("HASH") or "").strip()
-        if not hashkey:
-            raise KISDirectClientError("KIS hashkey response did not include HASH.")
-        return hashkey
+        for attempt in range(_KIS_RETRY_ATTEMPTS):
+            self._wait_for_turn("request")
+            try:
+                response = self.session.post(
+                    f"{self.settings.base_url.rstrip('/')}/uapi/hashkey",
+                    headers={
+                        "content-type": "application/json; charset=UTF-8",
+                        "appkey": self.settings.app_key,
+                        "appsecret": self.settings.app_secret,
+                    },
+                    json=dict(payload),
+                    timeout=10,
+                )
+            except requests.Timeout as exc:
+                if attempt < _KIS_RETRY_ATTEMPTS - 1:
+                    time.sleep(_retry_delay_seconds(attempt))
+                    continue
+                raise KISDirectClientError("KIS hashkey request timed out after retries.") from exc
+            except requests.RequestException as exc:
+                raise KISDirectClientError("Failed to request KIS hashkey due to a network error.") from exc
+            body = self._checked_payload(response, label="KIS hashkey", check_rt_cd=False)
+            hashkey = str(body.get("HASH") or "").strip()
+            if not hashkey:
+                raise KISDirectClientError("KIS hashkey response did not include HASH.")
+            return hashkey
+        raise KISDirectClientError("KIS hashkey request failed after retries.")
 
     def _headers(self, *, tr_id: str, content_type: bool = False) -> dict[str, str]:
         headers = {
@@ -1166,20 +1309,29 @@ class KISDirectClient:
         return token.token
 
     def _request_access_token(self) -> KISAccessToken:
-        self._wait_for_turn()
-        try:
-            response = self.session.post(
-                f"{self.settings.base_url.rstrip('/')}/oauth2/tokenP",
-                json={
-                    "grant_type": "client_credentials",
-                    "appkey": self.settings.app_key,
-                    "appsecret": self.settings.app_secret,
-                },
-                headers={"content-type": "application/json; charset=UTF-8"},
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise KISDirectClientError("Failed to request KIS access token due to a network error.") from exc
+        for attempt in range(_KIS_RETRY_ATTEMPTS):
+            self._wait_for_turn("request")
+            try:
+                response = self.session.post(
+                    f"{self.settings.base_url.rstrip('/')}/oauth2/tokenP",
+                    json={
+                        "grant_type": "client_credentials",
+                        "appkey": self.settings.app_key,
+                        "appsecret": self.settings.app_secret,
+                    },
+                    headers={"content-type": "application/json; charset=UTF-8"},
+                    timeout=10,
+                )
+                break
+            except requests.Timeout as exc:
+                if attempt < _KIS_RETRY_ATTEMPTS - 1:
+                    time.sleep(_retry_delay_seconds(attempt))
+                    continue
+                raise KISDirectClientError("KIS access token request timed out after retries.") from exc
+            except requests.RequestException as exc:
+                raise KISDirectClientError("Failed to request KIS access token due to a network error.") from exc
+        else:
+            raise KISDirectClientError("KIS access token request failed after retries.")
         payload = self._checked_payload(response, label="KIS token", check_rt_cd=False)
         access_token = str(payload.get("access_token") or "").strip()
         if not access_token:
@@ -1245,13 +1397,23 @@ class KISDirectClient:
             raise KISDirectClientError(f"{label} request failed ({code}): {message}")
         return payload
 
-    def _wait_for_turn(self) -> None:
-        min_interval = 1.0 / max(self.rate_limit_per_second, 1)
-        with self._lock:
-            elapsed = time.monotonic() - self._last_request_at
+    def _lane_rate_limit(self, lane: str) -> int:
+        configured = self.query_rate_limit_per_second if lane == "query" else self.request_rate_limit_per_second
+        return _clamp_rate_limit(
+            configured if configured is not None else self.rate_limit_per_second,
+            mock=self.settings.mock,
+        )
+
+    def _wait_for_turn(self, lane: str) -> None:
+        min_interval = 1.0 / self._lane_rate_limit(lane)
+        lock = self._query_lock if lane == "query" else self._request_lock
+        last_attr = "_last_query_request_at" if lane == "query" else "_last_request_request_at"
+        with lock:
+            last_request_at = float(getattr(self, last_attr))
+            elapsed = time.monotonic() - last_request_at
             if elapsed < min_interval:
                 time.sleep(min_interval - elapsed)
-            self._last_request_at = time.monotonic()
+            setattr(self, last_attr, time.monotonic())
 
 
 _TOKEN_CACHE: dict[str, KISAccessToken] = {}
@@ -1263,7 +1425,9 @@ _SUPPORTED_OPERATIONS = {
     "get_daily_ohlcv",
     "get_or_cache_daily_ohlcv",
     "get_or_cache_domestic_minute_bars",
+    "get_or_cache_overseas_minute_bars",
     "get_intraday_bars",
+    "get_overseas_intraday_bars",
     "get_domestic_news_titles",
     "get_overseas_news_titles",
     "get_overseas_breaking_news_titles",
@@ -1575,6 +1739,23 @@ def _is_kis_rate_limit_error(text: str) -> bool:
     return "EGW00201" in text or "초당 거래건수" in text
 
 
+def _is_kis_sor_unavailable_error(text: str) -> bool:
+    return "APBK3009" in text
+
+
+def _clamp_rate_limit(value: Any, *, mock: bool) -> int:
+    max_rate = _KIS_MOCK_MAX_RATE_LIMIT_PER_SECOND if mock else _KIS_REAL_MAX_RATE_LIMIT_PER_SECOND
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = max_rate
+    return min(max(parsed, 1), max_rate)
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    return min(3.0, 1.0 * (int(attempt) + 1))
+
+
 def _required_mapping(payload: Mapping[str, Any], key: str) -> dict[str, Any]:
     value = payload.get(key)
     if not isinstance(value, dict):
@@ -1640,7 +1821,7 @@ def _row_date(row: Mapping[str, Any]) -> str:
 
 
 def _row_time(row: Mapping[str, Any]) -> str:
-    for key in ("time", "stck_cntg_hour", "hour", "hhmmss"):
+    for key in ("time", "stck_cntg_hour", "hour", "hhmmss", "xhms", "local_time"):
         value = row.get(key)
         if value not in (None, ""):
             return _optional_time(value) or ""

@@ -8,6 +8,7 @@ from leaps_quant_engine.adapters.kis_direct import KISDirectClient
 from leaps_quant_engine.broker_routing import currency_for_market_scope
 from leaps_quant_engine.models import OrderSide, Symbol
 from leaps_quant_engine.settings import load_kis_settings_for_account
+from leaps_quant_engine.transactions import TransactionCostSummary
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
 
@@ -222,6 +223,11 @@ def execution_to_virtual_fill(
         quantity=quantity,
         price=price,
     )
+    costs, fee_components = _transaction_costs_from_execution(execution, market=market)
+    metadata: dict[str, Any] = {}
+    if fee_components:
+        metadata["fee_components"] = fee_components
+        metadata["transaction_costs"] = costs.to_dict()
     return VirtualFillEvent(
         fill_id=fill_id,
         order_id=order_id,
@@ -232,7 +238,119 @@ def execution_to_virtual_fill(
         fill_price=price,
         filled_at=filled_at,
         sleeve_id=assign_unknown_to_sleeve_id,
+        fee=costs.total_cost,
+        metadata=metadata,
     )
+
+
+_FEE_KEYS = (
+    "fee",
+    "fees",
+    "fee_amount",
+    "fee_amt",
+    "execution_fee",
+    "transaction_fee",
+    "broker_fee",
+    "chag",
+    "tot_fee",
+)
+_COMMISSION_KEYS = (
+    "commission",
+    "commission_amount",
+    "commission_amt",
+    "broker_commission",
+    "brokerage_commission",
+    "commission_fee",
+    "comm_fee",
+    "comm_amt",
+    "cmsn",
+)
+_TAX_KEYS = (
+    "tax",
+    "taxes",
+    "tax_amount",
+    "tax_amt",
+    "transaction_tax",
+    "securities_transaction_tax",
+    "sell_tax",
+    "stt",
+    "txam",
+)
+_REGULATORY_FEE_KEYS = (
+    "regulatory_fee",
+    "regulatory_fee_amount",
+    "exchange_fee",
+    "exchange_fee_amount",
+    "sec_fee",
+    "taf_fee",
+    "levy",
+    "levy_amount",
+)
+_TOTAL_COST_KEYS = (
+    "total_fee",
+    "total_fee_amount",
+    "total_cost",
+    "total_cost_amount",
+    "transaction_cost",
+    "transaction_cost_amount",
+)
+
+
+def _transaction_costs_from_execution(
+    execution: dict[str, Any],
+    *,
+    market: str,
+) -> tuple[TransactionCostSummary, dict[str, float]]:
+    fee = _sum_present_fields(execution, _FEE_KEYS)
+    commission = _sum_present_fields(execution, _COMMISSION_KEYS)
+    tax = _sum_present_fields(execution, _TAX_KEYS)
+    regulatory_fee = _sum_present_fields(execution, _REGULATORY_FEE_KEYS)
+    explicit_total = _first_present_float(execution, _TOTAL_COST_KEYS)
+    if explicit_total is not None:
+        component_total = commission + tax + regulatory_fee
+        fee = max(explicit_total - component_total, 0.0)
+    components = {
+        key: value
+        for key, value in {
+            "fee": fee,
+            "commission": commission,
+            "tax": tax,
+            "regulatory_fee": regulatory_fee,
+        }.items()
+        if abs(value) > 1e-12
+    }
+    return (
+        TransactionCostSummary(
+            fee=fee,
+            commission=commission,
+            tax=tax,
+            regulatory_fee=regulatory_fee,
+            currency=currency_for_market_scope(market),
+            source="kis_execution",
+        ),
+        components,
+    )
+
+
+def _sum_present_fields(payload: dict[str, Any], keys: tuple[str, ...]) -> float:
+    total = 0.0
+    for key in keys:
+        if key not in payload:
+            continue
+        value = _float_or_none(payload.get(key))
+        if value is not None:
+            total += value
+    return total
+
+
+def _first_present_float(payload: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = _float_or_none(payload.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _extract_executions(payload: dict[str, Any]) -> list[dict[str, Any]]:

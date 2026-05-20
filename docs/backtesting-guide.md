@@ -113,6 +113,66 @@ py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_wor
 Warmup bars prepare indicators. Metrics and report cycles should still be read
 from the requested `--start` to `--end` evaluation window.
 
+## Daily Cycle Time
+
+Daily data providers often stamp daily bars at `00:00:00`. That is a data
+timestamp, not a realistic engine decision time. For daily backtests that should
+simulate a cycle at market open, pass `--daily-bar-time`.
+
+KRX example:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/leaps_workspace_smoke.json `
+  --sleeve-id LEaps `
+  --start 2026-05-01 `
+  --end 2026-05-08 `
+  --warmup-start 2026-04-01 `
+  --daily-bar-time 09:00 `
+  --cash 2000000 `
+  --source finance-datareader `
+  --summary-only
+```
+
+US example:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-backtest-daily configs/runtime/us_etf_rotation_sleeve.json `
+  --sleeve-id us_etf_rotation `
+  --start 2026-05-01 `
+  --end 2026-05-08 `
+  --warmup-start 2026-04-01 `
+  --daily-bar-time 09:30 `
+  --source finance-datareader `
+  --summary-only
+```
+
+This restamps each daily replay slice and bar to the chosen time while keeping
+the original trading date and OHLCV values. It affects alpha/portfolio cadence,
+cycle journal timestamps, fills, and reports. It does not turn daily bars into
+minute bars.
+
+## Temporal PPO Windows
+
+Temporal PPO is not solved by indicator warmup alone. Warmup gives the current
+indicator values at `--start`; temporal PPO also needs a point-in-time feature
+window such as `rl_temporal_features` with the last 64 confirmed daily rows.
+
+For runtime backtests, the engine creates a temporal feature provider
+automatically when the sleeve portfolio parameters use `feature_schema` values
+such as `v2_temporal` or `v2_temporal_residual`. The provider reads only bars
+available through the decision date and attaches the window to
+`SnapshotContext` metadata. Alpha models then pass that metadata through to UP
+insights, and the RL portfolio constructor consumes only those alpha-gated
+windows.
+
+Use `--warmup-start` far enough before `--start`. For `v2_temporal`, budget at
+least 84 daily bars before the first evaluation cycle; for
+`v2_temporal_residual`, budget at least 144 daily bars. More is fine.
+
+In `runtime-backtest-minute`, minute rows drive the evaluation cycles, but the
+temporal PPO windows still come from `--daily-source` and `--warmup-start`.
+Minute bars do not advance confirmed daily temporal rows.
+
 ## Opening Gap Proxy
 
 Long daily backtests usually do not have historical pre-open order book or
@@ -200,6 +260,15 @@ feed_load_ms
 daily_warmup_ms
 framework_replay_ms
 framework_replay_wall_ms
+replay_indicator_update_ms
+replay_indicator_snapshot_ms
+replay_universe_selection_ms
+replay_framework_runner_ms
+replay_journal_append_ms
+replay_order_coordination_ms
+replay_fill_model_ms
+replay_portfolio_apply_ms
+replay_snapshot_record_ms
 report_generation_ms
 framework_model_ms
 total_ms
@@ -245,6 +314,13 @@ when insights exist but orders are zero.
 `--journal` writes append-only JSONL cycle entries. Use it when an agent or
 operator needs to inspect selection, alpha, portfolio, risk, execution, timings,
 warnings, and errors after the run.
+
+Runtime daily/minute backtests also support `--journal-mode auto|full|light`.
+`auto` is the default. It writes full lineage for detailed runs, but switches
+to light cycle entries for `--summary-only` so repeated research backtests do
+not spend extra time serializing full lineage payloads every cycle. Use
+`--journal-mode full` when the whole `Insight -> Target -> Risk -> Order`
+lineage is the diagnostic target.
 
 ## One-Alpha Framework Backtest
 
@@ -328,6 +404,25 @@ minute backtest CLI can compare them with normal `--start` / `--end` values.
 Free providers can have retention limits or missing symbols; if the report is
 `empty` or `partial`, treat it as a data availability issue.
 
+For recent US/overseas bars from KIS, use the same command with
+`--provider kis-cache`:
+
+```powershell
+py -3 -m leaps_quant_engine.cli download-us-minute-feed configs/runtime/us_etf_rotation_sleeve.json `
+  --sleeve-id us_etf_rotation `
+  --output data/replay/us_etf_rotation_latest_minute.csv `
+  --start 2026-05-15 `
+  --end 2026-05-15 `
+  --provider kis-cache `
+  --overwrite `
+  --summary-only
+```
+
+KIS overseas minute lookup is a recent intraday query, not a long-range vendor
+history feed. It is useful for same-day/live cache collection and short recent
+validation. For older multi-day research ranges, prefer an existing local cache
+or yfinance-style historical download and report partial data honestly.
+
 ## Minute Cache
 
 For Korean minute research, keep a rolling local cache and export deterministic
@@ -357,6 +452,13 @@ py -3 -m leaps_quant_engine.cli minute-cache-build configs/runtime/live_multi_sl
 For KRX symbols, the yfinance adapter uses universe metadata to map KOSPI to
 `.KS` and KOSDAQ to `.KQ`, while preserving normalized output symbols such as
 `KRX:005930`.
+
+`minute-cache-build --provider kis-cache` now supports both KRX and overseas
+universes. Overseas symbols need an exchange in universe metadata, for example
+`"exchange": "NAS"`, unless the symbol market itself is already `NAS`, `NYS`,
+or `AMS`. The KIS overseas endpoint returns recent intraday bars, so use it as
+a live/recent collector path rather than a substitute for deep historical
+minute data.
 
 Export a cached range to the regular minute replay format:
 
@@ -429,6 +531,50 @@ Runtime minute replay loads CSV/JSONL feeds in a streaming pass and uses direct
 day-file reads for `--minute-cache-root`. The direct cache path preserves the
 same sorted `DataSlice` shape as a standard minute feed without an intermediate
 feed file.
+
+For repeated minute research over the same feed/range, add a compiled replay
+cache. The first run writes a pre-grouped `DataSlice` artifact; later runs can
+load that artifact directly and skip raw CSV/day-file parsing plus time-bucket
+grouping:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-backtest-minute configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --minute-cache-root data/replay/minute-cache `
+  --compiled-replay-cache data/replay/compiled/leaps_20260515.json.gz `
+  --start 2026-05-15T09:00:00 `
+  --end 2026-05-15T15:30:00 `
+  --warmup-start 2026-04-01 `
+  --cash 13000000 `
+  --currency KRW `
+  --daily-source finance-datareader `
+  --fee-model kis `
+  --summary-only
+```
+
+If the compiled artifact already exists, `runtime-backtest-minute` can use
+`--compiled-replay-cache` without `--minute-feed` or `--minute-cache-root`.
+Use `--refresh-compiled-replay-cache` when the underlying minute feed changed.
+The compiled cache is still only replay data, not model state.
+
+Repeated minute tests can also cache the confirmed daily warmup input:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-backtest-minute configs/runtime/live_multi_sleeve.json `
+  --sleeve-id LEaps `
+  --compiled-replay-cache data/replay/compiled/leaps_20260515.json.gz `
+  --daily-warmup-cache data/replay/warmup/leaps_20260401_20260514.json.gz `
+  --warmup-start 2026-04-01 `
+  --cash 13000000 `
+  --currency KRW `
+  --daily-source finance-datareader `
+  --summary-only
+```
+
+This stores the daily warmup bars, not serialized indicator objects. The engine
+still replays those bars through `IndicatorEngine.warm_up(...)`, which keeps the
+LEAN-style indicator contract intact. Use `--refresh-daily-warmup-cache` if the
+warmup window or daily source changed.
 
 Use opening/extended data for state such as expected open, gap, order-book
 quality, exit urgency, or execution sizing. Do not advance daily SMA, momentum,
@@ -543,6 +689,11 @@ Live side effects live behind order-runtime commands and explicit commit guards.
 Do not use backtest output as a live order unless it has passed the runtime
 preflight, order-runtime submit dry-run, and the intended broker confirmation
 path.
+
+Runtime configs may use `market_data.provider = "kis-gateway"` for live runs.
+Daily runtime backtests still inject their replay/cache provider through the
+backtest command, so they do not require the local KIS Gateway unless the caller
+explicitly builds a Gateway-backed provider for that research run.
 
 ## Verification
 

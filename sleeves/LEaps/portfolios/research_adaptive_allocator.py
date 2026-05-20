@@ -12,8 +12,13 @@ from leaps_quant_engine.portfolio import currency_for_symbol
 ALPHA_WEIGHTS = {
     "leaps-kospi-conviction": 1.00,
     "leaps-kospi-pullback-reversion": 0.70,
+    "leaps-kospi-swing-rebalance": 0.85,
 }
 ETF_SAFETY_ALPHA_ID = "leaps-krx-etf-safety"
+PARTIAL_TRIM_ACTION = "partial_trim"
+ETF_SAFETY_TAG_MARKER = ":etf_safety:"
+ETF_SAFETY_INVERSE_TAG_MARKER = ":etf_safety:inverse:"
+ETF_SAFETY_CASH_LIKE_TAG_MARKER = ":etf_safety:cash_like:"
 
 
 class ResearchAdaptivePortfolioConstructionModel:
@@ -41,6 +46,8 @@ class ResearchAdaptivePortfolioConstructionModel:
         enable_etf_safety_bucket: bool = False,
         etf_safety_alpha_id: str = ETF_SAFETY_ALPHA_ID,
         etf_safety_max_total_pct: float = 0.65,
+        inverse_hedge_stock_beta_assumption: float = 1.25,
+        inverse_hedge_shock_buffer_pct: float = 0.02,
         model_name: str = "research_adaptive_allocator",
     ) -> None:
         self.top_k = top_k
@@ -64,6 +71,8 @@ class ResearchAdaptivePortfolioConstructionModel:
         self.enable_etf_safety_bucket = enable_etf_safety_bucket
         self.etf_safety_alpha_id = etf_safety_alpha_id
         self.etf_safety_max_total_pct = etf_safety_max_total_pct
+        self.inverse_hedge_stock_beta_assumption = max(float(inverse_hedge_stock_beta_assumption), 0.0)
+        self.inverse_hedge_shock_buffer_pct = _clamp_pct(inverse_hedge_shock_buffer_pct)
         self.model_name = model_name
 
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
@@ -73,6 +82,7 @@ class ResearchAdaptivePortfolioConstructionModel:
             if str(getattr(insight, "alpha_id", "")) != self.etf_safety_alpha_id
         )
         blocked = _latest_non_up_symbol_keys(stock_insights)
+        trim_multipliers = _partial_trim_multipliers(stock_insights)
         grouped = _group_latest_up_insights(stock_insights, blocked)
         candidates = [
             candidate
@@ -81,7 +91,9 @@ class ResearchAdaptivePortfolioConstructionModel:
         ]
         safety_targets, stock_gross_cap = _etf_safety_targets(context, self)
         if not candidates:
-            return _zero_missing_held_targets(context, safety_targets, self)
+            target_map = _apply_partial_trim_targets(context, dict(safety_targets), trim_multipliers, self)
+            target_map = _adjust_inverse_hedge_to_stock_exposure(context, target_map, self)
+            return _zero_missing_held_targets(context, target_map, self)
 
         candidates.sort(key=lambda item: (item["quality"], item["symbol_key"]), reverse=True)
         selected = self._selected_candidates(context, candidates)
@@ -91,6 +103,8 @@ class ResearchAdaptivePortfolioConstructionModel:
         target_map = dict(safety_targets)
         for symbol_key, target in self._target_map(selected, gross).items():
             target_map.setdefault(symbol_key, target)
+        target_map = _apply_partial_trim_targets(context, target_map, trim_multipliers, self)
+        target_map = _adjust_inverse_hedge_to_stock_exposure(context, target_map, self)
         return _zero_missing_held_targets(context, target_map, self)
 
     def _selected_candidates(
@@ -183,6 +197,8 @@ def create_portfolio_model(params: Mapping[str, Any] | None = None) -> ResearchA
         enable_etf_safety_bucket=bool(values.get("enable_etf_safety_bucket", False)),
         etf_safety_alpha_id=str(values.get("etf_safety_alpha_id", ETF_SAFETY_ALPHA_ID)),
         etf_safety_max_total_pct=float(values.get("etf_safety_max_total_pct", 0.65)),
+        inverse_hedge_stock_beta_assumption=float(values.get("inverse_hedge_stock_beta_assumption", 1.25)),
+        inverse_hedge_shock_buffer_pct=float(values.get("inverse_hedge_shock_buffer_pct", 0.02)),
         model_name=str(values.get("model_name", "research_adaptive_allocator")),
     )
 
@@ -275,6 +291,134 @@ def _zero_missing_held_targets(
     return tuple(targets.values())
 
 
+def _apply_partial_trim_targets(
+    context: PortfolioConstructionContext,
+    targets: dict[str, PortfolioAllocationTarget],
+    trim_multipliers: dict[str, float],
+    model: ResearchAdaptivePortfolioConstructionModel,
+) -> dict[str, PortfolioAllocationTarget]:
+    if not trim_multipliers:
+        return targets
+    result = dict(targets)
+    held_keys = {symbol.key for symbol in context.portfolio.held_symbols}
+    for symbol_key, multiplier in trim_multipliers.items():
+        multiplier = _clamp_pct(multiplier)
+        current_pct = _current_position_pct(context, symbol_key)
+        existing = result.get(symbol_key)
+        if symbol_key not in held_keys:
+            if existing is not None:
+                result.pop(symbol_key, None)
+            continue
+        target_percent = current_pct * multiplier
+        if existing is not None:
+            target_percent = min(existing.target_percent, target_percent)
+            symbol = existing.symbol
+            base_tag = existing.tag
+        else:
+            holding = context.portfolio.holdings.get(symbol_key)
+            if holding is None:
+                continue
+            symbol = holding.symbol
+            base_tag = f"adaptive:{model.model_name}:held_partial_trim"
+        result[symbol_key] = PortfolioAllocationTarget(
+            symbol=symbol,
+            target_percent=_clamp_pct(target_percent),
+            tag=f"{base_tag}:partial_trim={multiplier:.2f}",
+        )
+    return result
+
+
+def _adjust_inverse_hedge_to_stock_exposure(
+    context: PortfolioConstructionContext,
+    targets: dict[str, PortfolioAllocationTarget],
+    model: ResearchAdaptivePortfolioConstructionModel,
+) -> dict[str, PortfolioAllocationTarget]:
+    if not model.enable_etf_safety_bucket:
+        return targets
+
+    inverse_keys = [
+        symbol_key
+        for symbol_key, target in targets.items()
+        if _is_etf_safety_inverse_target(target) and target.target_percent > 0
+    ]
+    if not inverse_keys:
+        return targets
+
+    inverse_pct = sum(targets[symbol_key].target_percent for symbol_key in inverse_keys)
+    if inverse_pct <= 0:
+        return targets
+
+    stock_pct = sum(
+        target.target_percent
+        for target in targets.values()
+        if target.target_percent > 0 and not _is_etf_safety_target(target)
+    )
+    allowed_inverse_pct = 0.0
+    if stock_pct > 0:
+        allowed_inverse_pct = _clamp_pct(
+            stock_pct * model.inverse_hedge_stock_beta_assumption + model.inverse_hedge_shock_buffer_pct
+        )
+    allowed_inverse_pct = min(allowed_inverse_pct, inverse_pct)
+    if inverse_pct <= allowed_inverse_pct + 1e-12:
+        return targets
+
+    result = dict(targets)
+    scale = allowed_inverse_pct / inverse_pct if inverse_pct > 0 else 0.0
+    reduced_pct = 0.0
+    for symbol_key in inverse_keys:
+        target = result[symbol_key]
+        adjusted_pct = _clamp_pct(target.target_percent * scale)
+        reduced_pct += max(target.target_percent - adjusted_pct, 0.0)
+        tag = (
+            f"{target.tag}:inverse_cap={allowed_inverse_pct:.3f}"
+            f":stock_beta_exposure={stock_pct:.3f}"
+        )
+        if adjusted_pct <= 1e-12 and context.portfolio.quantity(target.symbol) == 0:
+            result.pop(symbol_key, None)
+            continue
+        result[symbol_key] = PortfolioAllocationTarget(
+            symbol=target.symbol,
+            target_percent=adjusted_pct,
+            tag=tag,
+        )
+
+    if reduced_pct <= 1e-12:
+        return result
+
+    cash_like_keys = [
+        symbol_key
+        for symbol_key, target in result.items()
+        if _is_etf_safety_cash_like_target(target) and target.target_percent > 0
+    ]
+    if not cash_like_keys:
+        return result
+
+    cash_like_pct = sum(result[symbol_key].target_percent for symbol_key in cash_like_keys)
+    for symbol_key in cash_like_keys:
+        target = result[symbol_key]
+        share = target.target_percent / cash_like_pct if cash_like_pct > 0 else 1.0 / len(cash_like_keys)
+        result[symbol_key] = PortfolioAllocationTarget(
+            symbol=target.symbol,
+            target_percent=_clamp_pct(target.target_percent + reduced_pct * share),
+            tag=f"{target.tag}:inverse_realloc={reduced_pct:.3f}",
+        )
+    return result
+
+
+def _current_position_pct(context: PortfolioConstructionContext, symbol_key: str) -> float:
+    holding = context.portfolio.holdings.get(symbol_key)
+    if holding is None or holding.quantity == 0:
+        return 0.0
+    price = context.portfolio.mark_price(holding.symbol, context.data)
+    if price is None or price <= 0:
+        return 0.0
+    currency = currency_for_symbol(holding.symbol)
+    equity = context.portfolio.equity_by_currency(context.data, (currency,)).get(currency, 0.0)
+    if equity <= 0:
+        return 0.0
+    return abs(holding.quantity * price) / equity
+
+
 def _etf_safety_targets(
     context: PortfolioConstructionContext,
     model: ResearchAdaptivePortfolioConstructionModel,
@@ -333,13 +477,64 @@ def _latest_non_up_symbol_keys(insights: tuple[Any, ...]) -> set[str]:
     latest: dict[str, Any] = {}
     for insight in insights:
         previous = latest.get(insight.symbol_key)
-        if previous is None or insight.generated_at >= previous.generated_at:
+        if previous is None or _is_newer_or_equal_priority(insight, previous):
             latest[insight.symbol_key] = insight
     return {
         symbol_key
         for symbol_key, insight in latest.items()
         if getattr(getattr(insight, "direction", None), "value", "") != "up"
+        and not _is_partial_trim(insight)
     }
+
+
+def _is_newer_or_equal_priority(candidate: Any, previous: Any) -> bool:
+    if candidate.generated_at > previous.generated_at:
+        return True
+    if candidate.generated_at < previous.generated_at:
+        return False
+    return _direction_priority(candidate) >= _direction_priority(previous)
+
+
+def _direction_priority(insight: Any) -> int:
+    direction = getattr(getattr(insight, "direction", None), "value", "")
+    if direction in {"flat", "down"} and not _is_partial_trim(insight):
+        return 2
+    return 1
+
+
+def _partial_trim_multipliers(insights: tuple[Any, ...]) -> dict[str, float]:
+    latest: dict[str, Any] = {}
+    for insight in insights:
+        if not _is_partial_trim(insight):
+            continue
+        previous = latest.get(insight.symbol_key)
+        if previous is None or insight.generated_at >= previous.generated_at:
+            latest[insight.symbol_key] = insight
+    result: dict[str, float] = {}
+    for symbol_key, insight in latest.items():
+        metadata = getattr(insight, "metadata", {}) or {}
+        multiplier = _safe_float(metadata.get("target_multiplier"))
+        if multiplier is None:
+            multiplier = 0.50
+        result[symbol_key] = max(0.0, min(multiplier, 1.0))
+    return result
+
+
+def _is_partial_trim(insight: Any) -> bool:
+    metadata = getattr(insight, "metadata", {}) or {}
+    return str(metadata.get("portfolio_action") or "").strip().lower() == PARTIAL_TRIM_ACTION
+
+
+def _is_etf_safety_target(target: PortfolioAllocationTarget) -> bool:
+    return ETF_SAFETY_TAG_MARKER in target.tag
+
+
+def _is_etf_safety_inverse_target(target: PortfolioAllocationTarget) -> bool:
+    return ETF_SAFETY_INVERSE_TAG_MARKER in target.tag
+
+
+def _is_etf_safety_cash_like_target(target: PortfolioAllocationTarget) -> bool:
+    return ETF_SAFETY_CASH_LIKE_TAG_MARKER in target.tag
 
 
 def _merged_metadata(insights: list[Any]) -> dict[str, Any]:

@@ -3,11 +3,13 @@
   "mode": "live",
   "timezone": "Asia/Seoul",
   "market_data": {
-    "provider": "market-data-engine",
+    "provider": "kis-gateway",
     "history_provider": "kis-cache",
-    "source": "market-data-engine",
+    "source": "kis-gateway",
     "history_source": "kis-cache",
-    "rate_limit_per_second": 5
+    "rate_limit_per_second": 18,
+    "gateway_base_url": "http://127.0.0.1:8766",
+    "snapshot_store_path": "../../data/market-data-snapshots/live_multi_sleeve.jsonl"
   },
   "broker_accounts": [
     {
@@ -82,6 +84,10 @@
             "enabled": true
           },
           {
+            "ref": "alphas/kospi_swing_rebalance.py",
+            "enabled": true
+          },
+          {
             "ref": "alphas/krx_etf_safety.py",
             "enabled": true
           },
@@ -93,42 +99,57 @@
         "input_selections": {
           "leaps-kospi-pullback-reversion": "leaps-stock-momentum",
           "leaps-kospi-conviction": "leaps-stock-momentum",
+          "leaps-kospi-swing-rebalance": "leaps-stock-momentum",
           "leaps-krx-etf-safety": "leaps-krx-etf-safety",
           "leaps-volatility-trailing-stop": "leaps-operational-symbols"
         }
       },
       "portfolio": {
-        "model": "portfolios/research_adaptive_allocator.py",
+        "model": "portfolios/v4_banded_momentum.py",
         "parameters": {
-          "top_k": 8,
-          "gross_exposure": 0.95,
-          "neutral_gross_exposure": 0.72,
-          "weak_gross_exposure": 0.40,
-          "cash_bias": 0.0,
-          "max_position_pct": 0.22,
-          "min_position_pct": 0.012,
-          "score_temperature": 0.25,
-          "volatility_penalty": 0.65,
-          "drawdown_penalty": 0.25,
-          "recent_momentum_weight": 0.26,
-          "trend_weight": 0.12,
-          "multi_alpha_bonus": 0.08,
-          "max_normalized_volatility": 0.20,
-          "high_vol_momentum_exception": 0.45,
-          "hold_existing_buffer": 0.72,
+          "model_name": "v4_banded_momentum",
+          "model_id": "leaps-v4-banded-momentum",
+          "state_namespace": "position_state",
+          "entry_top_n": 10,
+          "hold_top_n": 75,
+          "trim_top_n": 110,
+          "max_positions": 6,
+          "min_holding_days": 10,
+          "gross_exposure": 0.92,
+          "neutral_gross_exposure": 0.68,
+          "weak_gross_exposure": 0.35,
+          "max_position_pct": 0.24,
+          "min_position_pct": 0.015,
+          "min_entry_lot_count": 1.0,
+          "target_drift_threshold_pct": 0.08,
+          "reentry_cooldown_days": 3,
+          "score_temperature": 0.32,
+          "score_normalization_enabled": true,
+          "regime_alpha_weighting_enabled": true,
+          "retention_bonus": 0.10,
+          "multi_alpha_bonus": 0.06,
+          "recent_momentum_weight": 0.12,
+          "trend_weight": 0.06,
+          "volatility_penalty": 0.55,
+          "drawdown_penalty": 0.18,
+          "trim_multiplier": 0.50,
+          "missing_target_exit_confirmation_cycles": 8,
+          "hard_exit_cooldown_days": 7,
+          "reduce_half_cooldown_days": 3,
+          "add_requires_entry_band": true,
+          "add_requires_unrealized_profit": true,
+          "add_min_unrealized_return_pct": 0.0,
+          "max_target_turnover_pct": 0.02,
+          "daily_turnover_budget_pct": 0.035,
           "emit_zero_for_missing_held_targets": true,
-          "long_only": true,
-          "enable_etf_safety_bucket": true,
-          "etf_safety_alpha_id": "leaps-krx-etf-safety",
-          "etf_safety_max_total_pct": 0.60,
-          "model_name": "research_adaptive_allocator_v2"
+          "long_only": true
         },
         "rebalance": {
           "cash_reserve_pct": 0.0,
           "min_order_notional": 100000.0,
           "min_quantity_delta": 1,
           "allow_exit_below_min_notional": true,
-          "cadence": "every_5_minutes",
+          "cadence": "every_30_minutes",
           "reused_target_churn_guard": true,
           "reused_target_churn_max_quantity_delta": 1,
           "reused_target_churn_lot_fraction": 0.5,
@@ -139,8 +160,8 @@
         },
         "blend": {
           "enabled": false,
-          "duration_minutes": 60,
-          "target_drift_threshold_pct": 0.08,
+          "duration_minutes": 0,
+          "target_drift_threshold_pct": 0.0,
           "clock": "orderable_session"
         }
       },
@@ -160,8 +181,8 @@
           "regime_exposure_enabled": true,
           "regime_total_exposure_pct_by_currency": {
             "KRW": {
-              "risk_off": 0.85,
-              "neutral": 0.90,
+              "risk_off": 0.45,
+              "neutral": 0.75,
               "risk_on": 0.95,
               "strong_risk_on": 0.98
             }
@@ -169,13 +190,13 @@
           "intraday_market_guard_enabled": true,
           "intraday_guard_symbol": "KRX:069500",
           "intraday_guard_reference_alpha_id": "leaps-krx-etf-safety",
-          "intraday_entry_freeze_return_pct": -0.003,
+          "intraday_entry_freeze_return_pct": -0.01,
           "intraday_risk_off_return_pct": -0.02,
           "intraday_entry_freeze_cap_pct_by_currency": {
-            "KRW": 0.55
+            "KRW": 0.45
           },
           "intraday_risk_off_cap_pct_by_currency": {
-            "KRW": 0.35
+            "KRW": 0.25
           },
           "intraday_guard_exempt_symbols": [
             "KRX:488770",
@@ -185,8 +206,39 @@
           ],
           "intraday_open_entry_freeze_until": "09:40",
           "intraday_guard_high_drawdown_enabled": true,
-          "intraday_guard_high_entry_freeze_return_pct": -0.005,
+          "intraday_guard_high_entry_freeze_return_pct": -0.01,
           "intraday_guard_high_risk_off_return_pct": -0.012,
+          "intraday_guard_smoothing_enabled": true,
+          "intraday_guard_cap_curve": "smoothstep",
+          "intraday_guard_hard_entry_freeze": false,
+          "intraday_guard_recovery_enabled": true,
+          "intraday_guard_recovery_from_low_pct": 0.006,
+          "intraday_guard_recovery_confirmation_cycles": 2,
+          "intraday_guard_recovery_cap_pct_by_currency": {
+            "KRW": 0.45
+          },
+          "symbol_guard_enabled": true,
+          "symbol_guard_exempt_symbols": [
+            "KRX:488770",
+            "KRX:423160",
+            "KRX:459580",
+            "KRX:114800"
+          ],
+          "symbol_entry_block_intraday_return_pct": -0.025,
+          "symbol_entry_block_high_drawdown_pct": -0.04,
+          "symbol_entry_block_unrealized_loss_pct": -0.015,
+          "symbol_reduce_half_unrealized_loss_pct": -0.035,
+          "symbol_exit_unrealized_loss_pct": -0.06,
+          "symbol_reduce_half_high_drawdown_pct": -0.065,
+          "symbol_exit_high_drawdown_pct": -0.1,
+          "symbol_reduce_half_sma10_buffer_pct": -0.005,
+          "symbol_exit_sma20_buffer_pct": -0.005,
+          "symbol_reduce_fraction": 0.5,
+          "symbol_guard_volatility_adjusted_enabled": true,
+          "symbol_guard_reference_volatility_pct": 0.04,
+          "symbol_guard_min_volatility_multiplier": 0.75,
+          "symbol_guard_max_volatility_multiplier": 1.75,
+          "symbol_guard_entry_max_volatility_multiplier": 1.25,
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }
@@ -213,7 +265,115 @@
         }
       },
       "worker": {
-        "cycle_interval_seconds": 60,
+        "cycle_interval_seconds": 10,
+        "min_success": 1
+      }
+    },
+    {
+      "sleeve_id": "kr-lowvol-defensive",
+      "workspace_path": "sleeves/kr-lowvol-defensive",
+      "broker_account_id": "kis-domestic",
+      "broker_account_routes": {
+        "domestic": "kis-domestic"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "KRW": 10000000
+      },
+      "universe": {
+        "coarse_path": "configs/universes/kr_lowvol_defensive_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 40,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/lowvol_rank.py:LowVolDefensiveSelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ]
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 160,
+        "min_ready_ratio": 0.96,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/lowvol_defensive.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "kr-lowvol-defensive-alpha": "kr-lowvol-defensive-core"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/inverse_vol.py",
+        "parameters": {
+          "top_k": 12,
+          "core_gross_exposure": 0.88,
+          "neutral_gross_exposure": 0.65,
+          "defensive_gross_exposure": 0.40,
+          "max_position_pct": 0.10,
+          "min_position_pct": 0.015,
+          "emit_zero_for_missing_held_targets": true
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.05,
+          "min_order_notional": 250000.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true,
+          "cadence": "monthly",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 20.0
+        },
+        "target_resolution": {
+          "mode": "patch"
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 360,
+          "target_drift_threshold_pct": 0.08,
+          "clock": "orderable_session"
+        }
+      },
+      "risk": {
+        "model": "risks/basic.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct": 0.11,
+          "max_total_exposure_pct": 0.90,
+          "cash_buffer_pct": 0.05,
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/immediate.py",
+        "parameters": {
+          "tag_prefix": "kr-lowvol-defensive",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "limit_offset_bps": 6.0,
+          "max_slice_notional": 1000000,
+          "max_slices": 4,
+          "urgency": "patient",
+          "max_order_age_seconds": 1200,
+          "price_drift_bps": 70,
+          "min_replace_interval_seconds": 240,
+          "max_replacements": 2
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 300,
         "min_success": 1
       }
     },
@@ -237,6 +397,7 @@
         },
         "active": {
           "max_symbols": 8,
+          "cadence": "once_per_day",
           "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
           "selection_models": [
             "selections/etf_rotation.py:EtfRotationSelectionModel",
@@ -276,15 +437,15 @@
           "metadata_path": "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.json",
           "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
           "fallback_action": 4,
-          "top_k": 3,
+          "top_k": 4,
           "model_name": "daa_pullback_c18",
-          "weight_temperature": 0.5,
+          "weight_temperature": 0.8,
           "min_position_pct": 0.0,
           "min_signal_action": 1,
           "allocation_mode": "risk_softmax",
           "fallback_gross_exposure": 0.75,
           "max_portfolio_pct": 1.0,
-          "max_position_pct": 0.30,
+          "max_position_pct": 0.25,
           "long_only": true
         },
         "rebalance": {
@@ -312,9 +473,12 @@
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 0.30,
+          "max_position_pct": 0.25,
           "max_total_exposure_pct": 0.98,
           "cash_buffer_pct": 0.02,
+          "max_cycle_buy_notional": 10000.0,
+          "max_cycle_buy_notional_pct": 0.65,
+          "cycle_buy_notional_currency": "USD",
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }
@@ -329,12 +493,12 @@
         }
       },
       "worker": {
-        "cycle_interval_seconds": 60,
+        "cycle_interval_seconds": 300,
         "min_success": 1
       }
     }
   ],
   "metadata": {
-    "description": "Combined live config for the multi-sleeve single runner. LEaps and us_etf_rotation share one live market snapshot cycle while preserving separate sleeve state, account routes, risk, execution, and framework state."
+    "description": "Combined live config for the multi-sleeve single runner. LEaps, kr-lowvol-defensive, and us_etf_rotation share one live market snapshot cycle while preserving separate sleeve state, account routes, risk, execution, and framework state."
   }
 }

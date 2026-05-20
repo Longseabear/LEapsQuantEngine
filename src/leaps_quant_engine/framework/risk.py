@@ -338,7 +338,143 @@ class BasicRiskManagementModel:
         return current_quantity + affordable_delta, available_cash - (affordable_delta * price)
 
 
+@dataclass(frozen=True, slots=True)
+class DailyLossLimitRiskModel:
+    """Opt-in model-owned daily loss circuit breaker example."""
+
+    max_daily_loss_pct: float = 0.03
+    model_id: str = "daily-loss-limit"
+    namespace: str = "daily_equity"
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.max_daily_loss_pct <= 1.0:
+            raise ValueError("max_daily_loss_pct must be between 0 exclusive and 1 inclusive.")
+
+    def manage_risk(self, context: RiskManagementContext) -> RiskDecisionBatch:
+        today_key = context.data.time.date().isoformat()
+        record = context.model_state.object_get(
+            model_id=self.model_id,
+            namespace=self.namespace,
+            symbol_key=today_key,
+        )
+        equity = _portfolio_equity_native_sum(context)
+        start_equity = float(record.get("start_equity") or equity)
+        loss_pct = 0.0 if start_equity <= 0 else (equity - start_equity) / start_equity
+        blocked = start_equity > 0 and loss_pct <= -self.max_daily_loss_pct
+        decisions = tuple(
+            _circuit_breaker_decision(
+                context,
+                target,
+                blocked=blocked,
+                reason="daily_loss_limit_exceeded",
+                metadata={
+                    "model_id": self.model_id,
+                    "start_equity": start_equity,
+                    "current_equity": equity,
+                    "loss_pct": loss_pct,
+                    "max_daily_loss_pct": self.max_daily_loss_pct,
+                },
+            )
+            for target in context.targets
+        )
+        patch = context.model_state.object_set(
+            {
+                "date": today_key,
+                "start_equity": start_equity,
+                "current_equity": equity,
+                "loss_pct": loss_pct,
+                "blocked": blocked,
+            },
+            model_id=self.model_id,
+            namespace=self.namespace,
+            symbol_key=today_key,
+            reason="daily_loss_limit_update",
+            generated_at=context.data.time,
+        )
+        return RiskDecisionBatch(sleeve_id=context.sleeve_id, decisions=decisions, state_patches=(patch,))
+
+
+@dataclass(frozen=True, slots=True)
+class MaxDrawdownRiskModel:
+    """Opt-in model-owned max drawdown circuit breaker example."""
+
+    max_drawdown_pct: float = 0.10
+    model_id: str = "max-drawdown"
+    namespace: str = "drawdown"
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.max_drawdown_pct <= 1.0:
+            raise ValueError("max_drawdown_pct must be between 0 exclusive and 1 inclusive.")
+
+    def manage_risk(self, context: RiskManagementContext) -> RiskDecisionBatch:
+        record = context.model_state.object_get(model_id=self.model_id, namespace=self.namespace)
+        equity = _portfolio_equity_native_sum(context)
+        prior_peak = float(record.get("peak_equity") or equity)
+        peak_equity = max(prior_peak, equity)
+        drawdown_pct = 0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity
+        blocked = peak_equity > 0 and drawdown_pct >= self.max_drawdown_pct
+        decisions = tuple(
+            _circuit_breaker_decision(
+                context,
+                target,
+                blocked=blocked,
+                reason="max_drawdown_limit_exceeded",
+                metadata={
+                    "model_id": self.model_id,
+                    "peak_equity": peak_equity,
+                    "current_equity": equity,
+                    "drawdown_pct": drawdown_pct,
+                    "max_drawdown_pct": self.max_drawdown_pct,
+                },
+            )
+            for target in context.targets
+        )
+        patch = context.model_state.object_set(
+            {
+                "peak_equity": peak_equity,
+                "current_equity": equity,
+                "drawdown_pct": drawdown_pct,
+                "blocked": blocked,
+            },
+            model_id=self.model_id,
+            namespace=self.namespace,
+            reason="max_drawdown_update",
+            generated_at=context.data.time,
+        )
+        return RiskDecisionBatch(sleeve_id=context.sleeve_id, decisions=decisions, state_patches=(patch,))
+
+
 def _target_currencies(context: RiskManagementContext) -> tuple[str, ...]:
     currencies = {currency_for_symbol(target.symbol) for target in context.targets}
     currencies.update(context.portfolio.currencies())
     return tuple(sorted(currencies))
+
+
+def _portfolio_equity_native_sum(context: RiskManagementContext) -> float:
+    return sum(context.portfolio.equity_by_currency(context.data).values())
+
+
+def _circuit_breaker_decision(
+    context: RiskManagementContext,
+    target: PortfolioTarget,
+    *,
+    blocked: bool,
+    reason: str,
+    metadata: Mapping[str, Any],
+) -> RiskDecision:
+    current_quantity = context.portfolio.quantity(target.symbol)
+    if blocked and target.quantity > current_quantity:
+        return RiskDecision(
+            original_target=target,
+            approved_target=None,
+            status=RiskDecisionStatus.REJECTED,
+            reason=reason,
+            metadata={**dict(metadata), "current_quantity": current_quantity, "requested_quantity": target.quantity},
+        )
+    return RiskDecision(
+        original_target=target,
+        approved_target=target,
+        status=RiskDecisionStatus.APPROVED,
+        reason="approved" if not blocked else "risk_reduction_allowed",
+        metadata={**dict(metadata), "current_quantity": current_quantity, "requested_quantity": target.quantity},
+    )

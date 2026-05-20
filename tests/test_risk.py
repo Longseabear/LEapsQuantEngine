@@ -4,6 +4,8 @@ import pytest
 
 from leaps_quant_engine.framework import (
     BasicRiskManagementModel,
+    DailyLossLimitRiskModel,
+    MaxDrawdownRiskModel,
     PassThroughRiskManagementModel,
     RiskDecisionStatus,
     RiskLimits,
@@ -11,6 +13,7 @@ from leaps_quant_engine.framework import (
 )
 from leaps_quant_engine.models import Bar, DataSlice, PortfolioTarget, Symbol
 from leaps_quant_engine.portfolio import Holding, Portfolio
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, RuntimeModelStateView
 from leaps_quant_engine.snapshots import SnapshotQualityReport, SnapshotQualityStatus
 
 
@@ -171,3 +174,93 @@ def test_basic_risk_clamps_to_total_exposure_limit():
 
     assert batch.approved_targets == (PortfolioTarget(second, quantity=3, tag="entry"),)
     assert batch.decisions[0].status is RiskDecisionStatus.CLAMPED
+
+
+def test_daily_loss_limit_model_rejects_new_entries_after_loss_limit():
+    symbol = Symbol("AAA", "US")
+    store = InMemoryRuntimeStateStore()
+    state = RuntimeModelStateView(store=store, default_sleeve_id="test-sleeve")
+    model = DailyLossLimitRiskModel(max_daily_loss_pct=0.05)
+    context = RiskManagementContext(
+        sleeve_id="test-sleeve",
+        data=_slice(symbol, 100.0),
+        portfolio=Portfolio(cash=940),
+        targets=(PortfolioTarget(symbol, quantity=1, tag="entry"),),
+        model_state=state,
+    )
+    store.apply_patches(
+        (
+            state.object_set(
+                {"start_equity": 1000.0},
+                model_id="daily-loss-limit",
+                namespace="daily_equity",
+                symbol_key=context.data.time.date().isoformat(),
+            ),
+        )
+    )
+
+    batch = model.manage_risk(context)
+
+    assert batch.approved_targets == ()
+    assert batch.decisions[0].status is RiskDecisionStatus.REJECTED
+    assert batch.decisions[0].reason == "daily_loss_limit_exceeded"
+    assert batch.state_patches[0].value["blocked"] is True
+
+
+def test_daily_loss_limit_model_allows_reductions_when_blocked():
+    symbol = Symbol("AAA", "US")
+    store = InMemoryRuntimeStateStore()
+    state = RuntimeModelStateView(store=store, default_sleeve_id="test-sleeve")
+    model = DailyLossLimitRiskModel(max_daily_loss_pct=0.05)
+    context = RiskManagementContext(
+        sleeve_id="test-sleeve",
+        data=_slice(symbol, 100.0),
+        portfolio=Portfolio(cash=440, holdings={symbol.key: Holding(symbol, quantity=5, average_price=100.0)}),
+        targets=(PortfolioTarget(symbol, quantity=2, tag="reduce"),),
+        model_state=state,
+    )
+    store.apply_patches(
+        (
+            state.object_set(
+                {"start_equity": 1000.0},
+                model_id="daily-loss-limit",
+                namespace="daily_equity",
+                symbol_key=context.data.time.date().isoformat(),
+            ),
+        )
+    )
+
+    batch = model.manage_risk(context)
+
+    assert batch.approved_targets == (PortfolioTarget(symbol, quantity=2, tag="reduce"),)
+    assert batch.decisions[0].reason == "risk_reduction_allowed"
+
+
+def test_max_drawdown_model_rejects_new_entries_below_peak_limit():
+    symbol = Symbol("AAA", "US")
+    store = InMemoryRuntimeStateStore()
+    state = RuntimeModelStateView(store=store, default_sleeve_id="test-sleeve")
+    model = MaxDrawdownRiskModel(max_drawdown_pct=0.10)
+    store.apply_patches(
+        (
+            state.object_set(
+                {"peak_equity": 1000.0},
+                model_id="max-drawdown",
+                namespace="drawdown",
+            ),
+        )
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="test-sleeve",
+            data=_slice(symbol, 100.0),
+            portfolio=Portfolio(cash=890),
+            targets=(PortfolioTarget(symbol, quantity=1, tag="entry"),),
+            model_state=state,
+        )
+    )
+
+    assert batch.approved_targets == ()
+    assert batch.decisions[0].reason == "max_drawdown_limit_exceeded"
+    assert batch.state_patches[0].value["peak_equity"] == 1000.0

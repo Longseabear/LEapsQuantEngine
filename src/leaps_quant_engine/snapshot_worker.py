@@ -11,12 +11,17 @@ from typing import Any
 from leaps_quant_engine.alpha import AlphaRuntime, InsightBatch, SnapshotContext
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.market_data import MarketDataProvider
-from leaps_quant_engine.market_data_snapshot import MarketDataSnapshot, MarketDataSnapshotEngine
+from leaps_quant_engine.market_data_snapshot import FileMarketDataSnapshotStore, MarketDataSnapshot, MarketDataSnapshotEngine
 from leaps_quant_engine.snapshots import (
+    IndicatorSnapshot,
     IndicatorSnapshotStore,
     SnapshotFreshnessPolicy,
     SnapshotQualityReport,
     SnapshotQualityStatus,
+)
+from leaps_quant_engine.temporal_features import (
+    TemporalFeatureWindowProvider,
+    enrich_indicator_snapshot_with_temporal_features,
 )
 from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.warmup import WarmupPolicy, WarmupReport, run_daily_indicator_warmup
@@ -39,7 +44,9 @@ class SnapshotWorkerCycleReport:
     indicator_update_count: int
     indicator_resolution_mismatch_count: int
     market_snapshot_id: str
+    market_snapshot_lane: str
     indicator_snapshot_id: str
+    indicator_snapshot_lane: str
     snapshot_as_of: str
     snapshot_quality: SnapshotQualityReport
     collection_elapsed_ms: float
@@ -68,7 +75,9 @@ class SnapshotWorkerCycleReport:
             "indicator_update_count": self.indicator_update_count,
             "indicator_resolution_mismatch_count": self.indicator_resolution_mismatch_count,
             "market_snapshot_id": self.market_snapshot_id,
+            "market_snapshot_lane": self.market_snapshot_lane,
             "indicator_snapshot_id": self.indicator_snapshot_id,
+            "indicator_snapshot_lane": self.indicator_snapshot_lane,
             "snapshot_as_of": self.snapshot_as_of,
             "snapshot_quality": self.snapshot_quality.to_dict(),
             "collection_elapsed_ms": self.collection_elapsed_ms,
@@ -137,8 +146,11 @@ class BackgroundSnapshotWorker:
     freshness_policy: SnapshotFreshnessPolicy = field(default_factory=SnapshotFreshnessPolicy)
     warmup_policy: WarmupPolicy = field(default_factory=WarmupPolicy)
     entry_block_reasons: tuple[str, ...] = ()
+    temporal_feature_provider: TemporalFeatureWindowProvider | None = None
+    snapshot_store: FileMarketDataSnapshotStore | None = None
     snapshot_engine: MarketDataSnapshotEngine = field(init=False)
     last_market_snapshot: MarketDataSnapshot | None = field(default=None, init=False)
+    last_market_snapshot_by_lane: dict[str, MarketDataSnapshot] = field(default_factory=dict, init=False)
     _stop_event: Event = field(default_factory=Event, init=False)
     _thread: Thread | None = field(default=None, init=False)
     _cycle_index: int = field(default=0, init=False)
@@ -153,7 +165,18 @@ class BackgroundSnapshotWorker:
             indicator_engine=self.indicator_engine,
             stores_by_sleeve=self.stores_by_sleeve,
             source=self.source,
+            snapshot_store=self.snapshot_store,
         )
+
+    def update_universe(self, universe: UniverseDefinition) -> None:
+        self.universe = universe
+        self.indicator_engine.set_active_universe(self.sleeve_id, universe)
+        if self.temporal_feature_provider is not None and self.history_provider is not None:
+            self.temporal_feature_provider.warm_up_from_provider(
+                self.history_provider,
+                universe.symbols,
+                refresh_history=False,
+            )
 
     def warm_up(
         self,
@@ -184,6 +207,14 @@ class BackgroundSnapshotWorker:
             policy=self.warmup_policy,
             indicator_engine=self.indicator_engine,
         )
+        if self.temporal_feature_provider is not None:
+            self.temporal_feature_provider.warm_up_from_provider(
+                self.history_provider,
+                self.universe.symbols,
+                start=start,
+                end=end,
+                refresh_history=refresh_history,
+            )
         logger.info(
             "background_snapshot_worker.warmup.complete",
             extra={
@@ -219,6 +250,7 @@ class BackgroundSnapshotWorker:
             min_success=self.min_success,
         )
         self.last_market_snapshot = collection.snapshot
+        self.last_market_snapshot_by_lane[collection.snapshot.lane] = collection.snapshot
         quality_report = self.freshness_policy.evaluate(
             requested_symbol_count=collection.report.requested_symbol_count,
             collected_symbol_count=collection.report.collected_symbol_count,
@@ -239,7 +271,8 @@ class BackgroundSnapshotWorker:
         )
         indicator_update_report = self.snapshot_engine.last_indicator_update_report
         indicator_update_ms = (time.perf_counter() - update_started) * 1000
-        indicator_snapshot = indicator_snapshots[self.sleeve_id]
+        indicator_snapshot = self._enrich_indicator_snapshot(indicator_snapshots[self.sleeve_id])
+        self.stores_by_sleeve.setdefault(self.sleeve_id, IndicatorSnapshotStore()).publish_active(indicator_snapshot)
         insight_batch = self._run_alpha(indicator_snapshot)
         ready_counts = [
             len(indicator_snapshot.ready_values(symbol_key))
@@ -259,7 +292,9 @@ class BackgroundSnapshotWorker:
             indicator_update_count=indicator_update_report.updated_count,
             indicator_resolution_mismatch_count=indicator_update_report.resolution_mismatch_count,
             market_snapshot_id=collection.snapshot.snapshot_id,
+            market_snapshot_lane=collection.snapshot.lane,
             indicator_snapshot_id=indicator_snapshot.snapshot_id,
+            indicator_snapshot_lane=indicator_snapshot.lane,
             snapshot_as_of=indicator_snapshot.as_of.isoformat(),
             snapshot_quality=quality_report,
             collection_elapsed_ms=collection.report.elapsed_ms,
@@ -298,6 +333,12 @@ class BackgroundSnapshotWorker:
             },
         )
         return report
+
+    def _enrich_indicator_snapshot(self, indicator_snapshot: IndicatorSnapshot) -> IndicatorSnapshot:
+        return enrich_indicator_snapshot_with_temporal_features(
+            indicator_snapshot,
+            self.temporal_feature_provider,
+        )
 
     def _run_alpha(self, indicator_snapshot) -> InsightBatch | None:
         if self.alpha_runtime is None:

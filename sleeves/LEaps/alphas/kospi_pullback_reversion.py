@@ -6,8 +6,8 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-kospi-pullback-reversion"
-VERSION = "0.2.0"
-EVALUATION_CADENCE = "every_cycle"
+VERSION = "0.3.0"
+EVALUATION_CADENCE = "every_15_minutes"
 INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=2)
 MAX_SELECTED = 4
@@ -18,6 +18,11 @@ MIN_PULLBACK_DEPTH = 0.015
 MAX_NORMALIZED_VOLATILITY = 0.17
 MAX_REBREAK_DISTANCE = 0.05
 MIN_REBREAK_MOMENTUM_5 = 0.015
+VOLATILITY_STABILIZATION_START = 0.11
+MAX_VOLATILE_PULLBACK = 0.19
+VOLATILE_REBREAK_MIN_MOMENTUM_5 = 0.02
+VOLATILE_PULLBACK_MAX_DEPTH = 0.09
+VOLATILE_PULLBACK_MAX_FAST_DISTANCE = 0.035
 MAX_PLAUSIBLE_DAILY_FEATURE_ABS = 3.0
 
 
@@ -55,10 +60,6 @@ def generate(context: SnapshotContext) -> list[Insight]:
         if trend_strength <= 0.0 or fast_average < slow_average or momentum_20 < MIN_TREND_MOMENTUM:
             continue
 
-        volatility = _normalized_volatility(context, symbol_key, close)
-        if volatility > MAX_NORMALIZED_VOLATILITY:
-            continue
-
         pullback_from_high = max((rolling_high - close) / rolling_high, 0.0)
         distance_to_fast = (fast_average / close) - 1.0
         short_reversal_pressure = max(-(momentum_5 or 0.0), 0.0)
@@ -72,6 +73,16 @@ def generate(context: SnapshotContext) -> list[Insight]:
         )
         if timing is None:
             continue
+        volatility = _normalized_volatility(context, symbol_key, close)
+        volatility_profile = _volatility_profile(
+            volatility=volatility,
+            setup=str(timing["setup"]),
+            momentum_5=momentum_5 or 0.0,
+            pullback_from_high=pullback_from_high,
+            distance_to_fast=distance_to_fast,
+        )
+        if volatility_profile is None:
+            continue
         if rolling_low is not None and rolling_low > 0 and close <= rolling_low * 1.01:
             continue
 
@@ -82,6 +93,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
             + (momentum_20 * 0.22)
             + (timing["score"] * 0.85)
             + liquidity_bonus
+            + float(volatility_profile["adjustment"])
             - (volatility * 0.42)
         )
         if score < MIN_SCORE:
@@ -101,6 +113,8 @@ def generate(context: SnapshotContext) -> list[Insight]:
                 "pullback_from_high": pullback_from_high,
                 "distance_to_fast": distance_to_fast,
                 "short_reversal_pressure": short_reversal_pressure,
+                "volatility_regime": volatility_profile["regime"],
+                "volatility_regime_adjustment": volatility_profile["adjustment"],
                 "rolling_high": rolling_high,
                 "rolling_low": rolling_low or 0.0,
                 "liquidity": liquidity or 0.0,
@@ -115,10 +129,11 @@ def generate(context: SnapshotContext) -> list[Insight]:
     for rank, item in enumerate(selected, start=1):
         score = float(item["score"])
         volatility = float(item["volatility"])
+        symbol_key = str(item["symbol_key"])
         insights.append(
             Insight(
                 sleeve_id=context.sleeve_id,
-                symbol=context.symbol(str(item["symbol_key"])),
+                symbol=context.symbol(symbol_key),
                 direction=InsightDirection.UP,
                 generated_at=context.as_of,
                 expires_at=context.as_of + HORIZON,
@@ -131,29 +146,44 @@ def generate(context: SnapshotContext) -> list[Insight]:
                 score=score,
                 group_id="krw-growth",
                 reason="kospi_pullback_reversion_in_uptrend",
-                metadata={
-                    "role": "krw_pullback_reversion",
-                    "close": item["close"],
-                    "fast_average": item["fast_average"],
-                    "slow_average": item["slow_average"],
-                    "momentum": item["momentum"],
-                    "momentum_5": item["momentum_5"],
-                    "trend_strength": item["trend_strength"],
-                    "volatility": item["volatility"],
-                    "pullback_depth": item["pullback_depth"],
-                    "entry_setup": item["entry_setup"],
-                    "pullback_from_high": item["pullback_from_high"],
-                    "distance_to_fast": item["distance_to_fast"],
-                    "short_reversal_pressure": item["short_reversal_pressure"],
-                    "rolling_high": item["rolling_high"],
-                    "rolling_low": item["rolling_low"],
-                    "liquidity": item["liquidity"],
-                    "rank": rank,
-                    "selected_count": len(selected),
-                },
+                metadata=_with_temporal_features(
+                    context,
+                    symbol_key,
+                    {
+                        "role": "krw_pullback_reversion",
+                        "close": item["close"],
+                        "fast_average": item["fast_average"],
+                        "slow_average": item["slow_average"],
+                        "momentum": item["momentum"],
+                        "momentum_5": item["momentum_5"],
+                        "trend_strength": item["trend_strength"],
+                        "volatility": item["volatility"],
+                        "pullback_depth": item["pullback_depth"],
+                        "entry_setup": item["entry_setup"],
+                        "pullback_from_high": item["pullback_from_high"],
+                        "distance_to_fast": item["distance_to_fast"],
+                        "short_reversal_pressure": item["short_reversal_pressure"],
+                        "volatility_regime": item["volatility_regime"],
+                        "volatility_regime_adjustment": item["volatility_regime_adjustment"],
+                        "rolling_high": item["rolling_high"],
+                        "rolling_low": item["rolling_low"],
+                        "liquidity": item["liquidity"],
+                        "rank": rank,
+                        "selected_count": len(selected),
+                    },
+                ),
             )
         )
     return insights
+
+
+def _with_temporal_features(context: SnapshotContext, symbol_key: str, metadata: dict) -> dict:
+    temporal_features = context.metadata_value(symbol_key, "rl_temporal_features")
+    if not isinstance(temporal_features, (list, tuple)) or not temporal_features:
+        return metadata
+    enriched = dict(metadata)
+    enriched["rl_temporal_features"] = list(temporal_features)
+    return enriched
 
 
 def _normalized_volatility(context: SnapshotContext, symbol_key: str, close: float | None) -> float:
@@ -192,6 +222,31 @@ def _entry_timing(
     if MIN_PULLBACK_DEPTH <= pullback_depth <= MAX_PULLBACK_DEPTH:
         return {"setup": "pullback", "score": pullback_depth}
     return None
+
+
+def _volatility_profile(
+    *,
+    volatility: float,
+    setup: str,
+    momentum_5: float,
+    pullback_from_high: float,
+    distance_to_fast: float,
+) -> dict[str, float | str] | None:
+    if volatility <= VOLATILITY_STABILIZATION_START:
+        return {"regime": "normal", "adjustment": 0.0}
+    if volatility > MAX_VOLATILE_PULLBACK:
+        return None
+    if setup == "rebreak" and momentum_5 >= VOLATILE_REBREAK_MIN_MOMENTUM_5:
+        adjustment = -min(max(volatility - VOLATILITY_STABILIZATION_START, 0.0) * 0.12, 0.02)
+        return {"regime": "volatile_rebreak", "adjustment": adjustment}
+    if (
+        momentum_5 < 0.0
+        or pullback_from_high > VOLATILE_PULLBACK_MAX_DEPTH
+        or distance_to_fast > VOLATILE_PULLBACK_MAX_FAST_DISTANCE
+    ):
+        return None
+    adjustment = -(0.02 + min(max(volatility - VOLATILITY_STABILIZATION_START, 0.0) * 0.22, 0.04))
+    return {"regime": "volatile_stabilized_pullback", "adjustment": adjustment}
 
 
 def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ...]) -> float | None:

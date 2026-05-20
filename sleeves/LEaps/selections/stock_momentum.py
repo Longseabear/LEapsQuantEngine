@@ -12,7 +12,6 @@ from leaps_quant_engine.universe.selection import (
 MAX_NORMALIZED_VOLATILITY = 0.18
 EXTREME_NORMALIZED_VOLATILITY = 0.24
 HIGH_VOL_MOMENTUM_EXCEPTION = 0.45
-SECTOR_RELATIVE_STRENGTH_WEIGHT = 0.20
 TREND_STRENGTH_WEIGHT = 0.08
 
 
@@ -64,7 +63,6 @@ class StockMomentumSelectionModel:
             )
             trend_strength = 0.0 if slow_average is None or slow_average <= 0 else (close / slow_average) - 1.0
             liquidity_score = 0.0 if liquidity is None else min(liquidity / 1_000_000_000.0, 1.0)
-            sector = _sector_for(context, symbol.key)
             scored.append(
                 {
                     "symbol": symbol,
@@ -77,17 +75,12 @@ class StockMomentumSelectionModel:
                     "liquidity": liquidity,
                     "liquidity_score": liquidity_score,
                     "volatility": volatility,
-                    "sector": sector,
                 }
             )
 
-        sector_strength = _sector_relative_strength(scored)
         for item in scored:
-            sector_score = sector_strength.get(str(item["sector"]), 0.0)
-            item["sector_relative_strength"] = sector_score
             item["score"] = (
                 float(item["recency_weighted_momentum"])
-                + (sector_score * SECTOR_RELATIVE_STRENGTH_WEIGHT)
                 + (max(float(item["trend_strength"]), 0.0) * TREND_STRENGTH_WEIGHT)
                 + (float(item["liquidity_score"]) * 0.05)
                 - min(float(item["volatility"]), 0.35) * 0.20
@@ -112,8 +105,6 @@ class StockMomentumSelectionModel:
                     "momentum_5": item["momentum_5"],
                     "momentum_60": item["momentum_60"],
                     "recency_weighted_momentum": item["recency_weighted_momentum"],
-                    "sector": item["sector"],
-                    "sector_relative_strength": item["sector_relative_strength"],
                     "trend_strength": item["trend_strength"],
                     "liquidity": item["liquidity"],
                     "volatility": item["volatility"],
@@ -168,23 +159,3 @@ def _is_etf(context: UniverseSelectionContext, symbol_key: str) -> bool:
         return True
     value = properties.get("is_etf")
     return bool(value) if isinstance(value, bool) else str(value).strip().lower() in {"1", "true", "yes", "y"}
-
-
-def _sector_for(context: UniverseSelectionContext, symbol_key: str) -> str:
-    properties = context.universe.properties_for(symbol_key)
-    sector = str(properties.get("sector") or properties.get("industry") or "unknown").strip().lower()
-    return sector or "unknown"
-
-
-def _sector_relative_strength(scored: list[dict[str, object]]) -> dict[str, float]:
-    totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
-    for item in scored:
-        sector = str(item["sector"])
-        totals[sector] = totals.get(sector, 0.0) + float(item["recency_weighted_momentum"])
-        counts[sector] = counts.get(sector, 0) + 1
-    return {
-        sector: totals[sector] / counts[sector]
-        for sector in totals
-        if counts.get(sector, 0) > 0
-    }

@@ -1,0 +1,388 @@
+{
+  "runtime_id": "live_multi_sleeve_v4",
+  "mode": "live",
+  "timezone": "Asia/Seoul",
+  "market_data": {
+    "provider": "kis-gateway",
+    "history_provider": "kis-cache",
+    "source": "kis-gateway",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 18,
+    "gateway_base_url": "http://127.0.0.1:8766",
+    "snapshot_store_path": "../../data/market-data-snapshots/live_multi_sleeve_v4.jsonl"
+  },
+  "broker_accounts": [
+    {
+      "account_id": "kis-domestic",
+      "market_scope": "domestic",
+      "currency": "KRW",
+      "account_store_path": "../../data/virtual-accounts/kis_domestic.json",
+      "order_store_path": "../../data/order-runtime/kis_domestic.jsonl",
+      "broker_gateway": "broker-engine",
+      "metadata": {
+        "kis_account_id": "default",
+        "note": "Domestic account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_DEFAULT_* env values."
+      }
+    },
+    {
+      "account_id": "kis-overseas",
+      "market_scope": "overseas",
+      "currency": "USD",
+      "account_store_path": "../../data/virtual-accounts/kis_overseas.json",
+      "order_store_path": "../../data/order-runtime/kis_overseas.jsonl",
+      "broker_gateway": "broker-engine",
+      "metadata": {
+        "kis_account_id": "us-growth",
+        "note": "US/overseas virtual sleeve account route. KIS credentials and account numbers are resolved from KIS_ACCOUNT_US_GROWTH_* env values."
+      }
+    }
+  ],
+  "journal_path": "../../data/cycle-journal/live_multi_sleeve.jsonl",
+  "sleeves": [
+    {
+      "sleeve_id": "LEaps",
+      "workspace_path": "sleeves/LEaps",
+      "broker_account_id": "kis-domestic",
+      "broker_account_routes": {
+        "domestic": "kis-domestic"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "KRW": 13777806
+      },
+      "universe": {
+        "coarse_path": "configs/universes/leaps_kr_research_200.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 60,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/stock_momentum.py:StockMomentumSelectionModel",
+            "selections/krx_etf_safety.py:KrxEtfSafetySelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ]
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 30,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/kospi_conviction.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/kospi_pullback_reversion.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/kospi_swing_rebalance.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/krx_etf_safety.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/volatility_trailing_stop.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "leaps-kospi-pullback-reversion": "leaps-stock-momentum",
+          "leaps-kospi-conviction": "leaps-stock-momentum",
+          "leaps-kospi-swing-rebalance": "leaps-stock-momentum",
+          "leaps-krx-etf-safety": "leaps-krx-etf-safety",
+          "leaps-volatility-trailing-stop": "leaps-operational-symbols"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/v4_banded_momentum.py",
+        "parameters": {
+          "model_name": "v4_banded_momentum",
+          "model_id": "leaps-v4-banded-momentum",
+          "state_namespace": "position_state",
+          "entry_top_n": 12,
+          "hold_top_n": 60,
+          "trim_top_n": 85,
+          "max_positions": 8,
+          "min_holding_days": 3,
+          "gross_exposure": 0.92,
+          "neutral_gross_exposure": 0.68,
+          "weak_gross_exposure": 0.35,
+          "max_position_pct": 0.24,
+          "min_position_pct": 0.015,
+          "min_entry_lot_count": 1.0,
+          "target_drift_threshold_pct": 0.0,
+          "reentry_cooldown_days": 1,
+          "score_temperature": 0.32,
+          "retention_bonus": 0.10,
+          "multi_alpha_bonus": 0.06,
+          "recent_momentum_weight": 0.12,
+          "trend_weight": 0.06,
+          "volatility_penalty": 0.55,
+          "drawdown_penalty": 0.18,
+          "trim_multiplier": 0.50,
+          "missing_target_exit_confirmation_cycles": 2,
+          "max_target_turnover_pct": 0.07,
+          "daily_turnover_budget_pct": 0.15,
+          "emit_zero_for_missing_held_targets": true,
+          "long_only": true
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.0,
+          "min_order_notional": 100000.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true,
+          "cadence": "every_5_minutes",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 5.0
+        },
+        "target_resolution": {
+          "mode": "complete"
+        },
+        "blend": {
+          "enabled": false,
+          "duration_minutes": 0,
+          "target_drift_threshold_pct": 0.0,
+          "clock": "orderable_session"
+        }
+      },
+      "risk": {
+        "model": "risks/kospi_growth_us_hedge.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct_by_currency": {
+            "KRW": 0.26
+          },
+          "max_total_exposure_pct_by_currency": {
+            "KRW": 0.98
+          },
+          "cash_buffer_pct_by_currency": {
+            "KRW": 0.02
+          },
+          "regime_exposure_enabled": true,
+          "regime_total_exposure_pct_by_currency": {
+            "KRW": {
+              "risk_off": 0.45,
+              "neutral": 0.75,
+              "risk_on": 0.95,
+              "strong_risk_on": 0.98
+            }
+          },
+          "intraday_market_guard_enabled": true,
+          "intraday_guard_symbol": "KRX:069500",
+          "intraday_guard_reference_alpha_id": "leaps-krx-etf-safety",
+          "intraday_entry_freeze_return_pct": -0.01,
+          "intraday_risk_off_return_pct": -0.02,
+          "intraday_entry_freeze_cap_pct_by_currency": {
+            "KRW": 0.45
+          },
+          "intraday_risk_off_cap_pct_by_currency": {
+            "KRW": 0.25
+          },
+          "intraday_guard_exempt_symbols": [
+            "KRX:488770",
+            "KRX:423160",
+            "KRX:459580",
+            "KRX:114800"
+          ],
+          "intraday_open_entry_freeze_until": "09:40",
+          "intraday_guard_high_drawdown_enabled": true,
+          "intraday_guard_high_entry_freeze_return_pct": -0.01,
+          "intraday_guard_high_risk_off_return_pct": -0.012,
+          "intraday_guard_smoothing_enabled": true,
+          "intraday_guard_cap_curve": "smoothstep",
+          "intraday_guard_hard_entry_freeze": false,
+          "intraday_guard_recovery_enabled": true,
+          "intraday_guard_recovery_from_low_pct": 0.006,
+          "intraday_guard_recovery_confirmation_cycles": 2,
+          "intraday_guard_recovery_cap_pct_by_currency": {
+            "KRW": 0.45
+          },
+          "symbol_guard_enabled": true,
+          "symbol_guard_exempt_symbols": [
+            "KRX:488770",
+            "KRX:423160",
+            "KRX:459580",
+            "KRX:114800"
+          ],
+          "symbol_entry_block_intraday_return_pct": -0.025,
+          "symbol_entry_block_high_drawdown_pct": -0.04,
+          "symbol_entry_block_unrealized_loss_pct": -0.015,
+          "symbol_reduce_half_unrealized_loss_pct": -0.035,
+          "symbol_exit_unrealized_loss_pct": -0.06,
+          "symbol_reduce_half_high_drawdown_pct": -0.065,
+          "symbol_exit_high_drawdown_pct": -0.1,
+          "symbol_reduce_half_sma10_buffer_pct": -0.005,
+          "symbol_exit_sma20_buffer_pct": -0.005,
+          "symbol_reduce_fraction": 0.5,
+          "symbol_guard_volatility_adjusted_enabled": true,
+          "symbol_guard_reference_volatility_pct": 0.04,
+          "symbol_guard_min_volatility_multiplier": 0.75,
+          "symbol_guard_max_volatility_multiplier": 1.75,
+          "symbol_guard_entry_max_volatility_multiplier": 1.25,
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/leaps_immediate.py",
+        "parameters": {
+          "tag_prefix": "leaps",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "buy_limit_offset_bps": 8.0,
+          "sell_limit_offset_bps": 15.0,
+          "stop_sell_limit_offset_bps": 35.0,
+          "max_slice_notional": 2000000,
+          "max_slices": 3,
+          "max_daily_volume_participation_bps": 50.0,
+          "chase_guard_intraday_return_bps": 500.0,
+          "chase_guard_size_multiplier": 0.4,
+          "regular_auction_buy_multiplier": 0.65,
+          "regular_auction_sell_multiplier": 1.0,
+          "extended_session_buy_multiplier": 0.35,
+          "extended_session_sell_multiplier": 1.0,
+          "block_after_hours_single_price": true
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 60,
+        "min_success": 1
+      }
+    },
+    {
+      "sleeve_id": "us_etf_rotation",
+      "workspace_path": "sleeves/us_etf_rotation",
+      "broker_account_id": "kis-overseas",
+      "broker_account_routes": {
+        "overseas": "kis-overseas"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "USD": 0
+      },
+      "universe": {
+        "coarse_path": "configs/universes/us_etf_rotation_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 8,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/etf_rotation.py:EtfRotationSelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ]
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 30,
+        "min_ready_ratio": 1.0,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/daa_pullback.py",
+            "enabled": true
+          },
+          {
+            "ref": "alphas/volatility_trailing_stop.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "us_etf_rotation_daa_pullback": "us_etf_rotation",
+          "us_etf_rotation-volatility-trailing-stop": "us_etf_rotation-operational-symbols"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/rl_ppo_constructor.py",
+        "parameters": {
+          "policy_path": null,
+          "policy_paths": [
+            "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.zip"
+          ],
+          "metadata_path": "data/rl/us_etf_rotation/leaps_ppo_portfolio_allocator.json",
+          "exposure_levels": [0.0, 0.25, 0.5, 0.75, 0.95],
+          "fallback_action": 4,
+          "top_k": 4,
+          "model_name": "daa_pullback_c18",
+          "weight_temperature": 0.8,
+          "min_position_pct": 0.0,
+          "min_signal_action": 1,
+          "allocation_mode": "risk_softmax",
+          "fallback_gross_exposure": 0.75,
+          "max_portfolio_pct": 1.0,
+          "max_position_pct": 0.25,
+          "long_only": true
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.02,
+          "min_order_notional": 200.0,
+          "min_quantity_delta": 2,
+          "allow_exit_below_min_notional": true,
+          "cadence": "every_5_minutes",
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 1,
+          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_equity_bps": 10.0
+        },
+        "target_resolution": {
+          "mode": "patch"
+        },
+        "blend": {
+          "enabled": true,
+          "duration_minutes": 300,
+          "target_drift_threshold_pct": 0.08,
+          "clock": "orderable_session"
+        }
+      },
+      "risk": {
+        "model": "risks/basic.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct": 0.25,
+          "max_total_exposure_pct": 0.98,
+          "cash_buffer_pct": 0.02,
+          "max_cycle_buy_notional": 10000.0,
+          "max_cycle_buy_notional_pct": 0.65,
+          "cycle_buy_notional_currency": "USD",
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/immediate.py",
+        "parameters": {
+          "tag_prefix": "us_etf_rotation",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "limit_offset_bps": 0.0
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 60,
+        "min_success": 1
+      }
+    }
+  ],
+  "metadata": {
+    "description": "Combined live config for the multi-sleeve single runner. LEaps and us_etf_rotation share one live market snapshot cycle while preserving separate sleeve state, account routes, risk, execution, and framework state."
+  }
+}

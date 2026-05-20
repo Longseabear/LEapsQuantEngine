@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
@@ -13,6 +13,7 @@ from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, b
 from leaps_quant_engine.runtime_bootstrap import _FallbackHistoryProvider
 from leaps_quant_engine.runtime_bootstrap import _confirmed_daily_warmup_end
 from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
+from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
 
@@ -330,12 +331,7 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
     universe_path = tmp_path / "universe.json"
     config_path = tmp_path / "runtime.json"
     _write_universe(universe_path)
-    _write_runtime_config(
-        config_path,
-        universe_path,
-        reused_target_churn_guard=True,
-        reused_target_churn_equity_bps=5.0,
-    )
+    _write_runtime_config(config_path, universe_path)
     snapshot = load_runtime_config_snapshot(config_path)
     symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
     live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
@@ -371,6 +367,78 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
         (str(tmp_path / "risk.py"), {"long_only": True, "max_position_pct": 0.4, "cash_buffer_pct": 0.05})
     ]
     assert execution_model_loader.calls == [(str(tmp_path / "execution.py"), {})]
+
+
+def test_runtime_active_universe_startup_only_persists_without_refresh(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    _write_universe(universe_path)
+    _write_runtime_config(config_path, universe_path)
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
+    runtime_state = InMemoryRuntimeStateStore()
+
+    runtime = bootstrap_sleeve_runtime(
+        snapshot,
+        "us-live",
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit: live_provider,
+            history_provider_factory=lambda: FakeHistoryProvider(),
+            alpha_loader=FakeAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+            runtime_state_store=runtime_state,
+        ),
+    )
+
+    refreshed = runtime.refresh_active_universe_if_due(as_of=datetime(2026, 5, 9, 9, 0))
+
+    assert refreshed is False
+    records = runtime_state.entries(model_id="engine-universe-selection", namespace="active_universe")
+    assert len(records) == 1
+    assert records[0].value["cadence"] == "startup_only"
+    assert records[0].value["symbol_keys"] == ["US:NVDA"]
+
+
+def test_runtime_active_universe_once_per_day_refreshes_worker_universe(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    _write_universe(universe_path)
+    _write_runtime_config(
+        config_path,
+        universe_path,
+        reused_target_churn_guard=True,
+        reused_target_churn_equity_bps=5.0,
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["sleeves"][0]["universe"]["active"]["cadence"] = "once_per_day"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot = load_runtime_config_snapshot(config_path)
+    symbols = [Symbol("NVDA", "US"), Symbol("MSFT", "US"), Symbol("IBM", "US")]
+    live_provider = FakeLiveProvider({symbol.key: _bar(symbol, 100 + index) for index, symbol in enumerate(symbols)})
+    runtime_state = InMemoryRuntimeStateStore()
+
+    runtime = bootstrap_sleeve_runtime(
+        snapshot,
+        "us-live",
+        dependencies=RuntimeBootstrapDependencies(
+            live_provider_factory=lambda universe, rate_limit: live_provider,
+            history_provider_factory=lambda: FakeHistoryProvider(),
+            alpha_loader=FakeAlphaLoader(),
+            portfolio_model_loader=FakePortfolioModelLoader(),
+            risk_model_loader=FakeRiskModelLoader(),
+            execution_model_loader=FakeExecutionModelLoader(),
+            runtime_state_store=runtime_state,
+        ),
+        held_symbols=(Symbol("IBM", "US"),),
+    )
+
+    assert runtime.refresh_active_universe_if_due(as_of=datetime(2026, 5, 9, 9, 0)) is True
+    assert runtime.worker.universe.symbol_keys == ("US:NVDA", "US:IBM")
+    assert runtime.refresh_active_universe_if_due(as_of=datetime(2026, 5, 9, 10, 0)) is False
+    assert runtime.refresh_active_universe_if_due(as_of=datetime(2026, 5, 10, 9, 0)) is True
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.cash_reserve_pct == 0.1
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.min_order_notional == 1000
     assert runtime.framework_runner.portfolio_engine.rebalance_policy.reused_target_churn_guard is True
@@ -673,6 +741,29 @@ def test_fallback_history_provider_uses_secondary_history_when_primary_fails():
     history = provider.get_history(symbol, start=datetime(2026, 5, 1), end=datetime(2026, 5, 3))
 
     assert [bar.close for bar in history] == [100, 105, 110]
+
+
+def test_fallback_history_provider_uses_secondary_history_when_primary_range_is_too_short():
+    symbol = Symbol("005930", "KRX")
+    start = datetime(2025, 9, 1)
+    end = datetime(2026, 5, 17)
+    primary_bars = [
+        Bar(symbol, start + timedelta(days=index), 100, 100, 100, 100 + index, 1000)
+        for index in range(30)
+    ]
+    fallback_bars = [
+        Bar(symbol, start + timedelta(days=index), 200, 200, 200, 200 + index, 1000)
+        for index in range(120)
+    ]
+    provider = _FallbackHistoryProvider(
+        primary=FakeHistoryProvider({symbol.key: primary_bars}),
+        fallback=FakeHistoryProvider({symbol.key: fallback_bars}),
+    )
+
+    history = provider.get_history(symbol, start=start, end=end)
+
+    assert len(history) == 120
+    assert history[0].close == 200
 
 
 def test_runtime_fetches_current_portfolio_for_leaps_sleeve(tmp_path):

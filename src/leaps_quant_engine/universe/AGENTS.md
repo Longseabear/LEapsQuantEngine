@@ -34,6 +34,9 @@ selected_active_symbols
 - Universe selection is sleeve/strategy-owned but engine safety invariants are global.
 - Config files may define precomputed coarse universes in v0.
 - Fine universe entries should carry freshness and failure metadata.
+- Active selection cadence is runtime-owned. Use `universe.active.cadence`
+  (`startup_only`, `once_per_day`, or interval aliases) and let
+  `RuntimeSleeveRuntime` swap the worker universe at cycle boundaries.
 - Do not create orders, targets, broker calls, or portfolio mutations here.
 
 ## Tests

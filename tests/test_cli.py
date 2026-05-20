@@ -289,6 +289,8 @@ class SecondSymbolSelectionModel:
             "KRW",
             "--summary-only",
             "--include-insights",
+            "--daily-bar-time",
+            "09:00",
         ]
     )
 
@@ -299,7 +301,10 @@ class SecondSymbolSelectionModel:
     assert "history_feed_build_ms" in payload["timings"]
     assert payload["alpha"]["input_selections"] == {"selected-alpha": "second-only"}
     assert "orders" not in payload
+    assert payload["daily_bar_time"] == "09:00"
+    assert payload["start"] == "2026-01-01T09:00:00"
     assert payload["insights"]["cycle_count"] == 2
+    assert payload["insights"]["cycles"][0]["generated_at"] == "2026-01-01T09:00:00"
     assert payload["insights"]["cycles"][0]["new_insights"][0]["symbol"] == "KRX:000660"
     assert payload["insights"]["cycles"][1]["new_insights"][0]["metadata"]["opening_gap_pct"] == 0.0
     assert "cycles" in payload["selection"]
@@ -393,6 +398,7 @@ def generate(context):
         ),
         encoding="utf-8",
     )
+    journal_path = tmp_path / "minute-journal.jsonl"
 
     exit_code = main(
         [
@@ -412,6 +418,8 @@ def generate(context):
             "1000",
             "--currency",
             "KRW",
+            "--journal",
+            str(journal_path),
             "--summary-only",
             "--include-insights",
         ]
@@ -421,11 +429,130 @@ def generate(context):
     payload = json.loads(capsys.readouterr().out)
     assert payload["source"] == "minute-feed"
     assert {"config_bootstrap_ms", "feed_load_ms", "daily_warmup_ms", "framework_replay_ms", "report_generation_ms", "total_ms"} <= set(payload["timings"])
+    assert {
+        "replay_indicator_update_ms",
+        "replay_indicator_snapshot_ms",
+        "replay_framework_runner_ms",
+        "replay_journal_append_ms",
+    } <= set(payload["timings"])
+    assert payload["cycle_journal"]["mode"] == "light"
     assert payload["minute_backtest"]["minute_data_slice_count"] == 2
     assert payload["minute_backtest"]["daily_warmup_bar_count"] == 1
     assert payload["insights"]["cycle_count"] == 2
     assert payload["insights"]["cycles"][0]["new_insights"][0]["metadata"]["daily_close"] == 100.0
     assert payload["final_quantity"] == {"KRX:005930": 20}
+    journal_rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+    assert len(journal_rows) == 2
+    assert journal_rows[0]["metadata"]["lineage_omitted"] == "journal_mode_light"
+    assert "lineage" not in journal_rows[0]["metadata"]
+
+    compiled_cache = tmp_path / "compiled-minute-replay.json.gz"
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--minute-feed",
+            str(minute_feed),
+            "--compiled-replay-cache",
+            str(compiled_cache),
+            "--start",
+            "2026-05-01T09:00:00",
+            "--end",
+            "2026-05-01T09:01:00",
+            "--warmup-start",
+            "2026-04-01",
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    compiled_write_payload = json.loads(capsys.readouterr().out)
+    assert compiled_write_payload["source"] == "minute-feed"
+    assert compiled_write_payload["compiled_replay_cache"]["status"] == "written"
+    assert compiled_write_payload["compiled_replay_cache"]["slice_count"] == 2
+    assert compiled_cache.exists()
+
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--compiled-replay-cache",
+            str(compiled_cache),
+            "--warmup-start",
+            "2026-04-01",
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    compiled_hit_payload = json.loads(capsys.readouterr().out)
+    assert compiled_hit_payload["source"] == "compiled-replay-cache"
+    assert compiled_hit_payload["compiled_replay_cache"]["status"] == "hit"
+    assert compiled_hit_payload["minute_backtest"]["minute_data_slice_count"] == 2
+    assert compiled_hit_payload["final_quantity"] == {"KRX:005930": 20}
+
+    daily_warmup_cache = tmp_path / "daily-warmup.json.gz"
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--compiled-replay-cache",
+            str(compiled_cache),
+            "--warmup-start",
+            "2026-04-01",
+            "--daily-warmup-cache",
+            str(daily_warmup_cache),
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    warmup_write_payload = json.loads(capsys.readouterr().out)
+    assert warmup_write_payload["daily_warmup_cache"]["status"] == "written"
+    assert warmup_write_payload["daily_warmup_cache"]["row_count"] == 1
+
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--compiled-replay-cache",
+            str(compiled_cache),
+            "--warmup-start",
+            "2026-04-01",
+            "--daily-warmup-cache",
+            str(daily_warmup_cache),
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    warmup_hit_payload = json.loads(capsys.readouterr().out)
+    assert warmup_hit_payload["daily_warmup_cache"]["status"] == "hit"
+    assert warmup_hit_payload["final_quantity"] == {"KRX:005930": 20}
 
     cache_dir = tmp_path / "minute-cache" / "runtime-minute-universe"
     cache_dir.mkdir(parents=True)
@@ -696,13 +823,14 @@ def test_cli_minute_cache_build_supports_kis_extended_session_metadata(monkeypat
     class FakeKISProvider:
         last_instance = None
 
-        def __init__(self):
+        def __init__(self, *, exchange_by_symbol=None):
             self.calls = []
+            self.exchange_by_symbol = dict(exchange_by_symbol or {})
             FakeKISProvider.last_instance = self
 
         @classmethod
-        def from_env(cls):
-            return cls()
+        def from_env(cls, exchange_by_symbol=None):
+            return cls(exchange_by_symbol=exchange_by_symbol)
 
         def get_cached_minute_history(
             self,
@@ -763,6 +891,102 @@ def test_cli_minute_cache_build_supports_kis_extended_session_metadata(monkeypat
         rows = handle.read().splitlines()
     assert "market_session_phase" in rows[0]
     assert "regular_open_auction" in rows[1]
+
+
+def test_cli_minute_cache_build_supports_kis_overseas_universe(monkeypatch, tmp_path, capsys):
+    universe_path = tmp_path / "us_universe.json"
+    universe_path.write_text(
+        json.dumps(
+            {
+                "id": "us-minute-universe",
+                "market": "US",
+                "symbols": [{"ticker": "SMH", "market": "US", "exchange": "NAS"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "us-minute-runtime",
+                "mode": "backtest",
+                "timezone": "America/New_York",
+                "sleeves": [
+                    {
+                        "sleeve_id": "us_etf_rotation",
+                        "cash": 1000,
+                        "universe": {"coarse_path": str(universe_path), "active": {"max_symbols": 1}},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeKISProvider:
+        last_instance = None
+
+        def __init__(self, *, exchange_by_symbol=None):
+            self.exchange_by_symbol = dict(exchange_by_symbol or {})
+            self.calls = []
+            FakeKISProvider.last_instance = self
+
+        @classmethod
+        def from_env(cls, exchange_by_symbol=None):
+            return cls(exchange_by_symbol=exchange_by_symbol)
+
+        def get_cached_minute_history(
+            self,
+            symbol,
+            *,
+            trade_date,
+            start_time,
+            end_time,
+            interval_minutes,
+            refresh,
+        ):
+            self.calls.append((symbol.key, trade_date, start_time, end_time, interval_minutes, refresh))
+            return [
+                Bar(
+                    symbol,
+                    cli.datetime(2026, 5, 15, 9, 30),
+                    570.10,
+                    571.00,
+                    569.90,
+                    570.44,
+                    1200,
+                    resolution="minute",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "KISCachedMarketDataProvider", FakeKISProvider)
+
+    exit_code = main(
+        [
+            "minute-cache-build",
+            str(config_path),
+            "--sleeve-id",
+            "us_etf_rotation",
+            "--cache-root",
+            str(tmp_path / "minute-cache"),
+            "--start",
+            "2026-05-15",
+            "--end",
+            "2026-05-15",
+            "--provider",
+            "kis-cache",
+            "--refresh-provider-cache",
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["provider"] == "kis-cache"
+    assert payload["row_count"] == 1
+    assert FakeKISProvider.last_instance.exchange_by_symbol == {"US:SMH": "NAS", "SMH": "NAS"}
+    assert FakeKISProvider.last_instance.calls == [("US:SMH", cli.datetime(2026, 5, 15, 9, 30), "09:30:00", "16:00:00", 1, True)]
 
 
 def test_cli_leaps_runtime_backtest_uses_kr_research_universe_and_krw_cash(monkeypatch, capsys):

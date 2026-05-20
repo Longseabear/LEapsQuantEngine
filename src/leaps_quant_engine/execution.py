@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
+from leaps_quant_engine.cadence import within_time_window
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, TimeInForce
 from leaps_quant_engine.portfolio import Portfolio
@@ -111,6 +112,9 @@ class StandardExecutionModel:
     price_drift_bps: float | None = None
     min_replace_interval_seconds: float | None = None
     max_replacements: int | None = None
+    buy_window: str = ""
+    sell_window: str = ""
+    window_timezone: str = "UTC"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_type", _coerce_order_type(self.order_type))
@@ -130,6 +134,10 @@ class StandardExecutionModel:
             raise ValueError("min_replace_interval_seconds must be non-negative when provided.")
         if self.max_replacements is not None and self.max_replacements < 0:
             raise ValueError("max_replacements must be non-negative when provided.")
+        if self.buy_window:
+            within_time_window(datetime(2000, 1, 3, 12, 0), self.buy_window, timezone=self.window_timezone)
+        if self.sell_window:
+            within_time_window(datetime(2000, 1, 3, 12, 0), self.sell_window, timezone=self.window_timezone)
 
     def create_orders(
         self,
@@ -151,6 +159,9 @@ class StandardExecutionModel:
                 continue
             reference_price = float(bar.close)
             side = OrderSide.BUY if delta > 0 else OrderSide.SELL
+            as_of = execution_context.generated_at if execution_context is not None else data.time
+            if not self._side_window_allows(side, as_of):
+                continue
             quantities = _split_quantity(
                 abs(delta),
                 reference_price=reference_price,
@@ -190,6 +201,11 @@ class StandardExecutionModel:
                     )
                 )
         return orders
+
+    def _side_window_allows(self, side: OrderSide, as_of: datetime) -> bool:
+        if side is OrderSide.BUY:
+            return within_time_window(as_of, self.buy_window, timezone=self.window_timezone)
+        return within_time_window(as_of, self.sell_window, timezone=self.window_timezone)
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +305,12 @@ def _execution_policy_metadata(model: StandardExecutionModel) -> dict[str, Any]:
         policy["min_replace_interval_seconds"] = float(model.min_replace_interval_seconds)
     if model.max_replacements is not None:
         policy["max_replacements"] = int(model.max_replacements)
+    if model.buy_window:
+        policy["buy_window"] = model.buy_window
+    if model.sell_window:
+        policy["sell_window"] = model.sell_window
+    if model.buy_window or model.sell_window:
+        policy["window_timezone"] = model.window_timezone
     return {"execution_policy": policy} if policy else {}
 
 
