@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEaps Sleeve Agent Messenger"
+  short_description: "Message mapped sleeve Codex agents"
+  default_prompt: "Use $leaps-sleeve-agent-messenger to send a short message to a mapped LEaps sleeve agent."

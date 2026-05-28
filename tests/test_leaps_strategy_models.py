@@ -11,10 +11,12 @@ import pytest
 
 from leaps_quant_engine.alpha import Insight, InsightDirection
 from leaps_quant_engine.alpha import SnapshotContext
+from leaps_quant_engine.execution import ExecutionContext, PendingOrderState
 from leaps_quant_engine.framework import PortfolioAllocationTarget, PortfolioConstructionContext
 from leaps_quant_engine.framework.risk import RiskManagementContext
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, PortfolioTarget, Symbol
+from leaps_quant_engine.orders import OrderTicket, OrderTicketStatus
 from leaps_quant_engine.portfolio import Holding, Portfolio
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, RuntimeModelStateView, StatePatch
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue
@@ -81,37 +83,90 @@ def test_leaps_live_alphas_use_patient_alpha_fast_risk_cadences():
     }
 
     assert cadences == {
-        "sleeves/LEaps/alphas/kospi_conviction.py": "every_15_minutes",
-        "sleeves/LEaps/alphas/kospi_pullback_reversion.py": "every_15_minutes",
-        "sleeves/LEaps/alphas/kospi_swing_rebalance.py": "every_15_minutes",
+        "sleeves/LEaps/alphas/kospi_conviction.py": "every_5_minutes",
+        "sleeves/LEaps/alphas/kospi_pullback_reversion.py": "every_5_minutes",
+        "sleeves/LEaps/alphas/kospi_swing_rebalance.py": "every_5_minutes",
         "sleeves/LEaps/alphas/krx_etf_safety.py": "every_5_minutes",
-        "sleeves/LEaps/alphas/volatility_trailing_stop.py": "every_cycle",
+        "sleeves/LEaps/alphas/volatility_trailing_stop.py": "every_5_minutes",
     }
 
 
-def test_leaps_live_config_reviews_portfolio_slowly_and_runs_worker_fast():
+def test_leaps_live_config_uses_agent_daily_target_portfolio():
     payload = json.loads((ROOT / "configs/runtime/live_multi_sleeve.json").read_text(encoding="utf-8"))
     sleeve = next(item for item in payload["sleeves"] if item["sleeve_id"] == "LEaps")
     portfolio = sleeve["portfolio"]
+    startup_script = (ROOT / "tools/leaps_start_live_stack.ps1").read_text(encoding="utf-8")
 
-    assert portfolio["rebalance"]["cadence"] == "every_30_minutes"
-    assert portfolio["parameters"]["entry_top_n"] == 10
-    assert portfolio["parameters"]["hold_top_n"] == 75
-    assert portfolio["parameters"]["trim_top_n"] == 110
-    assert portfolio["parameters"]["max_positions"] == 6
-    assert portfolio["parameters"]["min_holding_days"] == 10
-    assert portfolio["parameters"]["target_drift_threshold_pct"] == 0.08
-    assert portfolio["parameters"]["reentry_cooldown_days"] == 3
-    assert portfolio["parameters"]["score_normalization_enabled"] is True
-    assert portfolio["parameters"]["regime_alpha_weighting_enabled"] is True
-    assert portfolio["parameters"]["missing_target_exit_confirmation_cycles"] == 8
-    assert portfolio["parameters"]["hard_exit_cooldown_days"] == 7
-    assert portfolio["parameters"]["reduce_half_cooldown_days"] == 3
-    assert portfolio["parameters"]["add_requires_entry_band"] is True
-    assert portfolio["parameters"]["add_requires_unrealized_profit"] is True
-    assert portfolio["parameters"]["max_target_turnover_pct"] == 0.02
-    assert portfolio["parameters"]["daily_turnover_budget_pct"] == 0.035
-    assert sleeve["worker"]["cycle_interval_seconds"] == 10
+    assert sleeve["universe"]["active"]["cadence"] == "daily_at 08:45 Asia/Seoul"
+    assert sleeve["universe"]["active"]["selection_models"] == [
+        "selections/agent_daily_target.py:AgentDailyTargetSelectionModel",
+        "selections/krx_etf_safety.py:KrxEtfSafetySelectionModel",
+        "selections/operational_symbols.py:OperationalSymbolsSelectionModel",
+    ]
+    assert sleeve["alpha"]["modules"] == []
+    assert sleeve["alpha"]["input_selections"] == {}
+    assert portfolio["model"] == "portfolios/agent_daily_target.py"
+    assert portfolio["rebalance"]["cadence"] == "daily_at 08:50 Asia/Seoul"
+    assert portfolio["rebalance"]["min_order_notional"] == 50_000
+    assert portfolio["rebalance"]["whole_share_entry_floor_min_fraction"] == 0.75
+    assert portfolio["rebalance"]["reused_target_churn_lot_fraction"] == 0.25
+    assert portfolio["parameters"]["model_id"] == "leaps-agent-daily-target-portfolio"
+    assert portfolio["parameters"]["target_path"] == "data/operator-targets/LEaps/latest_target.json"
+    assert portfolio["parameters"]["max_gross_exposure"] == 0.98
+    assert portfolio["parameters"]["max_position_pct"] == 0.24
+    assert portfolio["parameters"]["max_target_age_hours"] == 36.0
+    assert portfolio["parameters"]["require_sleeve_id"] is True
+    assert portfolio["parameters"]["scale_to_max_gross"] is True
+    assert portfolio["parameters"]["emit_zero_for_missing_held_targets"] is True
+    risk_params = sleeve["risk"]["parameters"]
+    assert risk_params["regime_total_exposure_pct_by_currency"]["KRW"]["neutral"] == 0.98
+    assert risk_params["intraday_entry_freeze_cap_pct_by_currency"]["KRW"] == 0.55
+    assert risk_params["intraday_risk_off_cap_pct_by_currency"]["KRW"] == 0.35
+    assert risk_params["intraday_guard_high_entry_freeze_return_pct"] == -0.015
+    assert risk_params["intraday_guard_high_risk_off_return_pct"] == -0.02
+    assert risk_params["intraday_guard_recovery_cap_pct_by_currency"]["KRW"] == 0.55
+    assert risk_params["symbol_entry_block_intraday_return_pct"] == -0.12
+    assert risk_params["symbol_entry_block_high_drawdown_pct"] == -0.10
+    assert risk_params["symbol_entry_block_unrealized_loss_pct"] == -0.08
+    assert risk_params["symbol_entry_block_sma10_buffer_pct"] == -0.07
+    assert risk_params["symbol_entry_block_sma20_buffer_pct"] == -0.03
+    assert risk_params["symbol_reduce_half_unrealized_loss_pct"] == -0.07
+    assert risk_params["symbol_exit_unrealized_loss_pct"] == -0.1
+    assert risk_params["symbol_reduce_half_high_drawdown_pct"] == -0.16
+    assert risk_params["symbol_exit_high_drawdown_pct"] == -0.22
+    assert risk_params["symbol_reduce_half_sma10_buffer_pct"] == -0.2
+    assert risk_params["symbol_exit_sma20_buffer_pct"] == -0.2
+    assert risk_params["symbol_guard_max_volatility_multiplier"] == 1.25
+    assert risk_params["symbol_pullback_add_enabled"] is True
+    assert risk_params["symbol_pullback_add_fraction"] == 0.35
+    assert risk_params["symbol_pullback_add_min_intraday_return_pct"] == -0.12
+    assert risk_params["symbol_pullback_add_min_unrealized_pnl_pct"] == -0.06
+    assert risk_params["symbol_pullback_add_min_alpha_count"] == 0
+    execution_params = sleeve["execution"]["parameters"]
+    assert execution_params["dynamic_slice_notional_enabled"] is True
+    assert execution_params["dynamic_slice_equity_pct"] == 0.2
+    assert execution_params["dynamic_slice_min_notional"] == 1_000_000
+    assert execution_params["dynamic_slice_max_notional"] == 5_000_000
+    assert execution_params["dynamic_slice_liquidity_bps"] == 8.0
+    assert execution_params["model_version"] == "4.4.1"
+    assert execution_params["auction_volume_participation_enabled"] is False
+    assert execution_params["volume_participation_use_liquidity_notional"] is True
+    assert execution_params["volume_participation_min_notional"] == 2_000_000
+    assert execution_params["reused_target_suppress_buy_add"] is False
+    assert execution_params["reused_target_sell_no_trade_max_quantity_delta"] == 2
+    assert execution_params["reused_target_sell_no_trade_max_notional"] == 300_000
+    assert execution_params["reused_target_sell_no_trade_pct_of_target"] == 0.05
+    assert execution_params["anti_oscillation_enabled"] is True
+    assert execution_params["notional_rebalance_band_enabled"] is True
+    assert execution_params["rebalance_no_trade_min_notional"] == 100_000
+    assert execution_params["rebalance_no_trade_pct_of_target"] == 0.08
+    assert execution_params["opposite_rebalance_cooldown_minutes"] == 15
+    assert execution_params["opposite_rebalance_no_trade_max_quantity_delta"] == 2
+    assert execution_params["opposite_rebalance_no_trade_max_notional"] == 300_000
+    assert execution_params["opposite_rebalance_no_trade_pct_of_position"] == 0.05
+    assert execution_params["risk_reentry_cooldown_minutes"] == 60
+    assert sleeve["worker"]["cycle_interval_seconds"] == 300
+    assert '"-IntervalSeconds", "10"' in startup_script
 
 
 def test_leaps_growth_alphas_pass_through_temporal_feature_windows():
@@ -168,6 +223,78 @@ def test_leaps_growth_alphas_pass_through_temporal_feature_windows():
         assert up_insights[0].metadata["rl_temporal_features"] == temporal_rows
 
 
+def test_growth_alphas_prefer_live_close_for_intraday_price_marks():
+    now = datetime(2026, 5, 21, 10, 15)
+    symbol_key = "KRX:080220"
+
+    conviction_values = _values(
+        close=94_000,
+        fast=99_000,
+        slow=96_000,
+        momentum=0.12,
+        momentum_5=0.035,
+        vol=0.04,
+        rolling_high=101_000,
+    )
+    conviction_values["live_close"] = 100_000
+    conviction = _load("sleeves/LEaps/alphas/kospi_conviction.py")
+    conviction_insights = conviction.generate(
+        SnapshotContext.from_indicator_snapshot(_snapshot(now, {symbol_key: conviction_values})).with_input_symbols(
+            (symbol_key,)
+        )
+    )
+
+    assert [insight.symbol.key for insight in conviction_insights] == [symbol_key]
+    assert conviction_insights[0].metadata["close"] == 100_000
+
+    pullback_values = _values(
+        close=94_000,
+        fast=99_000,
+        slow=94_000,
+        momentum=0.14,
+        momentum_5=0.035,
+        vol=0.04,
+        rolling_high=103_000,
+        rolling_low=93_000,
+    )
+    pullback_values["live_close"] = 100_000
+    pullback = _load("sleeves/LEaps/alphas/kospi_pullback_reversion.py")
+    pullback_insights = pullback.generate(
+        SnapshotContext.from_indicator_snapshot(_snapshot(now, {symbol_key: pullback_values})).with_input_symbols(
+            (symbol_key,)
+        )
+    )
+
+    assert [insight.symbol.key for insight in pullback_insights] == [symbol_key]
+    assert pullback_insights[0].metadata["close"] == 100_000
+
+
+def test_kospi_swing_rebalance_alpha_treats_live_breakouts_as_continuation_buys():
+    module = _load("sleeves/LEaps/alphas/kospi_swing_rebalance.py")
+    now = datetime(2026, 5, 21, 10, 15)
+    values = _values(
+        close=94_000,
+        fast=101_000,
+        slow=90_000,
+        momentum=0.22,
+        momentum_5=0.12,
+        vol=0.05,
+        rolling_high=103_000,
+    )
+    values["sma_10_close"] = 100_000
+    values["live_close"] = 104_000
+    snapshot = _snapshot(now, {"KRX:080220": values})
+
+    insights = module.generate(SnapshotContext.from_indicator_snapshot(snapshot).with_input_symbols(("KRX:080220",)))
+
+    assert [insight.symbol.key for insight in insights] == ["KRX:080220"]
+    assert insights[0].direction is InsightDirection.UP
+    assert insights[0].reason == "kospi_swing_buy_breakout_continuation"
+    assert insights[0].metadata["portfolio_action"] == "buy_breakout"
+    assert insights[0].metadata["close"] == 104_000
+    assert insights[0].metadata["pullback_from_high"] == 0.0
+
+
 def test_volatility_trailing_stop_uses_model_state_high_watermark():
     module = _load("sleeves/LEaps/alphas/volatility_trailing_stop.py")
     now = datetime(2026, 5, 8)
@@ -216,6 +343,49 @@ def test_volatility_trailing_stop_uses_model_state_high_watermark():
     assert patches[0].key.model_id == "leaps-volatility-trailing-stop"
     assert patches[0].key.namespace == "trailing_stop"
     assert patches[0].value["high_watermark_price"] == 120_000
+    assert patches[0].value["last_price"] == 100_000
+
+
+def test_volatility_trailing_stop_uses_live_close_for_intraday_stop_checks():
+    module = _load("sleeves/LEaps/alphas/volatility_trailing_stop.py")
+    now = datetime(2026, 5, 21, 10, 20)
+    symbol_key = "KRX:005930"
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-volatility-trailing-stop",
+                    namespace="trailing_stop",
+                    symbol_key=symbol_key,
+                ),
+                value={"high_watermark_price": 120_000},
+                reason="seed_high_watermark",
+            ),
+        )
+    )
+    values = _values(
+        close=112_000,
+        fast=113_000,
+        slow=100_000,
+        momentum=0.12,
+        momentum_5=0.02,
+        vol=0.05,
+        rolling_high=118_000,
+    )
+    values["live_close"] = 100_000
+    snapshot = _snapshot(now, {symbol_key: values})
+    context = SnapshotContext.from_indicator_snapshot(
+        snapshot,
+        model_state=state_view,
+    ).with_input_symbols((symbol_key,))
+
+    insights = module.generate(context)
+    patches = module.state_patches(context=context, insights=tuple(insights))
+
+    assert [insight.symbol.key for insight in insights] == [symbol_key]
+    assert insights[0].metadata["close"] == 100_000
     assert patches[0].value["last_price"] == 100_000
 
 
@@ -1283,8 +1453,8 @@ def test_kospi_conviction_alpha_filters_uncompensated_high_volatility():
     snapshot = _snapshot(
         now,
         {
-            "KRX:005930": _values(close=100_000, fast=110_000, slow=90_000, momentum=0.25, momentum_5=0.05, vol=0.19),
-            "KRX:000660": _values(close=150_000, fast=160_000, slow=120_000, momentum=0.62, momentum_5=0.15, vol=0.19),
+            "KRX:005930": _values(close=100_000, fast=110_000, slow=90_000, momentum=0.25, momentum_5=0.05, vol=0.26),
+            "KRX:000660": _values(close=150_000, fast=160_000, slow=120_000, momentum=0.62, momentum_5=0.15, vol=0.26),
         },
     )
 
@@ -1378,7 +1548,7 @@ def test_kospi_pullback_reversion_alpha_requires_stabilization_in_volatility():
                 slow=88_000,
                 momentum=0.18,
                 momentum_5=-0.025,
-                vol=0.14,
+                    vol=0.18,
                 rolling_high=106_000,
                 rolling_low=94_000,
             ),
@@ -1388,7 +1558,7 @@ def test_kospi_pullback_reversion_alpha_requires_stabilization_in_volatility():
                 slow=90_000,
                 momentum=0.20,
                 momentum_5=0.035,
-                vol=0.14,
+                    vol=0.18,
                 rolling_high=102_000,
                 rolling_low=93_000,
             ),
@@ -1461,8 +1631,8 @@ def test_kospi_swing_rebalance_alpha_partially_trims_volatility_shocks():
         slow=90_000,
         momentum=0.11,
         momentum_5=-0.02,
-        vol=0.14,
-        rolling_high=111_000,
+        vol=0.22,
+        rolling_high=120_000,
     )
     values["sma_10_close"] = 99_000
     snapshot = _snapshot(now, {"KRX:005930": values})
@@ -2487,6 +2657,60 @@ def test_kospi_growth_risk_symbol_guard_blocks_adding_to_losing_holding():
     assert decision.metadata["unrealized_pnl_pct"] == pytest.approx(-0.02)
 
 
+def test_kospi_growth_risk_symbol_guard_blocks_add_on_sma_break_without_selling():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 32)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 101_000, 99_400, 99_400, 1000)},
+    )
+    portfolio = Portfolio(
+        cash=1_000_000,
+        cash_by_currency={"KRW": 1_000_000},
+        holdings={stock.key: Holding(stock, quantity=10, average_price=98_000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_entry_block_sma10_buffer_pct": -0.005,
+            "symbol_entry_block_sma20_buffer_pct": -0.005,
+            "symbol_reduce_half_sma10_buffer_pct": -0.20,
+            "symbol_exit_sma20_buffer_pct": -0.20,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=portfolio,
+            targets=(PortfolioTarget(stock, 15),),
+            active_insights=(
+                Insight(
+                    sleeve_id="LEaps",
+                    symbol=stock,
+                    direction=InsightDirection.UP,
+                    generated_at=now,
+                    source_snapshot_id="test",
+                    alpha_id="leaps-kospi-swing-rebalance",
+                    alpha_version="0.1.0",
+                    metadata={"sma10": 100_000.0, "sma20": 98_000.0, "market_breadth": 0.7, "momentum": 0.2},
+                ),
+            ),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_entry_block"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 10
+    assert decision.metadata["trigger"] == "sma10_add_block"
+
+
 def test_kospi_growth_risk_symbol_guard_reduces_half_on_deeper_loss():
     module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
     now = datetime(2026, 5, 19, 10, 35)
@@ -2666,6 +2890,142 @@ def test_kospi_growth_risk_symbol_guard_caps_high_volatility_entry_looseness():
     assert decision.metadata["thresholds"]["entry_block_intraday_return_pct"] == pytest.approx(-0.03125)
 
 
+def test_kospi_growth_risk_symbol_guard_allows_partial_add_on_strong_pullback():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 22, 11, 13)
+    stock = Symbol("036930", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 185_300, 215_000, 185_200, 197_700, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_entry_block_high_drawdown_pct": -0.055,
+            "symbol_reduce_half_high_drawdown_pct": -0.09,
+            "symbol_exit_high_drawdown_pct": -0.12,
+            "symbol_guard_volatility_adjusted_enabled": True,
+            "symbol_guard_reference_volatility_pct": 0.04,
+            "symbol_guard_max_volatility_multiplier": 1.25,
+            "symbol_guard_entry_max_volatility_multiplier": 1.25,
+            "symbol_pullback_add_enabled": True,
+            "symbol_pullback_add_fraction": 0.5,
+            "symbol_pullback_add_min_alpha_count": 2,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=10_000_000,
+                cash_by_currency={"KRW": 10_000_000},
+                holdings={stock.key: Holding(stock, quantity=1, average_price=190_800)},
+            ),
+            targets=(PortfolioTarget(stock, 14),),
+            active_insights=(
+                Insight(
+                    sleeve_id="LEaps",
+                    symbol=stock,
+                    direction=InsightDirection.UP,
+                    generated_at=now,
+                    source_snapshot_id="test",
+                    alpha_id="leaps-kospi-conviction",
+                    alpha_version="0.1.0",
+                    metadata={
+                        "sma10": 165_260.0,
+                        "sma20": 145_540.0,
+                        "volatility": 0.12588149763722284,
+                    },
+                ),
+                Insight(
+                    sleeve_id="LEaps",
+                    symbol=stock,
+                    direction=InsightDirection.UP,
+                    generated_at=now,
+                    source_snapshot_id="test",
+                    alpha_id="leaps-kospi-pullback-reversion",
+                    alpha_version="0.1.0",
+                    metadata={},
+                ),
+                Insight(
+                    sleeve_id="LEaps",
+                    symbol=stock,
+                    direction=InsightDirection.UP,
+                    generated_at=now,
+                    source_snapshot_id="test",
+                    alpha_id="leaps-kospi-swing-rebalance",
+                    alpha_version="0.1.0",
+                    metadata={},
+                ),
+            ),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_pullback_add"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 8
+    assert decision.metadata["trigger"] == "session_high_drawdown"
+    assert decision.metadata["drawdown_from_session_high"] == pytest.approx(-0.08046511627906971)
+    assert decision.metadata["thresholds"]["entry_block_high_drawdown_pct"] == pytest.approx(-0.06875)
+
+
+def test_kospi_growth_risk_symbol_guard_stages_rebalance_on_agent_pullback_without_alpha_metadata():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 28, 15, 39)
+    stock = Symbol("036930", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 234_500, 235_500, 201_000, 208_000, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_entry_block_intraday_return_pct": -0.12,
+            "symbol_entry_block_high_drawdown_pct": -0.10,
+            "symbol_entry_block_unrealized_loss_pct": -0.08,
+            "symbol_reduce_half_unrealized_loss_pct": -0.07,
+            "symbol_exit_unrealized_loss_pct": -0.10,
+            "symbol_reduce_half_high_drawdown_pct": -0.16,
+            "symbol_exit_high_drawdown_pct": -0.22,
+            "symbol_pullback_add_enabled": True,
+            "symbol_pullback_add_fraction": 0.35,
+            "symbol_pullback_add_min_intraday_return_pct": -0.12,
+            "symbol_pullback_add_min_unrealized_pnl_pct": -0.06,
+            "symbol_pullback_add_min_alpha_count": 0,
+        }
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=10_000_000,
+                cash_by_currency={"KRW": 10_000_000},
+                holdings={stock.key: Holding(stock, quantity=5, average_price=217_870)},
+            ),
+            targets=(PortfolioTarget(stock, 11),),
+            active_insights=(),
+        )
+    )
+
+    decision = batch.decisions[0]
+    assert decision.reason == "symbol_guard_pullback_add"
+    assert decision.approved_target is not None
+    assert decision.approved_target.quantity == 8
+    assert decision.metadata["trigger"] == "session_high_drawdown"
+    assert decision.metadata["signal_alpha_ids"] == []
+
+
 def test_kospi_growth_risk_symbol_guard_does_not_repeat_half_reduce_after_state_mark():
     module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
     now = datetime(2026, 5, 19, 10, 36)
@@ -2724,6 +3084,74 @@ def test_kospi_growth_risk_symbol_guard_does_not_repeat_half_reduce_after_state_
     assert decision.metadata["anchor_quantity"] == 10
 
 
+def test_kospi_growth_risk_symbol_guard_clear_preserves_last_risk_event():
+    module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
+    now = datetime(2026, 5, 19, 10, 38)
+    event_at = now - timedelta(minutes=20)
+    stock = Symbol("417840", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={stock.key: Bar(stock, now, 100_000, 101_000, 99_000, 100_000, 1000)},
+    )
+    model = module.create_risk_model(
+        {
+            "max_position_pct_by_currency": {"KRW": 1.0},
+            "max_total_exposure_pct_by_currency": {"KRW": 1.0},
+            "cash_buffer_pct_by_currency": {"KRW": 0.0},
+            "symbol_guard_enabled": True,
+            "symbol_guard_recovery_confirmation_cycles": 1,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="symbol_guard",
+                    symbol_key=stock.key.upper(),
+                ),
+                value={
+                    "status": "recovering",
+                    "last_risk_status": "exited",
+                    "last_risk_trigger": "sma20_break",
+                    "last_risk_event_at": event_at.isoformat(),
+                    "updated_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+                reason="seed_recovering_symbol_guard",
+            ),
+        ),
+        applied_at=now,
+    )
+
+    batch = model.manage_risk(
+        RiskManagementContext(
+            sleeve_id="LEaps",
+            data=data,
+            portfolio=Portfolio(
+                cash=1_000_000,
+                cash_by_currency={"KRW": 1_000_000},
+                holdings={stock.key: Holding(stock, quantity=10, average_price=100_000)},
+            ),
+            targets=(PortfolioTarget(stock, 10),),
+            model_state=state_view,
+        )
+    )
+    store.apply_patches(batch.state_patches, applied_at=now)
+    record = state_view.get(
+        model_id="leaps-kospi-growth-us-hedge-risk",
+        namespace="symbol_guard",
+        symbol_key=stock.key.upper(),
+    )
+
+    assert record is not None
+    assert record.value["status"] == "clear"
+    assert record.value["last_risk_status"] == "exited"
+    assert record.value["last_risk_trigger"] == "sma20_break"
+    assert record.value["last_risk_event_at"] == event_at.isoformat()
+
+
 def test_kospi_growth_risk_symbol_guard_exits_on_twenty_day_break():
     module = _load("sleeves/LEaps/risks/kospi_growth_us_hedge.py")
     now = datetime(2026, 5, 19, 10, 40)
@@ -2772,6 +3200,7 @@ def test_kospi_growth_risk_symbol_guard_exits_on_twenty_day_break():
     assert decision.reason == "symbol_guard_exit"
     assert decision.approved_target is not None
     assert decision.approved_target.quantity == 0
+    assert "risk:symbol_guard_exit" in decision.approved_target.tag
     assert decision.metadata["trigger"] == "sma20_break"
 
 
@@ -3006,6 +3435,1123 @@ def test_leaps_execution_tags_orders_by_currency():
     assert orders[0].metadata["execution_style"] == "leaps_momentum"
 
 
+def test_leaps_execution_subtracts_open_buy_from_unordered_quantity():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    portfolio = Portfolio(
+        cash=3_000_000,
+        holdings={symbol.key: Holding(symbol, quantity=70, average_price=90_000)},
+    )
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _order_ticket(
+                symbol,
+                side=OrderSide.BUY,
+                quantity=30,
+                sleeve_id="LEaps",
+                created_at=now,
+            ),
+        ),
+        sleeve_id="LEaps",
+        as_of=now,
+    )
+    model = module.create_execution_model(
+        {"max_slice_notional": 10_000_000, "max_daily_volume_participation_bps": 10_000}
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        [PortfolioTarget(symbol, 100, tag="entry")],
+        execution_context=ExecutionContext(
+            sleeve_id="LEaps",
+            generated_at=now,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+            pending_orders=pending,
+            target_batch_id="order-sizing-1",
+            source_target_batch_id="portfolio-target-1",
+        ),
+    )
+
+    assert orders == []
+
+
+def test_leaps_execution_orders_only_open_buy_remaining_quantity():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    portfolio = Portfolio(
+        cash=3_000_000,
+        holdings={symbol.key: Holding(symbol, quantity=70, average_price=90_000)},
+    )
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _order_ticket(
+                symbol,
+                side=OrderSide.BUY,
+                quantity=10,
+                sleeve_id="LEaps",
+                created_at=now,
+            ),
+        ),
+        sleeve_id="LEaps",
+        as_of=now,
+    )
+    model = module.create_execution_model(
+        {"max_slice_notional": 10_000_000, "max_daily_volume_participation_bps": 10_000}
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        [PortfolioTarget(symbol, 100, tag="entry")],
+        execution_context=ExecutionContext(
+            sleeve_id="LEaps",
+            generated_at=now,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+            pending_orders=pending,
+            target_batch_id="order-sizing-1",
+            source_target_batch_id="portfolio-target-1",
+        ),
+    )
+
+    assert [order.quantity for order in orders] == [20]
+    assert orders[0].metadata["raw_delta_quantity"] == 30
+    assert orders[0].metadata["unordered_delta_quantity"] == 20
+    assert orders[0].metadata["pending_buy_quantity"] == 10
+    assert orders[0].metadata["projected_quantity"] == 80
+    assert orders[0].metadata["target_batch_id"] == "order-sizing-1"
+    assert orders[0].metadata["source_target_batch_id"] == "portfolio-target-1"
+
+
+def test_leaps_execution_hard_exit_can_bypass_pending_sell_suppression():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=100, average_price=90_000)})
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _order_ticket(
+                symbol,
+                side=OrderSide.SELL,
+                quantity=100,
+                sleeve_id="LEaps",
+                created_at=now,
+            ),
+        ),
+        sleeve_id="LEaps",
+        as_of=now,
+    )
+    model = module.create_execution_model(
+        {"max_slice_notional": 10_000_000, "max_daily_volume_participation_bps": 10_000}
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        [PortfolioTarget(symbol, 0, tag="hard_exit:trailing_stop")],
+        execution_context=ExecutionContext(
+            sleeve_id="LEaps",
+            generated_at=now,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 0, tag="hard_exit:trailing_stop"),),
+            pending_orders=pending,
+        ),
+    )
+
+    assert [order.quantity for order in orders] == [100]
+    assert orders[0].side is OrderSide.SELL
+    assert orders[0].metadata["unordered_quantity_bypassed"] is True
+    assert orders[0].metadata["pending_sell_quantity"] == 100
+
+
+def test_leaps_execution_v41_suppresses_reused_target_adds_after_target_seen():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "reused_target_suppress_buy_add": True,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    first_portfolio = Portfolio(
+        cash=3_000_000,
+        holdings={symbol.key: Holding(symbol, quantity=70, average_price=90_000)},
+    )
+    first_context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=first_portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-1",
+        source_target_batch_id="portfolio-target-1",
+    )
+
+    first_orders = tuple(
+        model.create_orders(
+            "LEaps",
+            first_portfolio,
+            data,
+            list(first_context.approved_targets),
+            execution_context=first_context,
+        )
+    )
+    store.apply_patches(model.state_patches(context=first_context, orders=first_orders), applied_at=now)
+    second_portfolio = Portfolio(
+        cash=3_000_000,
+        holdings={symbol.key: Holding(symbol, quantity=100, average_price=90_000)},
+    )
+    second_context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now + timedelta(minutes=1),
+        portfolio=second_portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 105, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-2",
+        source_target_batch_id="portfolio-target-1",
+    )
+
+    second_orders = model.create_orders(
+        "LEaps",
+        second_portfolio,
+        data,
+        list(second_context.approved_targets),
+        execution_context=second_context,
+    )
+
+    assert [order.quantity for order in first_orders] == [30]
+    assert second_orders == []
+
+
+def test_leaps_execution_v41_allows_adds_on_fresh_target_batch():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "reused_target_suppress_buy_add": True,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={"source_target_batch_id": "portfolio-target-old", "target_quantity": 100},
+                reason="seed_prior_target",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(
+        cash=3_000_000,
+        holdings={symbol.key: Holding(symbol, quantity=100, average_price=90_000)},
+    )
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 105, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-1",
+        source_target_batch_id="portfolio-target-new",
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        list(context.approved_targets),
+        execution_context=context,
+    )
+
+    assert [order.quantity for order in orders] == [5]
+    assert orders[0].metadata["reused_source_target_seen"] is False
+
+
+def test_leaps_execution_v41_suppresses_small_reused_target_sells():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "reused_target_suppress_buy_add": True,
+            "reused_target_sell_no_trade_max_quantity_delta": 2,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={"source_target_batch_id": "portfolio-target-1", "target_quantity": 100},
+                reason="seed_prior_target",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=100, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 99, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-1",
+        source_target_batch_id="portfolio-target-1",
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        list(context.approved_targets),
+        execution_context=context,
+    )
+
+    assert orders == []
+
+
+def test_leaps_execution_v41_allows_large_reused_target_sells():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "reused_target_suppress_buy_add": True,
+            "reused_target_sell_no_trade_max_quantity_delta": 2,
+            "reused_target_sell_no_trade_max_notional": 300_000,
+            "reused_target_sell_no_trade_pct_of_target": 0.05,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={"source_target_batch_id": "portfolio-target-1", "target_quantity": 100},
+                reason="seed_prior_target",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=100, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 50, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-1",
+        source_target_batch_id="portfolio-target-1",
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        portfolio,
+        data,
+        list(context.approved_targets),
+        execution_context=context,
+    )
+
+    assert [order.quantity for order in orders] == [50]
+    assert orders[0].side is OrderSide.SELL
+    assert orders[0].metadata["reused_source_target_seen"] is True
+
+
+def test_leaps_execution_v42_suppresses_small_buyback_after_recent_sell():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "opposite_rebalance_cooldown_minutes": 60,
+            "opposite_rebalance_no_trade_max_quantity_delta": 2,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-old",
+                    "target_quantity": 26,
+                    "last_order_side": "sell",
+                    "last_ordered_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+                reason="seed_recent_buy",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=1_000_000, holdings={symbol.key: Holding(symbol, quantity=26, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 27, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "opposite_rebalance_cooldown"
+
+
+def test_leaps_execution_v42_allows_same_direction_rebalance_adds():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "opposite_rebalance_cooldown_minutes": 60,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-old",
+                    "target_quantity": 27,
+                    "last_order_side": "buy",
+                    "last_ordered_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+                reason="seed_recent_buy",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=1_000_000, holdings={symbol.key: Holding(symbol, quantity=27, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 31, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+
+    assert [order.quantity for order in orders] == [4]
+    assert orders[0].side is OrderSide.BUY
+
+
+def test_leaps_execution_v42_allows_large_buyback_after_recent_sell():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "opposite_rebalance_cooldown_minutes": 60,
+            "opposite_rebalance_no_trade_max_quantity_delta": 2,
+            "opposite_rebalance_no_trade_max_notional": 300_000,
+            "opposite_rebalance_no_trade_pct_of_position": 0.05,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-old",
+                    "target_quantity": 50,
+                    "last_order_side": "sell",
+                    "last_ordered_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+                reason="seed_recent_buy",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=10_000_000, holdings={symbol.key: Holding(symbol, quantity=50, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+
+    assert [order.quantity for order in orders] == [50]
+    assert orders[0].side is OrderSide.BUY
+
+
+def test_leaps_execution_can_block_any_opposite_rebalance_during_cooldown():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "opposite_rebalance_cooldown_minutes": 60,
+            "opposite_rebalance_require_small_change": False,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-old",
+                    "target_quantity": 50,
+                    "last_order_side": "sell",
+                    "last_ordered_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+                reason="seed_recent_sell",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=10_000_000, holdings={symbol.key: Holding(symbol, quantity=50, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+
+    assert orders == []
+
+
+def test_leaps_execution_v42_blocks_buyback_after_symbol_guard_reduction():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "risk_reentry_cooldown_minutes": 60,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="symbol_guard",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "status": "reduced",
+                    "anchor_quantity": 100,
+                    "last_approved_quantity": 50,
+                    "updated_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+                reason="seed_recent_risk_reduction",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=5_000_000, holdings={symbol.key: Holding(symbol, quantity=50, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "risk_guard_reentry_cooldown"
+
+
+def test_leaps_execution_blocks_buyback_during_symbol_guard_recovery():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "risk_reentry_cooldown_minutes": 60,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="symbol_guard",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "status": "recovering",
+                    "anchor_quantity": None,
+                    "last_approved_quantity": 100,
+                    "recovery_confirmation_count": 2,
+                    "updated_at": (now - timedelta(minutes=5)).isoformat(),
+                },
+                reason="seed_symbol_guard_recovery",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=5_000_000, holdings={symbol.key: Holding(symbol, quantity=50, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+
+    assert orders == []
+
+
+def test_leaps_execution_blocks_buyback_after_symbol_guard_clears_with_recent_event():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "risk_reentry_cooldown_minutes": 60,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-kospi-growth-us-hedge-risk",
+                    namespace="symbol_guard",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "status": "clear",
+                    "last_approved_quantity": 50,
+                    "last_risk_status": "exited",
+                    "last_risk_trigger": "sma20_break",
+                    "last_risk_event_at": (now - timedelta(minutes=20)).isoformat(),
+                    "updated_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+                reason="seed_recent_cleared_symbol_guard_event",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=5_000_000, holdings={symbol.key: Holding(symbol, quantity=50, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 100, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "risk_guard_reentry_cooldown"
+
+
+def test_leaps_execution_prefers_sell_when_same_cycle_targets_conflict():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    portfolio = Portfolio(cash=5_000_000, holdings={symbol.key: Holding(symbol, quantity=10, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(
+            PortfolioTarget(symbol, 5, tag="risk:symbol_guard_reduce_half"),
+            PortfolioTarget(symbol, 15, tag="entry"),
+        ),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert [(order.side, order.quantity) for order in orders] == [(OrderSide.SELL, 5)]
+    assert state is not None
+    assert state.value["suppression_reason"] == "same_cycle_opposite_target_conflict"
+
+
+def test_leaps_execution_blocks_buyback_after_recent_risk_reduction_target_state():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "risk_reentry_cooldown_minutes": 60,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-old",
+                    "target_quantity": 5,
+                    "last_order_side": "sell",
+                    "last_ordered_at": (now - timedelta(minutes=20)).isoformat(),
+                    "last_reduction_at": (now - timedelta(minutes=20)).isoformat(),
+                    "last_reduction_reason": "currency_policy_reduce",
+                },
+                reason="seed_recent_risk_reduction_target_state",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=5_000_000, holdings={symbol.key: Holding(symbol, quantity=5, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 10, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "risk_guard_reentry_cooldown"
+
+
+def test_leaps_execution_blocks_opposite_order_under_same_source_target():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 11, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "same_source_opposite_rebalance_guard": True,
+            "opposite_rebalance_cooldown_minutes": 0,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-20260508",
+                    "target_quantity": 10,
+                    "last_order_side": "sell",
+                    "last_ordered_at": (now - timedelta(hours=2)).isoformat(),
+                    "last_order_source_target_batch_id": "portfolio-target-20260508",
+                },
+                reason="seed_same_source_recent_sell",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=5_000_000, holdings={symbol.key: Holding(symbol, quantity=10, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 15, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-reused",
+        source_target_batch_id="portfolio-target-20260508",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "same_source_opposite_rebalance"
+
+
+def test_leaps_execution_v43_suppresses_small_notional_rebalance_drift():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "notional_rebalance_band_enabled": True,
+            "rebalance_no_trade_min_notional": 500_000,
+            "rebalance_no_trade_pct_of_target": 0.08,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    portfolio = Portfolio(cash=1_000_000, holdings={symbol.key: Holding(symbol, quantity=30, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 34, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "rebalance_notional_no_trade_band"
+    assert state.value["suppressed_notional"] == 400_000
+    assert state.value["suppressed_threshold_notional"] == 500_000
+
+
+def test_leaps_execution_v43_allows_large_notional_rebalance_drift():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "notional_rebalance_band_enabled": True,
+            "rebalance_no_trade_min_notional": 500_000,
+            "rebalance_no_trade_pct_of_target": 0.08,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    portfolio = Portfolio(cash=1_000_000, holdings={symbol.key: Holding(symbol, quantity=30, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 37, tag="entry"),),
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+
+    assert [order.quantity for order in orders] == [7]
+    assert orders[0].side is OrderSide.BUY
+
+
+def test_leaps_execution_v43_does_not_block_new_entry_or_risk_exit_with_notional_band():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "notional_rebalance_band_enabled": True,
+            "rebalance_no_trade_min_notional": 500_000,
+            "rebalance_no_trade_pct_of_target": 0.08,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    entry_portfolio = Portfolio(cash=1_000_000)
+    entry_context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=entry_portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 4, tag="entry"),),
+        target_batch_id="order-sizing-entry",
+        source_target_batch_id="portfolio-target-entry",
+    )
+    exit_portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=4, average_price=100_000)})
+    exit_context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=exit_portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 0, tag="risk:symbol_guard_exit"),),
+        target_batch_id="order-sizing-exit",
+        source_target_batch_id="portfolio-target-exit",
+    )
+
+    entry_orders = model.create_orders(
+        "LEaps",
+        entry_portfolio,
+        data,
+        list(entry_context.approved_targets),
+        execution_context=entry_context,
+    )
+    exit_orders = model.create_orders(
+        "LEaps",
+        exit_portfolio,
+        data,
+        list(exit_context.approved_targets),
+        execution_context=exit_context,
+    )
+
+    assert [order.quantity for order in entry_orders] == [4]
+    assert entry_orders[0].side is OrderSide.BUY
+    assert [order.quantity for order in exit_orders] == [4]
+    assert exit_orders[0].side is OrderSide.SELL
+
+
+def test_leaps_execution_v43_suppresses_small_sell_after_recent_buy():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8, 10, 0)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 100_000, 100_000, 100_000, 100_000, 1000)})
+    model = module.create_execution_model(
+        {
+            "anti_oscillation_enabled": True,
+            "opposite_rebalance_cooldown_minutes": 60,
+            "opposite_rebalance_no_trade_max_notional": 500_000,
+            "opposite_rebalance_no_trade_pct_of_position": 0.08,
+            "max_slice_notional": 10_000_000,
+            "max_daily_volume_participation_bps": 10_000,
+        }
+    )
+    store = InMemoryRuntimeStateStore()
+    state_view = RuntimeModelStateView(store, default_sleeve_id="LEaps")
+    store.apply_patches(
+        (
+            StatePatch(
+                key=state_view.key(
+                    model_id="leaps-v4.3-notional-band-execution",
+                    namespace="target_fulfillment",
+                    symbol_key=symbol.key.upper(),
+                ),
+                value={
+                    "source_target_batch_id": "portfolio-target-old",
+                    "target_quantity": 30,
+                    "last_order_side": "buy",
+                    "last_ordered_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+                reason="seed_recent_buy",
+            ),
+        ),
+        applied_at=now,
+    )
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=30, average_price=90_000)})
+    context = ExecutionContext(
+        sleeve_id="LEaps",
+        generated_at=now,
+        portfolio=portfolio,
+        data=data,
+        approved_targets=(PortfolioTarget(symbol, 27, tag="entry"),),
+        model_state=state_view,
+        target_batch_id="order-sizing-fresh",
+        source_target_batch_id="portfolio-target-fresh",
+    )
+
+    orders = model.create_orders("LEaps", portfolio, data, list(context.approved_targets), execution_context=context)
+    store.apply_patches(model.state_patches(context=context, orders=tuple(orders)), applied_at=now)
+    state = state_view.get(
+        model_id="leaps-v4.3-notional-band-execution",
+        namespace="target_fulfillment",
+        symbol_key=symbol.key.upper(),
+    )
+
+    assert orders == []
+    assert state is not None
+    assert state.value["suppression_reason"] == "opposite_rebalance_cooldown"
+
+
 def test_leaps_execution_slices_and_prices_momentum_entries():
     module = _load("sleeves/LEaps/executions/leaps_immediate.py")
     now = datetime(2026, 5, 8)
@@ -3026,6 +4572,120 @@ def test_leaps_execution_slices_and_prices_momentum_entries():
     assert all(round(order.limit_price or 0, 6) == 100_100 for order in orders)
     assert orders[0].metadata["slice_count"] == 3
     assert orders[0].metadata["deferred_quantity"] == 1
+
+
+def test_leaps_execution_uses_dynamic_slice_notional_from_equity_and_liquidity():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 8)
+    symbol = Symbol("005930", "KRX")
+    data = DataSlice(
+        time=now,
+        bars={
+            symbol.key: Bar(
+                symbol,
+                now,
+                100_000,
+                100_000,
+                100_000,
+                100_000,
+                1_000_000,
+                metadata={"rolling_dollar_volume_20": 2_000_000_000},
+            )
+        },
+    )
+    model = module.create_execution_model(
+        {
+            "dynamic_slice_notional_enabled": True,
+            "dynamic_slice_equity_pct": 0.20,
+            "dynamic_slice_min_notional": 500_000,
+            "dynamic_slice_max_notional": 5_000_000,
+            "dynamic_slice_liquidity_bps": 8.0,
+            "max_slice_notional": 2_000_000,
+            "max_slices": 3,
+        }
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        Portfolio(cash=30_000_000, cash_by_currency={"KRW": 30_000_000}),
+        data,
+        [PortfolioTarget(symbol, 40, tag="entry")],
+    )
+
+    assert [order.quantity for order in orders] == [16, 16, 8]
+    assert orders[0].metadata["slice_notional_policy"] == "dynamic"
+    assert orders[0].metadata["slice_notional_source"] == "equity_pct"
+    assert orders[0].metadata["slice_liquidity_source"] == "rolling_dollar_volume_20"
+    assert orders[0].metadata["slice_liquidity_cap"] == 1_600_000
+
+
+def test_leaps_execution_v44_skips_tiny_snapshot_volume_cap_in_regular_auction():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 22, 8, 52)
+    symbol = Symbol("440110", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 118_050, 118_050, 118_050, 118_050, 4)})
+    model = module.create_execution_model(
+        {
+            "auction_volume_participation_enabled": False,
+            "regular_auction_buy_multiplier": 0.65,
+            "max_daily_volume_participation_bps": 50,
+            "max_slice_notional": 10_000_000,
+            "max_slices": 3,
+        }
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        Portfolio(cash=5_000_000),
+        data,
+        [PortfolioTarget(symbol, 10, tag="entry")],
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="regular_open_auction",
+            is_orderable=True,
+            is_regular_market_open=True,
+            source="test",
+        ),
+    )
+
+    assert [order.quantity for order in orders] == [6]
+    assert orders[0].metadata["session_policy"] == "regular_auction"
+    assert orders[0].metadata["session_quantity_clamp"] == "reduced_size"
+    assert orders[0].metadata["participation_cap"] == "skipped_auction_phase"
+
+
+def test_leaps_execution_v441_uses_min_notional_floor_for_tiny_live_volume():
+    module = _load("sleeves/LEaps/executions/leaps_immediate.py")
+    now = datetime(2026, 5, 22, 9, 2)
+    symbol = Symbol("036930", "KRX")
+    data = DataSlice(time=now, bars={symbol.key: Bar(symbol, now, 185_250, 185_250, 185_250, 185_250, 324)})
+    model = module.create_execution_model(
+        {
+            "max_daily_volume_participation_bps": 50,
+            "volume_participation_min_notional": 2_000_000,
+            "max_slice_notional": 10_000_000,
+            "max_slices": 3,
+        }
+    )
+
+    orders = model.create_orders(
+        "LEaps",
+        Portfolio(cash=5_000_000),
+        data,
+        [PortfolioTarget(symbol, 9, tag="entry")],
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="regular_continuous",
+            is_orderable=True,
+            is_regular_market_open=True,
+            source="test",
+        ),
+    )
+
+    assert [order.quantity for order in orders] == [9]
+    assert orders[0].metadata["participation_volume_source"] == "bar_volume"
+    assert orders[0].metadata["participation_cap_quantity_before_floor"] == 1
+    assert orders[0].metadata["participation_cap_floor"] == "min_notional"
 
 
 def test_leaps_execution_chase_guard_reduces_overextended_buy_size():
@@ -3159,6 +4819,31 @@ def test_leaps_execution_blocks_after_hours_single_price_by_default():
     )
 
     assert orders == []
+
+
+def _order_ticket(
+    symbol: Symbol,
+    *,
+    side: OrderSide,
+    quantity: int,
+    sleeve_id: str,
+    created_at: datetime,
+    status: OrderTicketStatus = OrderTicketStatus.SUBMITTED,
+    filled_quantity: int = 0,
+) -> OrderTicket:
+    return OrderTicket(
+        ticket_id=f"ticket-{side.value}-{symbol.ticker}",
+        order_intent_id=f"intent-{side.value}-{symbol.ticker}",
+        batch_id="batch-1",
+        sleeve_id=sleeve_id,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        reference_price=100_000,
+        status=status,
+        filled_quantity=filled_quantity,
+        created_at=created_at,
+    )
 
 
 def _snapshot(

@@ -296,32 +296,55 @@ class OrderRuntimeSupervisor:
                 expire_events=expire_events,
                 warnings=(warning,),
             )
-        try:
-            cancel_result = self.poll_worker.broker.cancel(
-                stale,
-                reason="stale_ticket_cancel",
-                occurred_at=checked_at,
-            )
-            self.order_state_store.record_events(cancel_result.events, recorded_at=checked_at)
-            for event in cancel_result.events:
+        cancel_events: list[OrderEvent] = []
+        stale_expired: list[OrderTicket] = []
+        stale_expire_events: list[OrderEvent] = []
+        warnings: list[str] = []
+        for ticket in stale:
+            try:
+                cancel_result = self.poll_worker.broker.cancel(
+                    (ticket,),
+                    reason="stale_ticket_cancel",
+                    occurred_at=checked_at,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if _is_no_cancellable_quantity_error(exc):
+                    event = ticket.event(
+                        OrderEventType.EXPIRED,
+                        occurred_at=checked_at,
+                        broker_order_id=ticket.broker_order_id,
+                        reason="stale_cancel_no_cancellable_quantity",
+                        metadata={
+                            "cancel_error": str(exc),
+                            "cancel_error_type": type(exc).__name__,
+                        },
+                    )
+                    stale_expired.append(ticket)
+                    stale_expire_events.append(event)
+                    warnings.append(f"stale_ticket_expired_after_no_cancellable_quantity:{ticket.ticket_id}")
+                    continue
+                warning = f"cancel_stale_failed:{ticket.ticket_id}: {exc}"
+                errors.append(warning)
+                warnings.append(warning)
+                continue
+            cancel_events.extend(cancel_result.events)
+        all_expire_events = (*expire_events, *tuple(stale_expire_events))
+        if cancel_events:
+            self.order_state_store.record_events(cancel_events, recorded_at=checked_at)
+            for event in cancel_events:
                 self.account_store.apply_order_event(event)
-            return OrderMaintenanceReport(
-                checked_at=checked_at,
-                stale_tickets=stale,
-                cancel_events=cancel_result.events,
-                expired_tickets=expired,
-                expire_events=expire_events,
-            )
-        except Exception as exc:  # noqa: BLE001
-            warning = f"cancel_stale_failed: {exc}"
-            errors.append(warning)
-            return OrderMaintenanceReport(
-                checked_at=checked_at,
-                stale_tickets=stale,
-                expired_tickets=expired,
-                expire_events=expire_events,
-                warnings=(warning,),
-            )
+        if stale_expire_events:
+            self.order_state_store.record_events(stale_expire_events, recorded_at=checked_at)
+            for event in stale_expire_events:
+                self.account_store.apply_order_event(event)
+        return OrderMaintenanceReport(
+            checked_at=checked_at,
+            stale_tickets=stale,
+            cancel_events=tuple(cancel_events),
+            expired_tickets=(*expired, *tuple(stale_expired)),
+            expire_events=all_expire_events,
+            warnings=tuple(warnings),
+        )
 
 
 def _is_stale_ticket(ticket: OrderTicket, checked_at: datetime, *, policy: OrderMaintenancePolicy) -> bool:
@@ -338,6 +361,20 @@ def _is_expired_day_ticket(ticket: OrderTicket, checked_at: datetime) -> bool:
     created_local = _to_market_time(ticket.created_at, market_zone)
     checked_local = _to_market_time(checked_at, market_zone)
     return checked_local.date() > created_local.date()
+
+
+def _is_no_cancellable_quantity_error(exc: Exception) -> bool:
+    text = str(exc)
+    lowered = text.lower()
+    return (
+        "apbk0927" in lowered
+        or "apbk0344" in lowered
+        or "정정취소 가능수량" in text
+        or "원주문정보가 존재하지" in text
+        or "no cancellable quantity" in lowered
+        or "cancellable quantity" in lowered
+        or "original order" in lowered and "not" in lowered and "exist" in lowered
+    )
 
 
 def _day_expiry_metadata(ticket: OrderTicket, checked_at: datetime) -> dict[str, Any]:

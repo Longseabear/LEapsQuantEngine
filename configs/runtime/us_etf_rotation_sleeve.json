@@ -98,14 +98,18 @@
         },
         "rebalance": {
           "cash_reserve_pct": 0.02,
-          "min_order_notional": 200.0,
-          "min_quantity_delta": 2,
+          "min_order_notional": 0.0,
+          "min_quantity_delta": 0,
           "allow_exit_below_min_notional": true,
           "cadence": "every_5_minutes",
+          "target_churn_guard": true,
+          "target_churn_max_quantity_delta": 1,
+          "target_churn_lot_fraction": 0.0,
+          "target_churn_equity_bps": 25.0,
           "reused_target_churn_guard": true,
           "reused_target_churn_max_quantity_delta": 1,
-          "reused_target_churn_lot_fraction": 0.5,
-          "reused_target_churn_equity_bps": 10.0
+          "reused_target_churn_lot_fraction": 0.0,
+          "reused_target_churn_equity_bps": 25.0
         },
         "target_resolution": {
           "mode": "patch"

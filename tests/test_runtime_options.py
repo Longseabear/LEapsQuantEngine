@@ -34,6 +34,7 @@ def _runtime_payload():
             {
                 "sleeve_id": "us-live",
                 "workspace_path": "sleeves/us-live",
+                "display_name": "US Live Display",
                 "cash": 100_000,
                 "universe": {
                     "coarse_path": "configs/universes/us_live_smoke.json",
@@ -91,6 +92,7 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert config.journal_path == Path("data/cycle-journal/live-us-main.jsonl")
     assert config.market_data.provider == "market-data-engine"
     assert sleeve.workspace_path == Path("sleeves/us-live")
+    assert sleeve.display_name == "US Live Display"
     assert sleeve.cash == 100_000
     assert sleeve.universe.coarse_path == Path("configs/universes/us_live_smoke.json")
     assert sleeve.universe.fine.enabled is True
@@ -102,6 +104,7 @@ def test_runtime_config_keeps_logic_as_module_references():
     assert sleeve.universe.active.selection_models == ()
     assert sleeve.alpha.modules == (ModuleReference("examples/alpha/price_above_sma_alpha.py"),)
     assert dict(sleeve.alpha.input_selections) == {}
+    assert config.to_dict()["sleeves"][0]["display_name"] == "US Live Display"
     assert sleeve.portfolio.model == ModuleReference("examples/portfolio_models/equal_weight.py")
     assert dict(sleeve.portfolio.parameters) == {"max_portfolio_pct": 0.8}
     assert sleeve.portfolio.account_store_path == Path("data/virtual-accounts/live-us-main.json")
@@ -317,13 +320,17 @@ def test_control_queue_drains_commands_in_order():
     second = queue.submit(RuntimeControlCommand.reload_sleeve("configs/runtime/live_us.json", "LEaps"))
     third = queue.submit(RuntimeControlCommand.activate_sleeve("configs/runtime/live_us.json", "ETF"))
     fourth = queue.submit(RuntimeControlCommand.deactivate_sleeve("configs/runtime/live_us.json", "ETF"))
-    fifth = queue.submit(RuntimeControlCommand.pause_worker())
+    fifth = queue.submit(RuntimeControlCommand.suspend_sleeve("configs/runtime/live_us.json", "LEaps"))
+    sixth = queue.submit(RuntimeControlCommand.resume_sleeve("configs/runtime/live_us.json", "LEaps"))
+    seventh = queue.submit(RuntimeControlCommand.pause_worker())
 
-    assert queue.drain() == (first, second, third, fourth, fifth)
+    assert queue.drain() == (first, second, third, fourth, fifth, sixth, seventh)
     assert queue.drain() == ()
     assert second.sleeve_id() == "LEaps"
     assert third.sleeve_id() == "ETF"
     assert fourth.sleeve_id() == "ETF"
+    assert fifth.sleeve_id() == "LEaps"
+    assert sixth.sleeve_id() == "LEaps"
 
 
 def test_file_control_queue_persists_and_drains_commands(tmp_path):
@@ -433,11 +440,15 @@ def test_runtime_config_controller_loads_on_activate_and_deactivate_sleeve_comma
     controller = RuntimeConfigController(snapshot=initial, queue=queue, loader=loader)
     queue.submit(RuntimeControlCommand.activate_sleeve(tmp_path / "updated.json", "us-live"))
     queue.submit(RuntimeControlCommand.deactivate_sleeve(tmp_path / "updated.json", "us-live"))
+    queue.submit(RuntimeControlCommand.suspend_sleeve(tmp_path / "updated.json", "us-live"))
+    queue.submit(RuntimeControlCommand.resume_sleeve(tmp_path / "updated.json", "us-live"))
     report = controller.apply_pending()
 
-    assert calls == [tmp_path / "updated.json", tmp_path / "updated.json"]
+    assert calls == [tmp_path / "updated.json", tmp_path / "updated.json", tmp_path / "updated.json", tmp_path / "updated.json"]
     assert [command.command_type for command in report.applied_commands] == [
         RuntimeControlCommandType.ACTIVATE_SLEEVE,
         RuntimeControlCommandType.DEACTIVATE_SLEEVE,
+        RuntimeControlCommandType.SUSPEND_SLEEVE,
+        RuntimeControlCommandType.RESUME_SLEEVE,
     ]
     assert report.current_version == "sha256:updated"

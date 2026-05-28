@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from leaps_quant_engine.brokerage import BrokerExecutionService, PaperBrokerExecutionGateway
+from leaps_quant_engine.brokerage import BrokerExecutionError, BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.models import OrderIntent, OrderSide, Symbol, TimeInForce
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
@@ -13,6 +13,20 @@ from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 class FailingPollWorker:
     def poll_once(self, **kwargs):
         raise RuntimeError("boom")
+
+
+class CancelTerminalBrokerErrorGateway:
+    def __init__(self, message):
+        self.message = message
+
+    def submit(self, ticket, *, occurred_at=None):
+        raise AssertionError("submit is not used in this test")
+
+    def cancel(self, ticket, *, reason="", occurred_at=None):
+        raise BrokerExecutionError(self.message)
+
+    def poll(self, ticket, *, occurred_at=None):
+        return ()
 
 
 def test_order_runtime_supervisor_reports_poll_errors_without_stopping(tmp_path):
@@ -77,6 +91,70 @@ def test_order_runtime_supervisor_cancels_stale_open_tickets(tmp_path):
     assert report.maintenance_report.stale_ticket_count == 1
     assert report.maintenance_report.cancel_events[0].event_type is OrderEventType.CANCELLED
     assert report.final_status.order_snapshot.open_tickets == ()
+
+
+def test_order_runtime_supervisor_expires_stale_ticket_when_broker_has_no_cancellable_quantity(tmp_path):
+    _assert_stale_cancel_terminal_error_expires_ticket(
+        tmp_path,
+        "domestic revise/cancel order request failed (APBK0927): 정정취소 가능수량이 없습니다.",
+    )
+
+
+def test_order_runtime_supervisor_expires_stale_ticket_when_original_order_is_missing(tmp_path):
+    _assert_stale_cancel_terminal_error_expires_ticket(
+        tmp_path,
+        "domestic revise/cancel order request failed (APBK0344): 원주문정보가 존재하지않습니다.",
+    )
+
+
+def _assert_stale_cancel_terminal_error_expires_ticket(tmp_path, message: str):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1000},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    batch = OrderIntentBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 10, 9, 0),
+        order_intents=(OrderIntent("LEaps", Symbol("005930", "KRX"), OrderSide.BUY, 1, 100),),
+        batch_id="batch-1",
+    )
+    ticket = OrderCoordinator().coordinate((batch,), generated_at=datetime(2026, 5, 10, 9, 0)).tickets[0]
+    accepted = ticket.event(
+        OrderEventType.ACCEPTED,
+        occurred_at=datetime(2026, 5, 10, 9, 0),
+        broker_order_id="91255:0004730200",
+    )
+    order_store.record_tickets((ticket,), recorded_at=datetime(2026, 5, 10, 9, 0))
+    order_store.record_event(accepted, recorded_at=datetime(2026, 5, 10, 9, 0))
+    account_store.register_order_ticket(ticket)
+    account_store.apply_order_event(accepted)
+
+    poll_worker = OpenTicketPollWorker(
+        broker=BrokerExecutionService(CancelTerminalBrokerErrorGateway(message)),
+        order_state_store=order_store,
+        account_store=account_store,
+    )
+    report = OrderRuntimeSupervisor(
+        runtime_id="test-runtime",
+        sleeve_ids=("LEaps",),
+        order_state_store=order_store,
+        account_store=account_store,
+        poll_worker=poll_worker,
+        maintenance_policy=OrderMaintenancePolicy(stale_after_seconds=60, cancel_stale=True),
+    ).run_once(
+        poll=False,
+        reconcile=False,
+        run_at=datetime(2026, 5, 10, 9, 2),
+    )
+
+    assert report.errors == ()
+    assert report.maintenance_report is not None
+    assert report.maintenance_report.stale_ticket_count == 1
+    assert report.maintenance_report.expire_events[0].event_type is OrderEventType.EXPIRED
+    assert report.maintenance_report.expire_events[0].reason == "stale_cancel_no_cancellable_quantity"
+    assert report.final_status.order_snapshot.open_tickets == ()
+    assert report.final_status.order_snapshot.terminal_tickets[0].status is OrderTicketStatus.EXPIRED
 
 
 def test_order_runtime_supervisor_expires_day_ticket_after_market_date_rollover(tmp_path):

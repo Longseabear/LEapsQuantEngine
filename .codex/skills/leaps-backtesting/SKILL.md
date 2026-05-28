@@ -29,6 +29,11 @@ Research backtests should run one sleeve at a time. Paper and live orchestration
 can run multiple sleeves together, but research should isolate sleeve capital
 and model wiring.
 
+For the local April/May 2026 research dataset, prefer `--source parquet-daily`
+or `--daily-source parquet-daily`. It reads normalized monthly files under
+`data/research/market_data/daily_bars/<market>_YYYY_MM.parquet` and avoids
+fresh provider drift during repeated smokes.
+
 ## Required Setup
 
 Work from the repo root:
@@ -72,6 +77,12 @@ the daily OHLCV values.
 Use `--source kis-cache` only for short cache/integration smokes where cached
 history is known to exist.
 
+Use `--source parquet-daily` when the requested date range is covered by the
+local monthly Parquet store, currently `krx_2026_04/05.parquet` and
+`us_2026_04/05.parquet`. This store includes KRX stocks, domestic ETFs, US
+stocks, and US ETFs in normalized columns. Daily row timestamps may be
+`00:00:00`; use `--daily-bar-time` to control replay cycle time.
+
 Runtime backtest reports include a `timings` block. Use it to separate
 `config_bootstrap_ms`, daily `history_feed_build_ms` or minute `feed_load_ms`,
 `daily_warmup_ms`, `framework_replay_ms`, `report_generation_ms`, and
@@ -82,10 +93,28 @@ such as `replay_indicator_update_ms`, `replay_indicator_snapshot_ms`,
 `replay_snapshot_record_ms`; these explain wall-clock overhead outside the
 narrow alpha/portfolio/risk/execution model timings.
 
+Runtime and framework backtest reports include `turnover_breakdown`. Read it as
+three different phenomena and keep retargeting separate from rebalancing:
+
+- `retargeting_turnover`: fresh target weight changes only, excluding reused
+  target tracking/rebalancing cycles. Use `retargeting_rate` when the operator
+  asks how often the model changed its mind.
+- `alpha_turnover`: compatibility alias for `retargeting_turnover`.
+- `execution_turnover`: actual simulated fill notional divided by average
+  equity. This matches `metrics.turnover` and includes rebalance, drift
+  correction, partial fills, slippage response, and execution effects.
+- `replacement_rate`: actual membership changes from fills, with
+  `new_entry_count` and `full_exit_count`.
+
 When writing a cycle journal during repeated research runs, prefer the default
 `--journal-mode auto`. It uses full lineage for detailed reports and light
 cycle entries for `--summary-only`. Use `--journal-mode full` only when lineage
 itself is the debugging target.
+
+Cycle journals include `metadata.stage_decisions.data` for backtest and
+live/paper cycles. Check this block when diagnosing parity: it shows the
+`DataSlice` resolution, `IndicatorSnapshot` lane, snapshot quality,
+`allows_new_entries`, and `allows_risk_checks`.
 
 FinanceDataReader daily history is cache-first by default under
 `data/runtime/cache/finance-datareader/daily`. Delete that ignored cache
@@ -114,6 +143,13 @@ Minute feed rows need symbol, time, open, high, low, close, and volume. Universe
 indicators without an explicit resolution are treated as confirmed daily
 indicators in this command, so minute bars do not advance daily momentum/SMA
 windows by accident. Explicit minute indicators still update on minute bars.
+
+For minute backtests over the April/May 2026 research window, pair minute feeds
+or `--minute-cache-root` with `--daily-source parquet-daily` when the daily
+warmup/evaluation bars should match the local monthly Parquet store. This is a
+good default for deterministic KRX/US stock and ETF smokes. Use
+`finance-datareader` only when the warmup window extends beyond the Parquet
+coverage, and use `kis-cache` for recent broker-adapter cache validation.
 
 When the local feed is missing, create it first:
 

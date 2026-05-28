@@ -28,6 +28,22 @@ def test_security_catalog_resolves_krx_sor_default_from_universe_metadata():
     assert props.quantity_step == 5
 
 
+def test_security_catalog_routes_domestic_etf_to_krx_by_default():
+    symbol = Symbol("069500", "KRX")
+    universe = UniverseDefinition(
+        id="u",
+        market="KRX",
+        symbols=(symbol,),
+        indicators=(),
+        symbol_properties={symbol.key: {"asset_type": "etf", "is_etf": True}},
+    )
+
+    props = SecurityCatalog.from_universe(universe).resolve(symbol)
+
+    assert props.market_scope == "domestic"
+    assert props.default_exchange_scope == "KRX"
+
+
 def test_engine_guard_uses_security_catalog_quantity_step_and_sessions(tmp_path):
     symbol = Symbol("005930", "KRX")
     universe = UniverseDefinition(

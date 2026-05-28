@@ -61,6 +61,100 @@ def test_cli_runtime_config_validate_outputs_snapshot(monkeypatch, capsys):
     }
 
 
+def test_cli_runtime_artifact_status_reports_configured_paths(tmp_path, capsys):
+    workspace = tmp_path / "sleeves" / "test-sleeve"
+    workspace.mkdir(parents=True)
+    (workspace / "STRATEGY.md").write_text("# Strategy\n", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("# Agents\n", encoding="utf-8")
+    (workspace / "README.md").write_text("# README\n", encoding="utf-8")
+
+    data_root = tmp_path / "data"
+    account_store = data_root / "virtual-accounts" / "test.json"
+    order_store = data_root / "order-runtime" / "test.jsonl"
+    account_store.parent.mkdir(parents=True)
+    order_store.parent.mkdir(parents=True)
+    account_store.write_text("{}", encoding="utf-8")
+    order_store.write_text("", encoding="utf-8")
+
+    active_sleeves_path = data_root / "runtime" / "live-order-loop" / "multi_sleeve_active_sleeves.json"
+    active_sleeves_path.parent.mkdir(parents=True)
+    active_sleeves_path.write_text(
+        json.dumps({"active_sleeve_ids": ["test-sleeve"], "source": "test"}),
+        encoding="utf-8",
+    )
+    framework_state_dir = data_root / "runtime" / "framework-state" / "multi-sleeve"
+    framework_state_dir.mkdir(parents=True)
+    (framework_state_dir / "test-sleeve.json").write_text("{}", encoding="utf-8")
+    report_dir = data_root / "runtime" / "portfolio-reports"
+    report_dir.mkdir(parents=True)
+    (report_dir / "test-sleeve_runtime_20260522_090000.json").write_text("{}", encoding="utf-8")
+
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "artifact-status-test",
+                "mode": "live",
+                "timezone": "Asia/Seoul",
+                "market_data": {
+                    "provider": "market-data-engine",
+                    "history_provider": "kis-cache",
+                    "snapshot_store_path": str(data_root / "market-data-snapshots" / "test.jsonl"),
+                },
+                "broker_accounts": [
+                    {
+                        "account_id": "test-account",
+                        "market_scope": "domestic",
+                        "currency": "KRW",
+                        "account_store_path": str(account_store),
+                        "order_store_path": str(order_store),
+                        "broker_gateway": "paper",
+                    }
+                ],
+                "journal_path": str(data_root / "cycle-journal" / "test.jsonl"),
+                "sleeves": [
+                    {
+                        "sleeve_id": "test-sleeve",
+                        "workspace_path": str(workspace),
+                        "cash_by_currency": {"KRW": 1000000},
+                        "broker_account_routes": {"domestic": "test-account"},
+                        "universe": {"coarse_path": str(tmp_path / "universe.json")},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "runtime-artifact-status",
+            str(config_path),
+            "--sleeve-id",
+            "test-sleeve",
+            "--active-sleeves-path",
+            str(active_sleeves_path),
+            "--framework-state-dir",
+            str(framework_state_dir),
+            "--report-dir",
+            str(report_dir),
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["read_only"] is True
+    assert payload["runtime_id"] == "artifact-status-test"
+    assert payload["active_sleeves"]["active_sleeve_ids"] == ["test-sleeve"]
+    assert payload["routes"][0]["account_store"]["exists"] is True
+    assert payload["routes"][0]["order_store"]["exists"] is True
+    assert payload["sleeves"][0]["sleeve_id"] == "test-sleeve"
+    assert payload["sleeves"][0]["active"] is True
+    assert payload["sleeves"][0]["framework_state"]["exists"] is True
+    assert payload["sleeves"][0]["latest_portfolio_report"]["exists"] is True
+
+
 def test_cli_daily_backtest_provider_prefers_finance_datareader(monkeypatch):
     class FakeFinanceProvider:
         pass
@@ -70,11 +164,16 @@ def test_cli_daily_backtest_provider_prefers_finance_datareader(monkeypatch):
         def from_env(cls):
             return cls()
 
+    class FakeParquetProvider:
+        pass
+
     monkeypatch.setattr(cli, "FinanceDataReaderMarketDataProvider", FakeFinanceProvider)
     monkeypatch.setattr(cli, "KISCachedMarketDataProvider", FakeKISProvider)
+    monkeypatch.setattr(cli, "ParquetDailyBarProvider", FakeParquetProvider)
 
     assert isinstance(cli._daily_backtest_provider("finance-datareader"), FakeFinanceProvider)
     assert isinstance(cli._daily_backtest_provider("kis-cache"), FakeKISProvider)
+    assert isinstance(cli._daily_backtest_provider("parquet-daily"), FakeParquetProvider)
 
 
 def test_cli_notify_user_message_saves_local_record(monkeypatch, tmp_path, capsys):
@@ -503,6 +602,45 @@ def generate(context):
     assert compiled_hit_payload["minute_backtest"]["minute_data_slice_count"] == 2
     assert compiled_hit_payload["final_quantity"] == {"KRX:005930": 20}
 
+    sliced_journal_path = tmp_path / "minute-sliced-journal.jsonl"
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--compiled-replay-cache",
+            str(compiled_cache),
+            "--start",
+            "2026-05-01T09:01:00",
+            "--end",
+            "2026-05-01T09:01:00",
+            "--warmup-start",
+            "2026-04-01",
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--journal",
+            str(sliced_journal_path),
+            "--summary-only",
+        ]
+    )
+
+    assert exit_code == 0
+    sliced_payload = json.loads(capsys.readouterr().out)
+    assert sliced_payload["source"] == "compiled-replay-cache"
+    assert sliced_payload["compiled_replay_cache"]["status"] == "hit"
+    assert sliced_payload["compiled_replay_cache"]["slice_count"] == 2
+    assert sliced_payload["minute_backtest"]["minute_data_slice_count"] == 1
+    assert sliced_payload["minute_backtest"]["requested_start"] == "2026-05-01T09:01:00"
+    assert sliced_payload["minute_backtest"]["requested_end"] == "2026-05-01T09:01:00"
+    assert sliced_payload["minute_backtest"]["effective_start"] == "2026-05-01T09:01:00"
+    assert sliced_payload["minute_backtest"]["effective_end"] == "2026-05-01T09:01:00"
+    sliced_journal_rows = [json.loads(line) for line in sliced_journal_path.read_text(encoding="utf-8").splitlines()]
+    assert len(sliced_journal_rows) == 1
+    assert sliced_journal_rows[0]["generated_at"].startswith("2026-05-01T09:01:00")
+
     daily_warmup_cache = tmp_path / "daily-warmup.json.gz"
     exit_code = main(
         [
@@ -587,6 +725,128 @@ def generate(context):
     assert cache_payload["minute_backtest"]["minute_feed"] is None
     assert cache_payload["minute_backtest"]["minute_data_slice_count"] == 2
     assert cache_payload["final_quantity"] == {"KRX:005930": 20}
+
+
+def test_cli_runtime_backtest_minute_advances_confirmed_daily_indicators(monkeypatch, tmp_path, capsys):
+    universe_path = tmp_path / "universe.json"
+    workspace = tmp_path / "sleeves" / "LEaps"
+    (workspace / "alphas").mkdir(parents=True)
+    universe_path.write_text(
+        json.dumps(
+            {
+                "id": "runtime-minute-daily-advance",
+                "market": "KRX",
+                "symbols": ["005930"],
+                "indicators": [{"name": "close", "type": "close", "period": 1}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "alphas" / "daily.py").write_text(
+        """
+from datetime import timedelta
+from leaps_quant_engine.alpha import Insight, InsightDirection
+
+ALPHA_ID = "daily-alpha"
+VERSION = "1.0"
+EVALUATION_CADENCE = "once_per_day"
+INPUT_RESOLUTION = "daily"
+
+def generate(context):
+    symbol_key = context.symbol_keys[0]
+    value = context.value(symbol_key, "close")
+    return [
+        Insight(
+            sleeve_id=context.sleeve_id,
+            symbol=context.symbol(symbol_key),
+            direction=InsightDirection.UP,
+            generated_at=context.as_of,
+            expires_at=context.as_of + timedelta(days=1),
+            source_snapshot_id=context.source_snapshot_id,
+            alpha_id=ALPHA_ID,
+            alpha_version=VERSION,
+            weight=1.0,
+            reason="daily_alpha",
+            metadata={"daily_close": value},
+        )
+    ]
+""",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "runtime_id": "runtime-minute-test",
+                "mode": "backtest",
+                "timezone": "Asia/Seoul",
+                "sleeves": [
+                    {
+                        "sleeve_id": "LEaps",
+                        "workspace_path": str(workspace),
+                        "cash": 1000,
+                        "universe": {"coarse_path": str(universe_path), "active": {"max_symbols": 1}},
+                        "indicators": {"warmup_enabled": True, "extra_bars": 5, "refresh_history": False},
+                        "alpha": {"modules": [{"ref": "alphas/daily.py"}]},
+                        "portfolio": {"model": "leaps_quant_engine.framework:EqualWeightPortfolioConstructionModel"},
+                        "risk": {"model": "leaps_quant_engine.framework:PassThroughRiskManagementModel"},
+                        "execution": {"model": "leaps_quant_engine.execution:ImmediateExecutionModel"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    symbol = Symbol("005930", "KRX")
+    provider = VirtualMarketDataProvider.from_bars(
+        [
+            Bar(symbol, cli.datetime(2026, 4, 30), 100, 100, 100, 100, 1000, resolution="daily"),
+            Bar(symbol, cli.datetime(2026, 5, 1), 120, 120, 120, 120, 1000, resolution="daily"),
+        ]
+    )
+    monkeypatch.setattr(cli, "_daily_backtest_provider", lambda source: provider)
+    minute_feed = tmp_path / "minute.csv"
+    minute_feed.write_text(
+        "\n".join(
+            [
+                "symbol,time,open,high,low,close,volume",
+                "KRX:005930,2026-05-01T09:00:00,50,50,50,50,100",
+                "KRX:005930,2026-05-04T09:00:00,60,60,60,60,100",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "runtime-backtest-minute",
+            str(config_path),
+            "--sleeve-id",
+            "LEaps",
+            "--minute-feed",
+            str(minute_feed),
+            "--start",
+            "2026-05-01T09:00:00",
+            "--end",
+            "2026-05-04T09:00:00",
+            "--warmup-start",
+            "2026-04-01",
+            "--cash",
+            "1000",
+            "--currency",
+            "KRW",
+            "--summary-only",
+            "--include-insights",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["minute_backtest"]["daily_warmup_bar_count"] == 1
+    assert payload["minute_backtest"]["daily_replay_bar_count"] == 1
+    assert payload["insights"]["insight_count"] == 2
+    assert payload["insights"]["cycles"][0]["new_insights"][0]["metadata"]["daily_close"] == 100.0
+    assert payload["insights"]["cycles"][1]["new_insights"][0]["metadata"]["daily_close"] == 120.0
 
 
 def test_cli_download_us_minute_feed_from_runtime_universe(monkeypatch, tmp_path, capsys):
@@ -1606,11 +1866,45 @@ def test_cli_persists_activate_and_deactivate_sleeve_control_commands(tmp_path, 
     deactivated = json.loads(capsys.readouterr().out)
     assert deactivated["command_type"] == "deactivate_sleeve"
 
+    assert main(
+        [
+            "runtime-control-submit",
+            "--queue",
+            str(queue_path),
+            "--command",
+            "suspend-sleeve",
+            "--config",
+            "configs/runtime/live_multi_sleeve.json",
+            "--sleeve-id",
+            "LEaps",
+        ]
+    ) == 0
+    suspended = json.loads(capsys.readouterr().out)
+    assert suspended["command_type"] == "suspend_sleeve"
+
+    assert main(
+        [
+            "runtime-control-submit",
+            "--queue",
+            str(queue_path),
+            "--command",
+            "resume-sleeve",
+            "--config",
+            "configs/runtime/live_multi_sleeve.json",
+            "--sleeve-id",
+            "LEaps",
+        ]
+    ) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert resumed["command_type"] == "resume_sleeve"
+
     assert main(["runtime-control-drain", "--queue", str(queue_path)]) == 0
     drained = json.loads(capsys.readouterr().out)
     assert [command["command_type"] for command in drained["commands"]] == [
         "activate_sleeve",
         "deactivate_sleeve",
+        "suspend_sleeve",
+        "resume_sleeve",
     ]
 
 

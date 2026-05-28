@@ -94,9 +94,12 @@ ETF model cadence.
 Keep churn guards enabled:
 
 ```text
-min_order_notional: 200
-min_quantity_delta: 2
+min_order_notional: 0
+min_quantity_delta: 0
+target_churn_guard: true
+target_churn_equity_bps: 25
 reused_target_churn_guard: true
+reused_target_churn_equity_bps: 25
 ```
 
 The sleeve should avoid replacing or re-sending orders on every quote tick.

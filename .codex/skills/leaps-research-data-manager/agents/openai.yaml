@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEaps Research Data Manager"
+  short_description: "Manage LEaps news evidence and daily/minute research data."
+  default_prompt: "Use this skill when collecting, inspecting, documenting, or wiring LEapsQuantEngine research news, daily bars, coverage universes, and backtest data sources."

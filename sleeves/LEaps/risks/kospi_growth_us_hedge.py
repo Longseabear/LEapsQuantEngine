@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import time
+from math import ceil
 
 from leaps_quant_engine.framework.risk import (
     RiskDecision,
@@ -67,6 +68,8 @@ class LeapsKospiGrowthUsHedgeRiskModel:
         symbol_entry_block_intraday_return_pct: float = -0.025,
         symbol_entry_block_high_drawdown_pct: float = -0.040,
         symbol_entry_block_unrealized_loss_pct: float = -0.015,
+        symbol_entry_block_sma10_buffer_pct: float | None = None,
+        symbol_entry_block_sma20_buffer_pct: float | None = None,
         symbol_reduce_half_unrealized_loss_pct: float = -0.035,
         symbol_exit_unrealized_loss_pct: float = -0.060,
         symbol_reduce_half_high_drawdown_pct: float = -0.065,
@@ -79,6 +82,14 @@ class LeapsKospiGrowthUsHedgeRiskModel:
         symbol_guard_min_volatility_multiplier: float = 0.75,
         symbol_guard_max_volatility_multiplier: float = 1.75,
         symbol_guard_entry_max_volatility_multiplier: float = 1.25,
+        symbol_guard_recovery_confirmation_cycles: int = 3,
+        symbol_pullback_add_enabled: bool = False,
+        symbol_pullback_add_fraction: float = 0.50,
+        symbol_pullback_add_min_intraday_return_pct: float = 0.0,
+        symbol_pullback_add_min_unrealized_pnl_pct: float = 0.0,
+        symbol_pullback_add_min_sma10_gap_pct: float = 0.0,
+        symbol_pullback_add_min_sma20_gap_pct: float = 0.0,
+        symbol_pullback_add_min_alpha_count: int = 2,
         reject_invalid_snapshot: bool = True,
         require_fresh_for_entries: bool = True,
     ) -> None:
@@ -139,6 +150,12 @@ class LeapsKospiGrowthUsHedgeRiskModel:
         self.symbol_entry_block_intraday_return_pct = float(symbol_entry_block_intraday_return_pct)
         self.symbol_entry_block_high_drawdown_pct = float(symbol_entry_block_high_drawdown_pct)
         self.symbol_entry_block_unrealized_loss_pct = float(symbol_entry_block_unrealized_loss_pct)
+        self.symbol_entry_block_sma10_buffer_pct = (
+            None if symbol_entry_block_sma10_buffer_pct is None else float(symbol_entry_block_sma10_buffer_pct)
+        )
+        self.symbol_entry_block_sma20_buffer_pct = (
+            None if symbol_entry_block_sma20_buffer_pct is None else float(symbol_entry_block_sma20_buffer_pct)
+        )
         self.symbol_reduce_half_unrealized_loss_pct = float(symbol_reduce_half_unrealized_loss_pct)
         self.symbol_exit_unrealized_loss_pct = float(symbol_exit_unrealized_loss_pct)
         self.symbol_reduce_half_high_drawdown_pct = float(symbol_reduce_half_high_drawdown_pct)
@@ -157,6 +174,14 @@ class LeapsKospiGrowthUsHedgeRiskModel:
             self.symbol_guard_min_volatility_multiplier,
             float(symbol_guard_entry_max_volatility_multiplier),
         )
+        self.symbol_guard_recovery_confirmation_cycles = max(1, int(symbol_guard_recovery_confirmation_cycles))
+        self.symbol_pullback_add_enabled = bool(symbol_pullback_add_enabled)
+        self.symbol_pullback_add_fraction = min(1.0, max(0.0, float(symbol_pullback_add_fraction)))
+        self.symbol_pullback_add_min_intraday_return_pct = float(symbol_pullback_add_min_intraday_return_pct)
+        self.symbol_pullback_add_min_unrealized_pnl_pct = float(symbol_pullback_add_min_unrealized_pnl_pct)
+        self.symbol_pullback_add_min_sma10_gap_pct = float(symbol_pullback_add_min_sma10_gap_pct)
+        self.symbol_pullback_add_min_sma20_gap_pct = float(symbol_pullback_add_min_sma20_gap_pct)
+        self.symbol_pullback_add_min_alpha_count = max(0, int(symbol_pullback_add_min_alpha_count))
         self.reject_invalid_snapshot = reject_invalid_snapshot
         self.require_fresh_for_entries = require_fresh_for_entries
 
@@ -448,7 +473,10 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                 remaining_cash,
             )
 
-        approved = PortfolioTarget(symbol=target.symbol, quantity=cash_limited_quantity, tag=target.tag)
+        approved_tag = target.tag
+        if cash_limited_quantity < current_quantity:
+            approved_tag = _risk_tag(target.tag, "currency_policy_reduce")
+        approved = PortfolioTarget(symbol=target.symbol, quantity=cash_limited_quantity, tag=approved_tag)
         status = RiskDecisionStatus.APPROVED if approved.quantity == target.quantity else RiskDecisionStatus.CLAMPED
         return (
             RiskDecision(
@@ -494,7 +522,7 @@ class LeapsKospiGrowthUsHedgeRiskModel:
         if current_quantity > 0:
             exit_reason = self._symbol_guard_exit_reason(metrics)
             if exit_reason is not None:
-                approved = PortfolioTarget(symbol=target.symbol, quantity=0, tag=target.tag)
+                approved = PortfolioTarget(symbol=target.symbol, quantity=0, tag=_risk_tag(target.tag, "symbol_guard_exit"))
                 return RiskDecision(
                     original_target=target,
                     approved_target=approved,
@@ -521,7 +549,11 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                 reduced_quantity = min(current_quantity, reduced_quantity)
                 approved_quantity = min(target.quantity, reduced_quantity)
                 if approved_quantity < target.quantity:
-                    approved = PortfolioTarget(symbol=target.symbol, quantity=approved_quantity, tag=target.tag)
+                    approved = PortfolioTarget(
+                        symbol=target.symbol,
+                        quantity=approved_quantity,
+                        tag=_risk_tag(target.tag, "symbol_guard_reduce_half"),
+                    )
                     return RiskDecision(
                         original_target=target,
                         approved_target=approved,
@@ -538,8 +570,8 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                         },
                     )
         if target.quantity > current_quantity:
-            block_reason = self._symbol_guard_entry_block_reason(metrics, has_position=current_quantity > 0)
-            if block_reason is not None:
+            hard_block_reason = self._symbol_guard_entry_hard_block_reason(metrics, has_position=current_quantity > 0)
+            if hard_block_reason is not None:
                 approved = PortfolioTarget(symbol=target.symbol, quantity=current_quantity, tag=target.tag)
                 return RiskDecision(
                     original_target=target,
@@ -548,7 +580,41 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                     reason="symbol_guard_entry_block",
                     metadata={
                         **metrics,
-                        "trigger": block_reason,
+                        "trigger": hard_block_reason,
+                        "market_regime": regime,
+                    },
+                )
+            drawdown_reason = self._symbol_guard_entry_drawdown_reason(metrics)
+            if drawdown_reason is not None:
+                pullback_quantity = self._symbol_guard_pullback_add_quantity(
+                    metrics,
+                    current_quantity=current_quantity,
+                    target_quantity=target.quantity,
+                )
+                if pullback_quantity is not None and pullback_quantity > current_quantity:
+                    approved = PortfolioTarget(symbol=target.symbol, quantity=pullback_quantity, tag=target.tag)
+                    return RiskDecision(
+                        original_target=target,
+                        approved_target=approved,
+                        status=RiskDecisionStatus.CLAMPED if pullback_quantity < target.quantity else RiskDecisionStatus.APPROVED,
+                        reason="symbol_guard_pullback_add",
+                        metadata={
+                            **metrics,
+                            "trigger": drawdown_reason,
+                            "pullback_add_fraction": self.symbol_pullback_add_fraction,
+                            "pullback_add_quantity": pullback_quantity,
+                            "market_regime": regime,
+                        },
+                    )
+                approved = PortfolioTarget(symbol=target.symbol, quantity=current_quantity, tag=target.tag)
+                return RiskDecision(
+                    original_target=target,
+                    approved_target=approved,
+                    status=RiskDecisionStatus.CLAMPED,
+                    reason="symbol_guard_entry_block",
+                    metadata={
+                        **metrics,
+                        "trigger": drawdown_reason,
                         "market_regime": regime,
                     },
                 )
@@ -652,6 +718,10 @@ class LeapsKospiGrowthUsHedgeRiskModel:
             "reduce_half_sma10_buffer_pct": self.symbol_reduce_half_sma10_buffer_pct,
             "exit_sma20_buffer_pct": self.symbol_exit_sma20_buffer_pct,
         }
+        if self.symbol_entry_block_sma10_buffer_pct is not None:
+            base_thresholds["entry_block_sma10_buffer_pct"] = self.symbol_entry_block_sma10_buffer_pct
+        if self.symbol_entry_block_sma20_buffer_pct is not None:
+            base_thresholds["entry_block_sma20_buffer_pct"] = self.symbol_entry_block_sma20_buffer_pct
         thresholds = dict(base_thresholds)
         volatility_pct = self._symbol_guard_volatility_pct(signal_metadata, price)
         volatility_multiplier = self._symbol_guard_volatility_multiplier(volatility_pct)
@@ -790,35 +860,95 @@ class LeapsKospiGrowthUsHedgeRiskModel:
         *,
         has_position: bool,
     ) -> str | None:
+        hard_block = self._symbol_guard_entry_hard_block_reason(metrics, has_position=has_position)
+        if hard_block is not None:
+            return hard_block
+        return self._symbol_guard_entry_drawdown_reason(metrics)
+
+    def _symbol_guard_entry_hard_block_reason(
+        self,
+        metrics: dict[str, object],
+        *,
+        has_position: bool,
+    ) -> str | None:
         intraday_return = _safe_float(metrics.get("intraday_return"))
-        drawdown = _safe_float(metrics.get("drawdown_from_session_high"))
         unrealized = _safe_float(metrics.get("unrealized_pnl_pct"))
+        sma10_gap = _safe_float(metrics.get("sma10_gap"))
+        sma20_gap = _safe_float(metrics.get("sma20_gap"))
         entry_intraday = self._symbol_guard_threshold(
             metrics,
             "entry_block_intraday_return_pct",
             self.symbol_entry_block_intraday_return_pct,
-        )
-        entry_drawdown = self._symbol_guard_threshold(
-            metrics,
-            "entry_block_high_drawdown_pct",
-            self.symbol_entry_block_high_drawdown_pct,
         )
         entry_unrealized = self._symbol_guard_threshold(
             metrics,
             "entry_block_unrealized_loss_pct",
             self.symbol_entry_block_unrealized_loss_pct,
         )
+        thresholds = metrics.get("thresholds")
+        entry_sma10 = (
+            _safe_float(thresholds.get("entry_block_sma10_buffer_pct"))
+            if isinstance(thresholds, Mapping)
+            else self.symbol_entry_block_sma10_buffer_pct
+        )
+        entry_sma20 = (
+            _safe_float(thresholds.get("entry_block_sma20_buffer_pct"))
+            if isinstance(thresholds, Mapping)
+            else self.symbol_entry_block_sma20_buffer_pct
+        )
         if intraday_return is not None and intraday_return <= entry_intraday:
             return "intraday_return"
-        if drawdown is not None and drawdown <= entry_drawdown:
-            return "session_high_drawdown"
         if (
             has_position
             and unrealized is not None
             and unrealized <= entry_unrealized
         ):
             return "unrealized_loss"
+        if has_position and sma20_gap is not None and entry_sma20 is not None and sma20_gap <= entry_sma20:
+            return "sma20_add_block"
+        if has_position and sma10_gap is not None and entry_sma10 is not None and sma10_gap <= entry_sma10:
+            return "sma10_add_block"
         return None
+
+    def _symbol_guard_entry_drawdown_reason(self, metrics: dict[str, object]) -> str | None:
+        drawdown = _safe_float(metrics.get("drawdown_from_session_high"))
+        entry_drawdown = self._symbol_guard_threshold(
+            metrics,
+            "entry_block_high_drawdown_pct",
+            self.symbol_entry_block_high_drawdown_pct,
+        )
+        if drawdown is not None and drawdown <= entry_drawdown:
+            return "session_high_drawdown"
+        return None
+
+    def _symbol_guard_pullback_add_quantity(
+        self,
+        metrics: dict[str, object],
+        *,
+        current_quantity: int,
+        target_quantity: int,
+    ) -> int | None:
+        if not self.symbol_pullback_add_enabled or current_quantity <= 0 or target_quantity <= current_quantity:
+            return None
+        intraday_return = _safe_float(metrics.get("intraday_return"))
+        unrealized = _safe_float(metrics.get("unrealized_pnl_pct"))
+        sma10_gap = _safe_float(metrics.get("sma10_gap"))
+        sma20_gap = _safe_float(metrics.get("sma20_gap"))
+        alpha_ids = metrics.get("signal_alpha_ids")
+        alpha_count = len(alpha_ids) if isinstance(alpha_ids, (list, tuple, set, frozenset)) else 0
+        if intraday_return is None or intraday_return < self.symbol_pullback_add_min_intraday_return_pct:
+            return None
+        if unrealized is None or unrealized < self.symbol_pullback_add_min_unrealized_pnl_pct:
+            return None
+        if sma10_gap is not None and sma10_gap < self.symbol_pullback_add_min_sma10_gap_pct:
+            return None
+        if sma20_gap is not None and sma20_gap < self.symbol_pullback_add_min_sma20_gap_pct:
+            return None
+        if alpha_count < self.symbol_pullback_add_min_alpha_count:
+            return None
+        delta = target_quantity - current_quantity
+        add_quantity = max(1, ceil(delta * self.symbol_pullback_add_fraction))
+        return min(target_quantity, current_quantity + add_quantity)
 
     def _symbol_guard_threshold(self, metrics: dict[str, object], name: str, fallback: float) -> float:
         thresholds = metrics.get("thresholds")
@@ -1129,6 +1259,9 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                             "last_approved_quantity": decision.approved_target.quantity if decision.approved_target else None,
                             "last_current_quantity": metadata.get("current_quantity"),
                             "trigger": metadata.get("trigger"),
+                            "last_risk_status": "reduced",
+                            "last_risk_trigger": metadata.get("trigger"),
+                            "last_risk_event_at": context.data.time.isoformat(),
                             "updated_at": context.data.time.isoformat(),
                         },
                         reason="symbol_guard_reduce_mark",
@@ -1150,6 +1283,9 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                             "last_approved_quantity": 0,
                             "last_current_quantity": metadata.get("current_quantity"),
                             "trigger": metadata.get("trigger"),
+                            "last_risk_status": "exited",
+                            "last_risk_trigger": metadata.get("trigger"),
+                            "last_risk_event_at": context.data.time.isoformat(),
                             "updated_at": context.data.time.isoformat(),
                         },
                         reason="symbol_guard_exit_mark",
@@ -1158,7 +1294,13 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                 )
                 continue
             prior = self._symbol_guard_state(context, symbol_key)
-            if prior and str(prior.get("status") or "") in {"reduced", "exited"}:
+            if prior and str(prior.get("status") or "") in {"reduced", "exited", "recovering"}:
+                confirmation_count = (_safe_int(prior.get("recovery_confirmation_count")) or 0) + 1
+                status = "clear"
+                reason = "symbol_guard_clear"
+                if confirmation_count < self.symbol_guard_recovery_confirmation_cycles:
+                    status = "recovering"
+                    reason = "symbol_guard_recovery_wait"
                 patches.append(
                     StatePatch(
                         key=context.model_state.key(
@@ -1168,14 +1310,19 @@ class LeapsKospiGrowthUsHedgeRiskModel:
                             symbol_key=symbol_key,
                         ),
                         value={
-                            "status": "clear",
+                            "status": status,
                             "anchor_quantity": None,
                             "last_approved_quantity": decision.approved_target.quantity if decision.approved_target else None,
                             "last_current_quantity": metadata.get("current_quantity"),
                             "trigger": None,
+                            "last_risk_status": prior.get("last_risk_status") or prior.get("status"),
+                            "last_risk_trigger": prior.get("last_risk_trigger") or prior.get("trigger"),
+                            "last_risk_event_at": prior.get("last_risk_event_at") or prior.get("updated_at"),
+                            "recovery_confirmation_count": confirmation_count,
+                            "recovery_confirmation_required": self.symbol_guard_recovery_confirmation_cycles,
                             "updated_at": context.data.time.isoformat(),
                         },
-                        reason="symbol_guard_clear",
+                        reason=reason,
                         generated_at=context.data.time,
                     )
                 )
@@ -1738,6 +1885,8 @@ def create_risk_model(params):
         symbol_entry_block_unrealized_loss_pct=float(
             params.get("symbol_entry_block_unrealized_loss_pct", -0.015)
         ),
+        symbol_entry_block_sma10_buffer_pct=_safe_float(params.get("symbol_entry_block_sma10_buffer_pct")),
+        symbol_entry_block_sma20_buffer_pct=_safe_float(params.get("symbol_entry_block_sma20_buffer_pct")),
         symbol_reduce_half_unrealized_loss_pct=float(
             params.get("symbol_reduce_half_unrealized_loss_pct", -0.035)
         ),
@@ -1766,6 +1915,20 @@ def create_risk_model(params):
         symbol_guard_entry_max_volatility_multiplier=float(
             params.get("symbol_guard_entry_max_volatility_multiplier", 1.25)
         ),
+        symbol_guard_recovery_confirmation_cycles=int(
+            params.get("symbol_guard_recovery_confirmation_cycles", 3)
+        ),
+        symbol_pullback_add_enabled=bool(params.get("symbol_pullback_add_enabled", False)),
+        symbol_pullback_add_fraction=float(params.get("symbol_pullback_add_fraction", 0.50)),
+        symbol_pullback_add_min_intraday_return_pct=float(
+            params.get("symbol_pullback_add_min_intraday_return_pct", 0.0)
+        ),
+        symbol_pullback_add_min_unrealized_pnl_pct=float(
+            params.get("symbol_pullback_add_min_unrealized_pnl_pct", 0.0)
+        ),
+        symbol_pullback_add_min_sma10_gap_pct=float(params.get("symbol_pullback_add_min_sma10_gap_pct", 0.0)),
+        symbol_pullback_add_min_sma20_gap_pct=float(params.get("symbol_pullback_add_min_sma20_gap_pct", 0.0)),
+        symbol_pullback_add_min_alpha_count=int(params.get("symbol_pullback_add_min_alpha_count", 2)),
         reject_invalid_snapshot=bool(params.get("reject_invalid_snapshot", True)),
         require_fresh_for_entries=bool(params.get("require_fresh_for_entries", True)),
     )
@@ -1799,6 +1962,16 @@ def _no_room_reason(
     if requested_quantity < current_quantity:
         return "target_reduction_blocked"
     return "risk_clamped_to_current"
+
+
+def _risk_tag(tag: object, reason: str) -> str:
+    base = str(tag or "").strip()
+    token = f"risk:{reason}"
+    if token in base:
+        return base
+    if not base:
+        return token
+    return f"{base}|{token}"
 
 
 def _float_map(value, fallback: dict[str, float]) -> dict[str, float]:

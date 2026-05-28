@@ -10,7 +10,7 @@ from leaps_quant_engine.models import OrderType
 from leaps_quant_engine.order_state import OrderRuntimeSnapshot, OrderRuntimeStateStore
 from leaps_quant_engine.orders import OrderEvent, OrderEventType, OrderTicket, OrderTicketStatus
 from leaps_quant_engine.portfolio import Portfolio
-from leaps_quant_engine.virtual_account import FillAllocationStatus, VirtualSleeveAccountStore
+from leaps_quant_engine.virtual_account import FillAllocationStatus, PortfolioMutationRecord, VirtualSleeveAccountStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,7 @@ class SleeveOrderRuntimeStatus:
     open_tickets: tuple[OrderTicket, ...]
     terminal_ticket_count: int
     recent_events: tuple[OrderEvent, ...]
+    recent_portfolio_mutations: tuple[PortfolioMutationRecord, ...] = ()
 
     @property
     def pending_buy_notional(self) -> float:
@@ -48,6 +49,10 @@ class SleeveOrderRuntimeStatus:
             "pending_sell_quantities": self.pending_sell_quantities,
             "recent_event_count": len(self.recent_events),
             "recent_events": [event.to_dict() for event in self.recent_events],
+            "recent_portfolio_mutation_count": len(self.recent_portfolio_mutations),
+            "recent_portfolio_mutations": [
+                mutation.to_dict() for mutation in self.recent_portfolio_mutations
+            ],
         }
         if include_details:
             payload["open_tickets"] = [_ticket_to_status_dict(ticket) for ticket in self.open_tickets]
@@ -160,6 +165,10 @@ def build_order_runtime_status(
                 open_tickets=tuple(ticket for ticket in sleeve_tickets if ticket.status not in _TERMINAL_STATUSES),
                 terminal_ticket_count=sum(1 for ticket in sleeve_tickets if ticket.status in _TERMINAL_STATUSES),
                 recent_events=_recent_order_events(snapshot.events, recent_events, sleeve_id=sleeve_id),
+                recent_portfolio_mutations=account_store.portfolio_mutations(
+                    sleeve_id=sleeve_id,
+                    limit=recent_events,
+                ),
             )
         )
 

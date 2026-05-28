@@ -152,6 +152,12 @@ Until that gateway is active, do not run multiple aggressive KIS callers in
 parallel. Bulk cache builders should run off-hours or with an explicit low rate
 limit.
 
+Strict live preflight treats this as an operating rule. If a live runtime config
+uses `market_data.provider` other than `kis-gateway`, `runtime-preflight
+--strict-live` returns a critical `market_data_gateway_policy` check. Backtests,
+paper experiments, and isolated research configs can still use other adapters,
+but the live multi-sleeve stack should converge through the local gateway.
+
 Runtime cycles must not wait for the gateway to finish polling every symbol.
 Collectors update snapshots in the background; cycles read the latest immutable
 snapshot and act according to freshness quality. The default engine thresholds
@@ -451,14 +457,35 @@ stdio server:
 ```text
 codex global MCP
   -> leaps_quant_engine.mcp_market_data_stdio
+  -> KISGatewayClient
+  -> local KIS gateway
   -> KISDirectClient
   -> local KIS cache / KIS REST
 ```
 
 This replaces the old StockProgram `market_data_engine.server.app serve-mcp`
 entry. The MCP server is intentionally thin: it exposes quote/history/cache
-tools and delegates broker-specific work to `KISDirectClient`. It must not be
-used from alpha, portfolio, risk, or execution model code.
+tools and delegates broker-specific work to the shared local KIS gateway. It
+must not be used from alpha, portfolio, risk, or execution model code.
+
+Codex launches stdio MCP servers per client/session, so multiple
+`mcp_market_data_stdio` processes can exist at the same time. Those processes
+must stay cheap proxies. The default backend is the shared HTTP gateway:
+
+```powershell
+$env:LEAPS_MARKET_DATA_MCP_BACKEND='gateway'
+$env:LEAPS_KIS_GATEWAY_BASE_URL='http://127.0.0.1:8766'
+```
+
+Direct KIS mode is only for local diagnostics:
+
+```powershell
+$env:LEAPS_MARKET_DATA_MCP_BACKEND='direct'
+```
+
+Do not use direct mode for normal live operation because each stdio process
+would create its own `KISDirectClient` and bypass the shared AppKey pacing
+boundary.
 
 Supported MCP tools include:
 

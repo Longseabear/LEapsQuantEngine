@@ -13,6 +13,7 @@ DEFAULT_EOD_SCHEDULES = (
     "18:05|krx-after-hours",
     "06:10|us-after-hours",
 )
+DEFAULT_CASH_SNAPSHOT_MAX_AGE_SECONDS = 30 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,7 @@ def build_cash_availability_report(
     routes: Sequence[CashAvailabilityRouteInput],
     residual_sleeve_id: str = "default sleeve",
     generated_at: datetime | None = None,
+    max_cash_snapshot_age_seconds: float | None = DEFAULT_CASH_SNAPSHOT_MAX_AGE_SECONDS,
 ) -> dict[str, Any]:
     generated = generated_at or datetime.now().astimezone()
     route_payloads: list[dict[str, Any]] = []
@@ -52,11 +54,36 @@ def build_cash_availability_report(
             residual_sleeve_id=residual_sleeve_id,
         )
         snapshot_payload = _account_cash_snapshot_payload(route.account_store_path, account_id, route.currency)
+        snapshot_synced_at = (
+            _parse_datetime(snapshot_payload.get("synced_at"))
+            if isinstance(snapshot_payload, Mapping)
+            else None
+        )
+        snapshot_age_seconds = (
+            _elapsed_seconds(generated, snapshot_synced_at)
+            if snapshot_synced_at is not None
+            else None
+        )
+        snapshot_stale = (
+            max_cash_snapshot_age_seconds is not None
+            and snapshot_age_seconds is not None
+            and snapshot_age_seconds > max_cash_snapshot_age_seconds
+        )
+        allocated_sleeve_cash = report.virtual_cash_total - report.residual_cash
+        broker_residual_cash = max(report.broker_cash_balance - allocated_sleeve_cash, 0.0)
+        unsynced_residual_cash = max(broker_residual_cash - report.residual_cash, 0.0)
+        overallocated_cash = max(report.virtual_cash_total - report.broker_cash_balance, 0.0)
         available_cash = float(report.residual_cash)
+        if not snapshot_stale and snapshot_payload is not None:
+            available_cash = max(available_cash, broker_residual_cash)
         totals_by_currency[route.currency] = totals_by_currency.get(route.currency, 0.0) + available_cash
         if snapshot_payload is None:
             warnings.append(f"missing_cash_snapshot:{account_id}:{route.currency}")
             needs_attention = True
+        elif snapshot_stale:
+            warnings.append(f"stale_cash_snapshot:{account_id}:{route.currency}:{snapshot_age_seconds}")
+            needs_attention = True
+            sync_recommended = True
         if report.difference > 1e-6:
             warnings.append(f"virtual_cash_exceeds_broker_snapshot:{account_id}:{route.currency}:{report.difference}")
             needs_attention = True
@@ -74,17 +101,32 @@ def build_cash_availability_report(
                 "virtual_cash_total": report.virtual_cash_total,
                 "difference": report.difference,
                 "residual_sleeve_id": residual_sleeve_id,
+                "stored_residual_cash": report.residual_cash,
+                "allocated_sleeve_cash": allocated_sleeve_cash,
+                "broker_residual_cash": broker_residual_cash,
+                "unsynced_residual_cash": unsynced_residual_cash,
+                "overallocated_cash": overallocated_cash,
                 "available_cash": available_cash,
+                "available_cash_source": (
+                    "broker_snapshot_residual"
+                    if available_cash > report.residual_cash + 1e-6
+                    else "stored_residual_sleeve"
+                ),
                 "sleeve_cash": {
                     sleeve_id: float(report.sleeve_cash.get(sleeve_id, 0.0))
                     for sleeve_id in sleeve_ids
                 },
                 "all_sleeve_cash": dict(report.sleeve_cash),
-                "cash_snapshot_synced_at": (
-                    snapshot_payload.get("synced_at")
-                    if isinstance(snapshot_payload, Mapping)
-                    else None
+                "cash_snapshot_synced_at": snapshot_synced_at.isoformat() if snapshot_synced_at else None,
+                "cash_snapshot_age_seconds": snapshot_age_seconds,
+                "cash_snapshot_status": (
+                    "missing"
+                    if snapshot_payload is None
+                    else "stale"
+                    if snapshot_stale
+                    else "fresh"
                 ),
+                "cash_snapshot_max_age_seconds": max_cash_snapshot_age_seconds,
             }
         )
 
@@ -153,6 +195,23 @@ def _account_cash_snapshot_payload(account_store_path: Path, account_id: str, cu
         if key and isinstance(snapshots.get(key), Mapping):
             return snapshots[key]
     return None
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _elapsed_seconds(end: datetime, start: datetime) -> float:
+    if end.tzinfo is None and start.tzinfo is not None:
+        start = start.replace(tzinfo=None)
+    elif end.tzinfo is not None and start.tzinfo is None:
+        end = end.replace(tzinfo=None)
+    return max(0.0, (end - start).total_seconds())
 
 
 def _parse_schedules(schedules: Sequence[str]) -> dict[str, time]:

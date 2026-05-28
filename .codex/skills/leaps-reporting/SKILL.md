@@ -98,14 +98,56 @@ Get-Content data/runtime/portfolio-reports/LEaps_portfolio_report_loop.log -Tail
 
 Never submit orders from a reporting process.
 
-To check the live submit loop, inspect the multi-sleeve loop instead:
+Operator UI value labels are deliberately separate. `EOD` values are
+after-hours daily-performance snapshots and may remain in the payload for
+diagnostics, but they should not be the primary sleeve summary/detail display.
+`Current estimate` first uses the local quote-lane market-data snapshot store
+plus virtual-account cash/holdings and framework-state target plans. It displays
+estimated equity, cumulative realized PnL estimate from the virtual-account
+fill ledger, current unrealized PnL, combined total PnL/return using current
+book value (cash plus holding cost basis) as the return denominator, cash-flow
+adjusted today `+/-` and today `%` versus the latest EOD snapshot, and held `%`
+versus target `%`. Sleeve summary cards should be sorted by current total return
+and show total P&L/return with Today `+/-`/`%` inside the same Total return
+block, plus compact visual bars for total/realized/unrealized PnL and
+stock/cash exposure. The summary panel should include a very compact all-sleeve
+total row with Today `+/-` and Today `%` by currency, and the sleeve detail view
+should support left/right navigation between sleeves. It may fall back to
+`data/runtime/live-order-loop/multi_sleeve_runtime_run_latest_by_sleeve.json`
+only before quote snapshots exist. Missing/stale values are marked
+stale/unavailable instead of falling back. `Cost basis` is virtual-account cash
+plus holding cost basis and is not market-value equity. The UI must not call
+KIS, broker gateways, or market-data providers from the HTTP request path.
+
+To check the live submit loop, inspect the multi-sleeve loop heartbeat and log
+instead:
 
 ```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like '*leaps_multi_sleeve_live_order_loop.ps1*' }
+py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/live_multi_sleeve.json `
+  --heartbeat data/runtime/live-order-loop/multi_sleeve_heartbeat.json `
+  --heartbeat-component multi_sleeve_live_order_loop `
+  --summary-only
 
 Get-Content data/runtime/live-order-loop/multi_sleeve.log -Tail 80 -Encoding UTF8
 ```
+
+After a reboot or operator machine restart, prefer the idempotent safe-start
+wrapper:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File tools\leaps_safe_start_live_stack.ps1
+```
+
+It checks KIS Gateway and broker-engine through HTTP `/health`, checks the
+multi-sleeve live loop/report loops/EOD scheduler through heartbeat JSON
+artifacts, runs strict live preflight, and reads the active sleeve file. It
+starts only missing components and writes the final machine-readable summary to
+`data/runtime/startup/leaps_safe_start_live_stack_status.json`. Use `-DryRun
+true -VerifySeconds 0` when the operator only wants to see what would happen.
+The wrapper must not submit manual/ad-hoc orders; live orders still come only
+from the multi-sleeve live loop. Windows process/PID scanning is opt-in only
+with `-UseProcessScan true`; normal operation should not depend on it.
 
 The multi-sleeve loop hot-reloads at cycle boundaries by draining
 `data/runtime/control/live.jsonl`. Add or remove live sleeves with
@@ -113,11 +155,28 @@ The multi-sleeve loop hot-reloads at cycle boundaries by draining
 `runtime-control-submit --command deactivate-sleeve`; removal is blocked when
 the sleeve still has holdings or open tickets.
 
+When an agent is unsure which files are live, do not infer paths from memory,
+old docs, or a sleeve workspace. Use the artifact index:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-artifact-status configs/runtime/live_multi_sleeve.json `
+  --active-only `
+  --summary-only
+```
+
+This is read-only. It reports active sleeves, broker-account routes, virtual
+account stores, order stores, framework-state files, report-loop files, cycle
+journal, snapshot store, startup status, and live-loop artifacts. It must not
+sync KIS, run models, submit orders, or mutate accounts.
+
 The loop also schedule-gates framework runs. By default `LEaps` is eligible
-during KRX 08:30-18:30 KST, while `us_etf_rotation` is eligible during US
-regular market hours, 09:30-16:00 Eastern Time. A skipped sleeve should appear
-in the live-order-loop log as `skipped=<sleeve>(outside_schedule:...)`; this is
-normal outside that market's strategy window.
+during KRX 08:30-18:30 KST, `kr-lowvol-defensive` during KRX 08:50-15:30 KST,
+and `us_etf_rotation` during US regular market hours, 09:30-16:00 Eastern Time.
+The schedule gate also blocks weekends and dates listed in
+`configs/market-calendars/krx_holidays.json` or
+`configs/market-calendars/us_holidays.json`. A skipped sleeve should appear in
+the live-order-loop log as `skipped=<sleeve>(outside_schedule:...)`,
+`market_weekend`, or `market_holiday:<scope>`.
 
 ## Backtest Report
 

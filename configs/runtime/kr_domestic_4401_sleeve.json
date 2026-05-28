@@ -1,0 +1,154 @@
+{
+  "runtime_id": "kr-domestic-4401",
+  "mode": "live",
+  "timezone": "Asia/Seoul",
+  "market_data": {
+    "provider": "kis-gateway",
+    "history_provider": "kis-cache",
+    "source": "kis-gateway",
+    "history_source": "kis-cache",
+    "rate_limit_per_second": 18,
+    "gateway_base_url": "http://127.0.0.1:8766",
+    "snapshot_store_path": "../../data/market-data-snapshots/kr_domestic_4401.jsonl"
+  },
+  "broker_accounts": [
+    {
+      "account_id": "kis-domestic-4401",
+      "market_scope": "domestic",
+      "currency": "KRW",
+      "account_store_path": "../../data/virtual-accounts/kis_domestic_4401.json",
+      "order_store_path": "../../data/order-runtime/kis_domestic_4401.jsonl",
+      "broker_gateway": "broker-engine",
+      "metadata": {
+        "kis_account_id": "us-growth",
+        "note": "Domestic route for the real KIS account ending 4401/product 01. The env scope is currently KIS_ACCOUNT_US_GROWTH_*; rename the env scope later if desired."
+      }
+    }
+  ],
+  "journal_path": "../../data/cycle-journal/kr_domestic_4401.jsonl",
+  "sleeves": [
+    {
+      "sleeve_id": "kr-domestic-4401",
+      "workspace_path": "sleeves/kr-domestic-4401",
+      "broker_account_id": "kis-domestic-4401",
+      "broker_account_routes": {
+        "domestic": "kis-domestic-4401"
+      },
+      "cash": 0,
+      "cash_by_currency": {
+        "KRW": 0
+      },
+      "universe": {
+        "coarse_path": "configs/universes/kr_domestic_4401_core.json",
+        "fine": {
+          "enabled": false,
+          "refresh_seconds": 300,
+          "max_age_seconds": 300
+        },
+        "active": {
+          "max_symbols": 48,
+          "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
+          "selection_models": [
+            "selections/watchlist.py:WatchlistSelectionModel",
+            "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
+          ],
+          "cadence": "startup_only"
+        }
+      },
+      "indicators": {
+        "warmup_enabled": true,
+        "extra_bars": 80,
+        "min_ready_ratio": 0.95,
+        "refresh_history": false
+      },
+      "alpha": {
+        "modules": [
+          {
+            "ref": "alphas/core_regime_allocator.py",
+            "enabled": true
+          }
+        ],
+        "input_selections": {
+          "kr-domestic-4401-core-regime": "kr-domestic-4401-watchlist"
+        }
+      },
+      "portfolio": {
+        "model": "portfolios/regime_inverse_vol.py",
+        "parameters": {
+          "max_risk_position_pct": 0.1,
+          "max_core_etf_pct": 0.18,
+          "max_defensive_pct": 0.3,
+          "max_hedge_pct": 0.06,
+          "min_position_pct": 0.015,
+          "min_return_volatility": 0.012,
+          "max_gross_increase_pct": 0.35,
+          "max_symbol_increase_pct": 0.08,
+          "whole_share_floor_enabled": true,
+          "whole_share_floor_min_fraction": 0.35,
+          "emit_zero_for_missing_held_targets": false
+        },
+        "rebalance": {
+          "cash_reserve_pct": 0.03,
+          "min_order_notional": 50000.0,
+          "min_order_notional_equity_bps": 50.0,
+          "min_quantity_delta": 1,
+          "allow_exit_below_min_notional": true,
+          "cadence": "daily_at 09:05 Asia/Seoul",
+          "target_churn_guard": true,
+          "target_churn_max_quantity_delta": 2,
+          "target_churn_lot_fraction": 1.0,
+          "target_churn_equity_bps": 50.0,
+          "whole_share_entry_floor_min_fraction": 0.35,
+          "reused_target_churn_guard": true,
+          "reused_target_churn_max_quantity_delta": 2,
+          "reused_target_churn_lot_fraction": 1.0,
+          "reused_target_churn_equity_bps": 50.0
+        },
+        "target_resolution": {
+          "mode": "patch"
+        },
+        "blend": {
+          "enabled": false
+        }
+      },
+      "risk": {
+        "model": "risks/basic.py",
+        "parameters": {
+          "long_only": true,
+          "max_position_pct": 0.35,
+          "max_total_exposure_pct": 0.95,
+          "cash_buffer_pct": 0.03,
+          "require_fresh_for_entries": true,
+          "reject_invalid_snapshot": true
+        }
+      },
+      "execution": {
+        "model": "executions/immediate.py",
+        "parameters": {
+          "tag_prefix": "kr-domestic-4401",
+          "order_type": "limit",
+          "time_in_force": "day",
+          "limit_offset_bps": 6.0,
+          "max_slice_notional": 1000000,
+          "max_slices": 3,
+          "urgency": "normal",
+          "max_order_age_seconds": 900,
+          "price_drift_bps": 70,
+          "min_replace_interval_seconds": 180,
+          "max_replacements": 2,
+          "allow_sells": true,
+          "buy_window": "09:00-15:20 Asia/Seoul",
+          "sell_window": "09:00-15:20 Asia/Seoul",
+          "window_timezone": "Asia/Seoul"
+        }
+      },
+      "worker": {
+        "cycle_interval_seconds": 60,
+        "min_success": 1
+      }
+    }
+  ],
+  "metadata": {
+    "description": "Live-capable but not enrolled KRW-only KRX sleeve for the real KIS account ending 4401/product 01. The active alpha is a core-regime allocator that rotates between KRX broad-market ETFs, liquid large-cap stocks, cash-like ETFs, and a small inverse hedge in shock regimes."
+  }
+}

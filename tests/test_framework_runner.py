@@ -2,15 +2,19 @@ from datetime import datetime
 
 from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightDirection
 from leaps_quant_engine.framework import (
+    BasicRiskManagementModel,
     EqualWeightPortfolioConstructionModel,
     FileFrameworkRunnerStateStore,
     FrameworkRunner,
     PassThroughRiskManagementModel,
+    PortfolioAllocationTarget,
     PortfolioConstructionEngine,
+    PortfolioTargetBatch,
     RebalancePolicy,
 )
+from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import Bar, DataSlice, OrderSide, Symbol
-from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.portfolio import Holding, Portfolio
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, ModelStateKey, StatePatch
 from leaps_quant_engine.snapshots import IndicatorSnapshot, IndicatorValue, SnapshotQualityReport, SnapshotQualityStatus
 
@@ -420,6 +424,175 @@ def test_framework_runner_reuses_portfolio_targets_until_rebalance_cadence_due()
     assert second.portfolio_target_batch.metadata["reused"] is True
     assert second.stage_decisions["portfolio"]["ran"] is False
     assert second.order_intents == ()
+
+
+def test_framework_runner_retries_cash_deferred_buy_after_sell_fill_without_portfolio_rerun():
+    sell_symbol = Symbol("AAPL", "US")
+    buy_symbol = Symbol("MSFT", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 9, 31)
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(None),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="once_per_day"),
+        ),
+    )
+    runner._last_portfolio_run_at = first_time
+    runner._last_portfolio_target_batch = PortfolioTargetBatch(
+        sleeve_id="us-live",
+        generated_at=first_time,
+        targets=(
+            PortfolioAllocationTarget(symbol=buy_symbol, target_percent=1.0, tag="entry"),
+            PortfolioAllocationTarget(symbol=sell_symbol, target_percent=0.0, tag="rebalance_exit"),
+        ),
+    )
+    portfolio = Portfolio(
+        cash=0,
+        holdings={sell_symbol.key: Holding(sell_symbol, quantity=10, average_price=100.0)},
+    )
+
+    first = runner.run_once(
+        indicator_snapshot=_multi_snapshot(first_time, (sell_symbol, buy_symbol)),
+        data=_multi_slice(first_time, (sell_symbol, buy_symbol), close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert first.stage_decisions["portfolio"]["ran"] is False
+    assert first.stage_decisions["target_lifecycle"]["deferred_buy_count"] == 1
+    assert first.stage_decisions["target_lifecycle"]["deferred_buys"][0]["symbol"] == buy_symbol.key
+    assert first.stage_decisions["target_lifecycle"]["deferred_buys"][0]["status"] == "deferred_waiting_for_cash"
+    assert [(order.symbol, order.side, order.quantity) for order in first.order_intents] == [
+        (sell_symbol, OrderSide.SELL, 10)
+    ]
+    for order in first.order_intents:
+        portfolio.apply_fill(order)
+
+    second = runner.run_once(
+        indicator_snapshot=_multi_snapshot(second_time, (sell_symbol, buy_symbol)),
+        data=_multi_slice(second_time, (sell_symbol, buy_symbol), close=100.0),
+        portfolio=portfolio,
+    )
+
+    assert second.stage_decisions["portfolio"]["ran"] is False
+    assert second.portfolio_target_batch.metadata["reused"] is True
+    assert second.stage_decisions["target_lifecycle"]["deferred_buy_count"] == 0
+    assert [(order.symbol, order.side, order.quantity) for order in second.order_intents] == [
+        (buy_symbol, OrderSide.BUY, 10)
+    ]
+
+
+def test_framework_runner_reports_reused_target_blocked_by_closed_session():
+    symbol = Symbol("MSFT", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 20, 1)
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(None),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="once_per_day"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    runner._last_portfolio_run_at = first_time
+    runner._last_portfolio_target_batch = PortfolioTargetBatch(
+        sleeve_id="us-live",
+        generated_at=first_time,
+        targets=(PortfolioAllocationTarget(symbol=symbol, target_percent=1.0, tag="entry"),),
+    )
+
+    result = runner.run_once(
+        indicator_snapshot=_snapshot(second_time, symbol),
+        data=_slice(second_time, symbol, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+        market_session=MarketSession(
+            market_scope="overseas",
+            session_phase="closed",
+            is_orderable=False,
+        ),
+    )
+
+    lifecycle = result.stage_decisions["target_lifecycle"]
+    assert lifecycle["deferred_buy_count"] == 0
+    assert lifecycle["blocked_count"] == 1
+    assert lifecycle["blocked_targets"][0]["status"] == "blocked_by_session"
+    assert lifecycle["blocked_targets"][0]["retriable"] is True
+
+
+def test_framework_runner_reports_risk_reject_as_non_retriable_target_block():
+    symbol = Symbol("MSFT", "US")
+    as_of = datetime(2026, 5, 9, 9, 30)
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(None),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="once_per_day"),
+        ),
+        risk_model=BasicRiskManagementModel(),
+    )
+    runner._last_portfolio_run_at = as_of
+    runner._last_portfolio_target_batch = PortfolioTargetBatch(
+        sleeve_id="us-live",
+        generated_at=as_of,
+        targets=(PortfolioAllocationTarget(symbol=symbol, target_percent=-1.0, tag="short"),),
+    )
+
+    result = runner.run_once(
+        indicator_snapshot=_snapshot(as_of, symbol),
+        data=_slice(as_of, symbol, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    lifecycle = result.stage_decisions["target_lifecycle"]
+    assert lifecycle["deferred_buy_count"] == 0
+    assert lifecycle["blocked_count"] == 1
+    assert lifecycle["blocked_targets"][0]["status"] == "blocked_by_risk"
+    assert lifecycle["blocked_targets"][0]["reason"] == "short_target_rejected"
+    assert lifecycle["blocked_targets"][0]["retriable"] is False
+
+
+def test_framework_runner_parks_unpriced_target_when_reusing_portfolio_batch():
+    priced = Symbol("NVDA", "US")
+    missing = Symbol("MSFT", "US")
+    first_time = datetime(2026, 5, 9, 9, 30)
+    second_time = datetime(2026, 5, 9, 9, 31)
+    runner = FrameworkRunner(
+        sleeve_id="us-live",
+        alpha_runtime=AlphaRuntime(active_models=(OneShotAlpha(None),)),
+        portfolio_engine=PortfolioConstructionEngine(
+            model=EqualWeightPortfolioConstructionModel(),
+            rebalance_policy=RebalancePolicy(cadence="once_per_day"),
+        ),
+        risk_model=PassThroughRiskManagementModel(),
+    )
+    runner._last_portfolio_run_at = first_time
+    runner._last_portfolio_target_batch = PortfolioTargetBatch(
+        sleeve_id="us-live",
+        generated_at=first_time,
+        targets=(
+            PortfolioAllocationTarget(symbol=priced, target_percent=0.5),
+            PortfolioAllocationTarget(symbol=missing, target_percent=0.5),
+        ),
+    )
+
+    result = runner.run_once(
+        indicator_snapshot=_snapshot(second_time, priced),
+        data=_slice(second_time, priced, close=100.0),
+        portfolio=Portfolio(cash=1_000),
+    )
+
+    assert result.stage_decisions["portfolio"]["ran"] is False
+    assert [target.symbol for target in result.portfolio_target_batch.targets] == [priced]
+    assert result.portfolio_target_batch.metadata["parked_unpriced_target_count"] == 1
+    assert result.portfolio_target_batch.metadata["parked_unpriced_target_symbols"] == ["US:MSFT"]
+    assert result.stage_decisions["portfolio"]["parked_unpriced_targets"] == {
+        "count": 1,
+        "symbols": ["US:MSFT"],
+    }
+    assert result.order_sizing_batch.target_count == 1
 
 
 def test_framework_runner_runs_portfolio_again_after_minute_rebalance_cadence():

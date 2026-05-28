@@ -8,7 +8,13 @@ from typing import Any, Iterable, Mapping
 
 from leaps_quant_engine.alpha import AlphaRuntime, Insight, InsightBatch, InsightManager, InsightManagerUpdate, SnapshotContext
 from leaps_quant_engine.cadence import cadence_due, normalize_cadence
-from leaps_quant_engine.execution import ExecutionContext, ExecutionEngine, ImmediateExecutionModel, OrderIntentBatch
+from leaps_quant_engine.execution import (
+    ExecutionContext,
+    ExecutionEngine,
+    ImmediateExecutionModel,
+    OrderIntentBatch,
+    PendingOrderState,
+)
 from leaps_quant_engine.framework.portfolio_construction import (
     EqualWeightPortfolioConstructionModel,
     PortfolioConstructionEngine,
@@ -267,6 +273,7 @@ class FrameworkRunner:
         alpha_symbols_by_model: Mapping[str, Iterable[Symbol | str]] | None = None,
         market_session: MarketSession | None = None,
         market_sessions: Mapping[str, MarketSession] | None = None,
+        pending_orders: PendingOrderState | None = None,
     ) -> FrameworkCycleResult:
         context = SnapshotContext.from_indicator_snapshot(
             indicator_snapshot,
@@ -275,6 +282,7 @@ class FrameworkRunner:
         )
 
         started = time.perf_counter()
+        quality_report = context.quality_report
         invalid_snapshot = _snapshot_quality_invalid(context)
         if invalid_snapshot:
             insight_batch = InsightBatch(
@@ -299,6 +307,14 @@ class FrameworkRunner:
                 insight_batch = _suppress_new_entry_insights_for_freshness(insight_batch, context)
         alpha_ms = _elapsed_ms(started)
         stage_decisions: dict[str, Any] = {
+            "data": {
+                "data_slice_resolution": data.resolution,
+                "indicator_snapshot_lane": indicator_snapshot.lane,
+                "snapshot_quality": quality_report.to_dict() if quality_report is not None else None,
+                "allows_new_entries": context.allows_new_entries,
+                "allows_risk_checks": context.allows_risk_checks,
+                "invalid_snapshot": invalid_snapshot,
+            },
             "alpha": dict(insight_batch.metadata),
         }
 
@@ -368,6 +384,14 @@ class FrameworkRunner:
                 )
             else:
                 reused_batch = _reuse_portfolio_target_batch(self._last_portfolio_target_batch, data.time)
+                if _has_unpriced_entry_target(portfolio_context, reused_batch):
+                    reused_batch = self.portfolio_engine.build_target_batch_from_targets(
+                        portfolio_context,
+                        reused_batch,
+                        reused_batch.targets,
+                        reason=reused_batch.reason,
+                        metadata={"reused": True},
+                    )
                 portfolio_target_batch = self._advance_portfolio_blend(
                     portfolio_context,
                     reused_batch,
@@ -387,6 +411,15 @@ class FrameworkRunner:
             ),
             "portfolio_blend": dict(portfolio_target_batch.metadata.get("portfolio_blend") or {}),
             "target_resolution": dict(portfolio_target_batch.metadata.get("portfolio_target_resolution") or {}),
+            "excluded_universe_mismatch_insights": {
+                "count": portfolio_target_batch.metadata.get("excluded_universe_mismatch_insight_count", 0),
+                "symbols": list(portfolio_target_batch.metadata.get("excluded_universe_mismatch_symbols") or []),
+                "insight_ids": list(portfolio_target_batch.metadata.get("excluded_universe_mismatch_insight_ids") or []),
+            },
+            "parked_unpriced_targets": {
+                "count": portfolio_target_batch.metadata.get("parked_unpriced_target_count", 0),
+                "symbols": list(portfolio_target_batch.metadata.get("parked_unpriced_target_symbols") or []),
+            },
         }
 
         started = time.perf_counter()
@@ -413,6 +446,15 @@ class FrameworkRunner:
             )
         )
         risk_ms = _elapsed_ms(started)
+        stage_decisions["target_lifecycle"] = _target_lifecycle_report(
+            portfolio=portfolio,
+            data=data,
+            target_batch=portfolio_target_batch,
+            order_sizing_batch=order_sizing_batch,
+            risk_decisions=risk_decisions,
+            market_session=market_session,
+            market_sessions=dict(market_sessions or {}),
+        )
 
         started = time.perf_counter()
         execution_batch = self.execution_engine.execute(
@@ -425,6 +467,9 @@ class FrameworkRunner:
                 market_session=market_session,
                 market_sessions=dict(market_sessions or {}),
                 model_state=self._model_state_view(),
+                pending_orders=pending_orders or PendingOrderState(),
+                target_batch_id=order_sizing_batch.batch_id,
+                source_target_batch_id=order_sizing_batch.source_batch_id,
             )
         )
         orders = execution_batch.order_intents
@@ -613,3 +658,103 @@ def _reuse_portfolio_target_batch(batch: PortfolioTargetBatch, generated_at: dat
         metadata=metadata,
         state_patches=(),
     )
+
+
+def _has_unpriced_entry_target(context: PortfolioConstructionContext, batch: PortfolioTargetBatch) -> bool:
+    return any(
+        abs(target.target_percent) > 1e-12
+        and context.portfolio.quantity(target.symbol) == 0
+        and context.data.get(target.symbol) is None
+        for target in batch.targets
+    )
+
+
+def _target_lifecycle_report(
+    *,
+    portfolio: Portfolio,
+    data: DataSlice,
+    target_batch: PortfolioTargetBatch,
+    order_sizing_batch: OrderSizingBatch,
+    risk_decisions: RiskDecisionBatch,
+    market_session: MarketSession | None = None,
+    market_sessions: Mapping[str, MarketSession] | None = None,
+) -> dict[str, Any]:
+    deferred: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    deferred_reasons = {"insufficient_cash"}
+    sessions = dict(market_sessions or {})
+    if market_session is not None:
+        sessions.setdefault(market_session.market_scope, market_session)
+    for decision in risk_decisions.decisions:
+        target = decision.original_target
+        current_quantity = portfolio.quantity(target.symbol)
+        requested_delta = int(target.quantity) - int(current_quantity)
+        if requested_delta == 0:
+            continue
+        approved_quantity = decision.approved_target.quantity if decision.approved_target is not None else current_quantity
+        deferred_quantity = max(0, int(target.quantity) - int(approved_quantity))
+        reason = str(decision.reason or "")
+        if requested_delta > 0 and deferred_quantity > 0 and reason in deferred_reasons:
+            deferred.append(
+                {
+                    "symbol": target.symbol.key,
+                    "status": "deferred_waiting_for_cash",
+                    "reason": reason,
+                    "current_quantity": current_quantity,
+                    "target_quantity": target.quantity,
+                    "approved_quantity": approved_quantity,
+                    "deferred_quantity": deferred_quantity,
+                    "price": portfolio.mark_price(target.symbol, data),
+                    "metadata": dict(decision.metadata),
+                }
+            )
+            continue
+        if decision.approved_target is None or str(decision.status.value) == "rejected":
+            blocked.append(
+                {
+                    "symbol": target.symbol.key,
+                    "status": "blocked_by_risk",
+                    "reason": reason,
+                    "current_quantity": current_quantity,
+                    "target_quantity": target.quantity,
+                    "approved_quantity": None,
+                    "retriable": False,
+                    "metadata": dict(decision.metadata),
+                }
+            )
+            continue
+        session = sessions.get(_market_scope_for_symbol(target.symbol))
+        if session is not None and not session.is_orderable:
+            blocked.append(
+                {
+                    "symbol": target.symbol.key,
+                    "status": "blocked_by_session",
+                    "reason": f"session_not_orderable:{session.session_phase}",
+                    "current_quantity": current_quantity,
+                    "target_quantity": target.quantity,
+                    "approved_quantity": approved_quantity,
+                    "retriable": True,
+                    "market_session": session.to_dict(),
+                }
+            )
+    return {
+        "source_target_batch_id": target_batch.batch_id,
+        "order_sizing_batch_id": order_sizing_batch.batch_id,
+        "target_validity": "until_next_portfolio_retarget_or_session_expiry",
+        "wake_conditions": [
+            "fill_event_applied_to_virtual_account",
+            "cash_or_position_changed",
+            "new_price_snapshot",
+            "next_execution_cadence",
+            "operator_retarget_or_retry",
+        ],
+        "deferred_buy_count": len(deferred),
+        "deferred_buys": deferred,
+        "blocked_count": len(blocked),
+        "blocked_targets": blocked,
+    }
+
+
+def _market_scope_for_symbol(symbol: Symbol) -> str:
+    market = symbol.market.strip().upper()
+    return "domestic" if market in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"} else "overseas"

@@ -1740,7 +1740,12 @@ def _is_kis_rate_limit_error(text: str) -> bool:
 
 
 def _is_kis_sor_unavailable_error(text: str) -> bool:
-    return "APBK3009" in text
+    normalized = str(text or "")
+    return (
+        "APBK3009" in normalized
+        or "APBK3026" in normalized
+        or "NXT 상장종목인지 확인" in normalized
+    )
 
 
 def _clamp_rate_limit(value: Any, *, mock: bool) -> int:

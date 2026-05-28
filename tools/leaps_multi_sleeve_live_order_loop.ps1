@@ -1,6 +1,6 @@
 param(
     [string]$Config = "configs/runtime/live_multi_sleeve.json",
-    [string[]]$SleeveIds = @("LEaps", "us_etf_rotation"),
+    [string[]]$SleeveIds = @("LEaps", "kr-lowvol-defensive", "us_etf_rotation"),
     [int]$IntervalSeconds = 60,
     [Nullable[double]]$DomesticMaxSubmitNotional = $null,
     [Nullable[double]]$OverseasMaxSubmitNotional = $null,
@@ -12,10 +12,18 @@ param(
     [string]$SubmitStatePath = "data/runtime/live-order-loop/multi_sleeve_submit_state.json",
     [string]$ControlQueue = "data/runtime/control/live.jsonl",
     [string]$ActiveSleevesPath = "data/runtime/live-order-loop/multi_sleeve_active_sleeves.json",
+    [string]$HeartbeatPath = "data/runtime/live-order-loop/multi_sleeve_heartbeat.json",
     [string]$HotReload = "true",
     [string[]]$SleeveSchedules = @(
         "LEaps|Korea Standard Time|09:00-18:30",
+        "kr-lowvol-defensive|Korea Standard Time|08:50-15:30",
+        "kr-domestic-4401|Korea Standard Time|09:00-15:30",
+        "semiconduct-kor|Korea Standard Time|09:00-15:30",
         "us_etf_rotation|Eastern Standard Time|09:30-16:00"
+    ),
+    [string[]]$MarketHolidayFiles = @(
+        "domestic=configs/market-calendars/krx_holidays.json",
+        "overseas=configs/market-calendars/us_holidays.json"
     ),
     [string]$SkipReconcile = "true",
     [int]$ReconcileEveryCycles = 5,
@@ -60,6 +68,7 @@ $script:SleeveIds = @(Normalize-SleeveIds -Items $SleeveIds)
 $script:Paused = $false
 $script:ShutdownRequested = $false
 $script:LastRunAtBySleeve = @{}
+$script:MarketHolidayCache = @{}
 $hotReloadEnabled = $HotReload -notmatch '^(false|0|no)$'
 
 $logFullPath = Resolve-LoopPath $LogPath
@@ -78,11 +87,50 @@ $controlQueueFullPath = Resolve-LoopPath $ControlQueue
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $controlQueueFullPath) | Out-Null
 $activeSleevesFullPath = Resolve-LoopPath $ActiveSleevesPath
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $activeSleevesFullPath) | Out-Null
+$heartbeatFullPath = Resolve-LoopPath $HeartbeatPath
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $heartbeatFullPath) | Out-Null
 
 function Write-LoopLog {
     param([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $logFullPath -Value "[$timestamp] $Message" -Encoding UTF8
+}
+
+function Write-LoopHeartbeat {
+    param(
+        [string]$Status,
+        [string]$Phase,
+        [int]$CycleIndexValue = 0,
+        [string[]]$ScheduledSleeveIds = @(),
+        [hashtable]$Metadata = @{}
+    )
+    $payload = [ordered]@{
+        schema_version = "runtime_heartbeat.v1"
+        runtime_id = "live_multi_sleeve"
+        component = "multi_sleeve_live_order_loop"
+        status = $Status
+        updated_at = (Get-Date).ToString("o")
+        config_path = $script:Config
+        config_version = ""
+        sleeve_ids = @($script:SleeveIds)
+        cycle_index = $CycleIndexValue
+        process_id = $PID
+        metadata = [ordered]@{
+            phase = $Phase
+            scheduled_sleeve_ids = @($ScheduledSleeveIds)
+            process_id_liveness_checked = $false
+        }
+    }
+    foreach ($key in $Metadata.Keys) {
+        $payload.metadata[$key] = $Metadata[$key]
+    }
+    try {
+        $tmp = "$heartbeatFullPath.tmp"
+        $payload | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $heartbeatFullPath -Force
+    } catch {
+        Write-LoopLog "heartbeat write failed path=$heartbeatFullPath error=$($_.Exception.Message)"
+    }
 }
 
 function Test-FlagEnabled {
@@ -139,6 +187,79 @@ function Get-SleeveSchedule {
     return $null
 }
 
+function Get-MarketScopeForSchedule {
+    param([object]$Schedule)
+    $timezone = [string]$Schedule.timezone
+    if ($timezone -like "*Eastern*") {
+        return "overseas"
+    }
+    if ($timezone -like "*Korea*") {
+        return "domestic"
+    }
+    return ""
+}
+
+function Get-HolidayFileForMarketScope {
+    param([string]$MarketScope)
+    foreach ($spec in @($MarketHolidayFiles)) {
+        $parts = ([string]$spec) -split "=", 2
+        if ($parts.Count -eq 2 -and $parts[0].Trim() -eq $MarketScope) {
+            return $parts[1].Trim()
+        }
+    }
+    return ""
+}
+
+function Get-MarketHolidayDates {
+    param([string]$MarketScope)
+    if (-not $MarketScope) {
+        return @()
+    }
+    if ($script:MarketHolidayCache.ContainsKey($MarketScope)) {
+        return @($script:MarketHolidayCache[$MarketScope])
+    }
+    $holidayDates = @()
+    $holidayFile = Get-HolidayFileForMarketScope -MarketScope $MarketScope
+    if ($holidayFile) {
+        $holidayPath = Resolve-LoopPath $holidayFile
+        if (Test-Path $holidayPath) {
+            try {
+                $payload = Get-Content $holidayPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $rawItems = @()
+                if ($payload -is [System.Array]) {
+                    $rawItems = @($payload)
+                } elseif ($payload.PSObject.Properties.Name -contains "holidays") {
+                    $rawItems = @($payload.holidays)
+                }
+                $holidayDates = @($rawItems | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+            } catch {
+                Write-LoopLog "holiday file parse failed market_scope=$MarketScope path=$holidayPath error=$($_.Exception.Message)"
+            }
+        } else {
+            Write-LoopLog "holiday file missing market_scope=$MarketScope path=$holidayPath"
+        }
+    }
+    $script:MarketHolidayCache[$MarketScope] = @($holidayDates)
+    return @($holidayDates)
+}
+
+function Test-MarketClosedDate {
+    param(
+        [object]$Schedule,
+        [datetime]$MarketNow
+    )
+    if ($MarketNow.DayOfWeek -in @([System.DayOfWeek]::Saturday, [System.DayOfWeek]::Sunday)) {
+        return [pscustomobject]@{ closed = $true; reason = "market_weekend" }
+    }
+    $marketScope = Get-MarketScopeForSchedule -Schedule $Schedule
+    $dateText = $MarketNow.ToString("yyyy-MM-dd")
+    $holidayDates = @(Get-MarketHolidayDates -MarketScope $marketScope)
+    if ($holidayDates -contains $dateText) {
+        return [pscustomobject]@{ closed = $true; reason = "market_holiday:$marketScope" }
+    }
+    return [pscustomobject]@{ closed = $false; reason = "" }
+}
+
 function Test-TimeWindow {
     param(
         [TimeSpan]$NowTime,
@@ -192,6 +313,14 @@ function Test-SleeveScheduledNow {
             active = $false
             reason = "invalid_timezone"
             market_time = ""
+        }
+    }
+    $closedDate = Test-MarketClosedDate -Schedule $schedule -MarketNow $marketNow
+    if ($closedDate.closed) {
+        return [pscustomobject]@{
+            active = $false
+            reason = $closedDate.reason
+            market_time = $marketNow.ToString("yyyy-MM-dd HH:mm:ss")
         }
     }
     foreach ($window in @($schedule.windows)) {
@@ -503,6 +632,14 @@ function Apply-HotReloadControls {
                 $candidate = @($script:SleeveIds | Where-Object { $_ -ne $commandSleeveId })
                 [void](Set-ActiveSleeves -ConfigPath $commandConfig -CandidateSleeveIds $candidate -Source "control:deactivate_sleeve:$commandSleeveId" -CheckRemovedSleeves $true)
             }
+            "suspend_sleeve" {
+                $candidate = @($script:SleeveIds | Where-Object { $_ -ne $commandSleeveId })
+                [void](Set-ActiveSleeves -ConfigPath $commandConfig -CandidateSleeveIds $candidate -Source "control:suspend_sleeve:$commandSleeveId" -CheckRemovedSleeves $false)
+            }
+            "resume_sleeve" {
+                $candidate = @($script:SleeveIds + $commandSleeveId)
+                [void](Set-ActiveSleeves -ConfigPath $commandConfig -CandidateSleeveIds $candidate -Source "control:resume_sleeve:$commandSleeveId" -CheckRemovedSleeves $false)
+            }
             "pause_worker" {
                 $script:Paused = $true
                 Write-LoopLog "hot-reload applied pause_worker"
@@ -725,21 +862,92 @@ function Invoke-OrderRuntimeSupervise {
     Write-LoopLog "$Phase order-runtime-supervise exit=$LASTEXITCODE output=$superviseOutputPath"
 }
 
+function Update-LatestBySleeveRuntimeArtifact {
+    param(
+        [string]$RunOutputPath,
+        [string]$LatestBySleevePath
+    )
+    if (-not (Test-Path -LiteralPath $RunOutputPath)) {
+        Write-LoopLog "latest-by-sleeve update skipped: missing run output path=$RunOutputPath"
+        return
+    }
+    try {
+        $run = Get-Content -LiteralPath $RunOutputPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $latest = $null
+        if (Test-Path -LiteralPath $LatestBySleevePath) {
+            $latest = Get-Content -LiteralPath $LatestBySleevePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+        if ($null -eq $latest) {
+            $latest = [pscustomobject]@{
+                schema_version = "multi_sleeve_runtime_latest_by_sleeve.v1"
+                generated_at = $null
+                runtime_id = $null
+                config_version = $null
+                source_path = $null
+                latest_by_sleeve = [pscustomobject]@{}
+            }
+        }
+        if ($null -eq $latest.PSObject.Properties["latest_by_sleeve"]) {
+            $latest | Add-Member -NotePropertyName "latest_by_sleeve" -NotePropertyValue ([pscustomobject]@{})
+        }
+        if ($null -eq $latest.latest_by_sleeve) {
+            $latest.latest_by_sleeve = [pscustomobject]@{}
+        }
+        foreach ($report in @($run.reports)) {
+            $sleeveId = [string]$report.sleeve_id
+            if ([string]::IsNullOrWhiteSpace($sleeveId)) {
+                continue
+            }
+            $entry = [pscustomobject]@{
+                sleeve_id = $sleeveId
+                updated_at = $run.completed_at
+                source_run_started_at = $run.started_at
+                source_run_completed_at = $run.completed_at
+                source_run_path = $RunOutputPath
+                market_snapshot = $run.market_snapshot
+                report = $report
+            }
+            $property = $latest.latest_by_sleeve.PSObject.Properties[$sleeveId]
+            if ($null -eq $property) {
+                $latest.latest_by_sleeve | Add-Member -NotePropertyName $sleeveId -NotePropertyValue $entry
+            } else {
+                $property.Value = $entry
+            }
+        }
+        $latest.generated_at = (Get-Date).ToString("o")
+        $latest.runtime_id = $run.runtime_id
+        $latest.config_version = $run.config_version
+        $latest.source_path = $RunOutputPath
+        $parent = Split-Path -Parent $LatestBySleevePath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        $latest | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $LatestBySleevePath -Encoding UTF8
+        $count = @($latest.latest_by_sleeve.PSObject.Properties).Count
+        Write-LoopLog "latest-by-sleeve updated path=$LatestBySleevePath sleeve_count=$count"
+    } catch {
+        Write-LoopLog "latest-by-sleeve update failed: $($_.Exception.Message)"
+    }
+}
+
 Initialize-ActiveSleeveState
 
 Write-LoopLog "multi-sleeve live order loop started config=$script:Config sleeves=$($script:SleeveIds -join ',') interval=${IntervalSeconds}s domestic_max=$(Format-SubmitNotionalCap $DomesticMaxSubmitNotional) overseas_max=$(Format-SubmitNotionalCap $OverseasMaxSubmitNotional) framework_state_dir=$FrameworkStateDir runtime_state=$runtimeStateFullPath hot_reload=$hotReloadEnabled control_queue=$controlQueueFullPath active_sleeves=$activeSleevesFullPath schedules=$($SleeveSchedules -join ';')"
-Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath submit_state=$submitStateFullPath"
+Write-LoopLog "resolved paths order_batch=$orderBatchFullPath journal=$journalFullPath log=$logFullPath submit_state=$submitStateFullPath heartbeat=$heartbeatFullPath"
 $cycleIndex = 0
+Write-LoopHeartbeat -Status "running" -Phase "started" -CycleIndexValue $cycleIndex
 
 while ($true) {
     try {
         Apply-HotReloadControls
         if ($script:ShutdownRequested) {
             Write-LoopLog "loop shutdown before cycle"
+            Write-LoopHeartbeat -Status "shutdown" -Phase "shutdown_requested" -CycleIndexValue $cycleIndex
             break
         }
         if ($script:Paused) {
             Write-LoopLog "cycle paused sleeves=$($script:SleeveIds -join ',')"
+            Write-LoopHeartbeat -Status "paused" -Phase "paused" -CycleIndexValue $cycleIndex
             Invoke-OrderRuntimeSupervise -Phase "paused-cycle"
             Start-Sleep -Seconds $IntervalSeconds
             continue
@@ -748,6 +956,7 @@ while ($true) {
         $schedule = Get-ScheduledSleeveIds
         $scheduledSleeveIds = @($schedule.sleeve_ids)
         Write-LoopLog "cycle begin config=$script:Config active_sleeves=$($script:SleeveIds -join ',') scheduled_sleeves=$($scheduledSleeveIds -join ',') skipped=$($schedule.skipped -join ';')"
+        Write-LoopHeartbeat -Status "running" -Phase "cycle_begin" -CycleIndexValue $cycleIndex -ScheduledSleeveIds $scheduledSleeveIds -Metadata @{ skipped = @($schedule.skipped) }
         $notifyThisCycle = $false
         $reconcileThisCycle = ($ReconcileEveryCycles -gt 0 -and (($cycleIndex % $ReconcileEveryCycles) -eq 0))
         Invoke-OrderRuntimeSupervise -Phase "pre-cycle"
@@ -755,6 +964,7 @@ while ($true) {
         $runExit = 0
         if ($scheduledSleeveIds.Count -le 0) {
             Write-LoopLog "runtime-run-multi-once skipped: no scheduled sleeves"
+            Write-LoopHeartbeat -Status "idle" -Phase "no_scheduled_sleeves" -CycleIndexValue $cycleIndex -Metadata @{ skipped = @($schedule.skipped) }
         } else {
             $runArgs = Add-SleeveArgs @(
                 "-3", "-m", "leaps_quant_engine.cli", "runtime-run-multi-once", $script:Config,
@@ -769,6 +979,8 @@ while ($true) {
             $runExit = $LASTEXITCODE
             Write-LoopLog "runtime-run-multi-once exit=$runExit sleeves=$($scheduledSleeveIds -join ',') output=$runOutputPath"
             if ($runExit -eq 0) {
+                $latestBySleevePath = Join-Path (Split-Path -Parent $logFullPath) "multi_sleeve_runtime_run_latest_by_sleeve.json"
+                Update-LatestBySleeveRuntimeArtifact -RunOutputPath $runOutputPath -LatestBySleevePath $latestBySleevePath
                 Mark-SleevesRan -SleeveIdsForRun $scheduledSleeveIds
             }
         }
@@ -839,8 +1051,10 @@ while ($true) {
 
         Invoke-OrderRuntimeSupervise -Phase "post-cycle" -Notify $notifyThisCycle -AllowReconcile ($notifyThisCycle -or $reconcileThisCycle)
         Write-LoopLog "cycle end"
+        Write-LoopHeartbeat -Status "running" -Phase "cycle_end" -CycleIndexValue $cycleIndex -ScheduledSleeveIds $scheduledSleeveIds -Metadata @{ run_exit = $runExit }
     } catch {
         Write-LoopLog "cycle exception: $($_.Exception.Message)"
+        Write-LoopHeartbeat -Status "error" -Phase "cycle_exception" -CycleIndexValue $cycleIndex -Metadata @{ error = $_.Exception.Message }
     }
 
     Start-Sleep -Seconds $IntervalSeconds

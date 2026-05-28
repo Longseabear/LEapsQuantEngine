@@ -222,10 +222,10 @@ def build_sleeve_daily_performance_report(
 def _snapshots_from_runtime_file(path: Path, root: Path) -> tuple[SleeveDailySnapshot, ...]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     current = _current_portfolio_payload(payload)
-    sleeve_id = str(current.get("sleeve_id") or payload.get("sleeve_id") or "")
+    sleeve_id = _sleeve_id_from_payload(payload, current)
     if not sleeve_id:
         raise ValueError("missing sleeve_id")
-    as_of = _parse_datetime(str(current.get("as_of") or payload.get("generated_at") or payload.get("as_of") or ""))
+    as_of = _parse_datetime(_as_of_from_payload(payload, current))
     date, label, target_label = _path_metadata(path, root, as_of)
     holdings = _holding_snapshots(current)
     currencies = _portfolio_currencies(current, holdings)
@@ -278,6 +278,30 @@ def _current_portfolio_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     if isinstance(portfolio, Mapping):
         return portfolio
     return {}
+
+
+def _sleeve_id_from_payload(payload: Mapping[str, Any], current: Mapping[str, Any]) -> str:
+    direct = str(current.get("sleeve_id") or payload.get("sleeve_id") or "").strip()
+    if direct:
+        return direct
+    framework = payload.get("framework") if isinstance(payload.get("framework"), Mapping) else {}
+    batch = framework.get("portfolio_target_batch") if isinstance(framework.get("portfolio_target_batch"), Mapping) else {}
+    batch_sleeve = str(batch.get("sleeve_id") or "").strip()
+    if batch_sleeve:
+        return batch_sleeve
+    report_source = payload.get("report_source") if isinstance(payload.get("report_source"), Mapping) else {}
+    return str(report_source.get("sleeve_id") or "").strip()
+
+
+def _as_of_from_payload(payload: Mapping[str, Any], current: Mapping[str, Any]) -> str:
+    report_source = payload.get("report_source") if isinstance(payload.get("report_source"), Mapping) else {}
+    return str(
+        current.get("as_of")
+        or payload.get("generated_at")
+        or payload.get("as_of")
+        or report_source.get("generated_at")
+        or ""
+    )
 
 
 def _holding_snapshots(current: Mapping[str, Any]) -> tuple[SleeveHoldingSnapshot, ...]:

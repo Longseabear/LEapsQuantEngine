@@ -237,6 +237,45 @@ def test_leaps_portfolio_report_fast_current_hides_latest_target(tmp_path, monke
     assert "- 주문 후보: 0건" in output
     assert "- 미체결 티켓: 1건" in output
 
+def test_leaps_portfolio_report_uses_latest_quote_snapshot_price(tmp_path):
+    config_path, account_path, framework_state_path, order_batch_path, order_status_path = _write_fast_report_fixtures(tmp_path)
+    snapshot_path = tmp_path / "market-data.jsonl"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "snapshot": {
+                    "snapshot_id": "quote-1",
+                    "bars": [
+                        {
+                            "symbol": {"market": "KRX", "ticker": "005930"},
+                            "close": 120_000,
+                        }
+                    ],
+                }
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    config_payload["market_data"] = {"snapshot_store_path": str(snapshot_path)}
+    config_path.write_text(json.dumps(config_payload, ensure_ascii=False), encoding="utf-8")
+
+    payload = report_module._build_fast_report_payload(
+        config=config_path,
+        sleeve_id="LEaps",
+        mode="latest-target",
+        account_store_path=account_path,
+        framework_state_path=framework_state_path,
+        order_batch_path=order_batch_path,
+        order_status_payload=json.loads(order_status_path.read_text(encoding="utf-8")),
+    )
+
+    holding = payload["portfolio_state"]["current"]["holdings"][0]
+    assert holding["market_price"] == 120_000
+    assert payload["portfolio_state"]["current"]["equity"] == 1_120_000
+
 
 def _write_fast_report_fixtures(tmp_path):
     config_path = tmp_path / "runtime.json"

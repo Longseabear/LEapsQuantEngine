@@ -18,7 +18,7 @@ from leaps_quant_engine.adapters.kis import KISCachedMarketDataProvider, MarketD
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader
 from leaps_quant_engine.broker_routing import market_scope_for_symbol, market_scope_from_market
 from leaps_quant_engine.cadence import cadence_due, normalize_cadence
-from leaps_quant_engine.execution import ExecutionEngine
+from leaps_quant_engine.execution import ExecutionEngine, PendingOrderState
 from leaps_quant_engine.execution_model_loader import PythonExecutionModelLoader
 from leaps_quant_engine.framework import (
     FrameworkCycleResult,
@@ -38,6 +38,7 @@ from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.market_data import MarketDataProvider
 from leaps_quant_engine.market_data_snapshot import FileMarketDataSnapshotStore
 from leaps_quant_engine.models import Bar, DataSlice, Symbol
+from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.portfolio import Portfolio, PortfolioProvider, StaticPortfolioProvider
 from leaps_quant_engine.portfolio_state import PortfolioEngineState
 from leaps_quant_engine.runtime_state import ModelStateKey, StatePatch, RuntimeStateStore
@@ -315,6 +316,7 @@ class RuntimeSleeveRuntime:
             alpha_symbols_by_model=pending._alpha_symbols_by_model(),
             market_session=pending._primary_market_session(market_sessions),
             market_sessions=market_sessions,
+            pending_orders=pending._pending_order_state(active_snapshot.as_of),
         )
 
     def _run_framework_once(self) -> FrameworkCycleResult | None:
@@ -332,6 +334,7 @@ class RuntimeSleeveRuntime:
             alpha_symbols_by_model=self._alpha_symbols_by_model(),
             market_session=self._primary_market_session(market_sessions),
             market_sessions=market_sessions,
+            pending_orders=self._pending_order_state(data.time),
         )
 
     def _alpha_symbols_by_model(self) -> dict[str, tuple[Symbol, ...]] | None:
@@ -377,6 +380,21 @@ class RuntimeSleeveRuntime:
             for scope in sorted(scopes)
             if scope in {"domestic", "overseas"}
         }
+
+    def _pending_order_state(self, as_of: datetime) -> PendingOrderState:
+        tickets = []
+        for order_store_path in _order_store_paths_for_sleeve(self.snapshot, self.sleeve_config):
+            if not order_store_path.exists():
+                continue
+            try:
+                tickets.extend(
+                    FileOrderRuntimeStateStore(order_store_path)
+                    .snapshot(captured_at=as_of)
+                    .open_tickets
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        return PendingOrderState.from_order_tickets(tickets, sleeve_id=self.sleeve_id, as_of=as_of)
 
     def _agent_status(self, report: "RuntimeRunOnceReport") -> dict[str, Any]:
         cycle = report.worker.cycles[-1] if report.worker.cycles else None
@@ -727,9 +745,17 @@ def _build_portfolio_engine(
         rebalance_policy=RebalancePolicy(
             cash_reserve_pct=rebalance_config.cash_reserve_pct,
             min_order_notional=rebalance_config.min_order_notional,
+            min_order_notional_equity_bps=rebalance_config.min_order_notional_equity_bps,
             min_quantity_delta=rebalance_config.min_quantity_delta,
             allow_exit_below_min_notional=rebalance_config.allow_exit_below_min_notional,
             cadence=rebalance_config.cadence,
+            target_churn_guard=rebalance_config.target_churn_guard,
+            target_churn_max_quantity_delta=rebalance_config.target_churn_max_quantity_delta,
+            target_churn_lot_fraction=rebalance_config.target_churn_lot_fraction,
+            target_churn_equity_bps=rebalance_config.target_churn_equity_bps,
+            whole_share_entry_floor_min_fraction=rebalance_config.whole_share_entry_floor_min_fraction,
+            whole_share_rounding_churn_guard=rebalance_config.whole_share_rounding_churn_guard,
+            whole_share_rounding_churn_min_fraction=rebalance_config.whole_share_rounding_churn_min_fraction,
             reused_target_churn_guard=rebalance_config.reused_target_churn_guard,
             reused_target_churn_max_quantity_delta=rebalance_config.reused_target_churn_max_quantity_delta,
             reused_target_churn_lot_fraction=rebalance_config.reused_target_churn_lot_fraction,
@@ -858,6 +884,27 @@ def _portfolio_account_store_path(
     return sleeve_config.portfolio.account_store_path
 
 
+def _order_store_paths_for_sleeve(
+    snapshot: RuntimeConfigSnapshot,
+    sleeve_config: SleeveRuntimeConfig,
+) -> tuple[Path, ...]:
+    account_ids: list[str] = []
+    if sleeve_config.broker_account_id:
+        account_ids.append(sleeve_config.broker_account_id)
+    account_ids.extend(str(account_id) for account_id in sleeve_config.broker_account_routes.values() if account_id)
+
+    paths: list[Path] = []
+    for account_id in dict.fromkeys(account_ids):
+        try:
+            account = snapshot.config.broker_account(account_id)
+        except KeyError:
+            continue
+        if account.order_store_path is None:
+            continue
+        paths.append(resolve_runtime_path(snapshot, account.order_store_path).resolve())
+    return tuple(dict.fromkeys(paths))
+
+
 def _build_selection_model(
     reference: ModuleReference,
     sleeve_config: SleeveRuntimeConfig,
@@ -877,6 +924,15 @@ def _build_selection_model(
         kwargs["max_active_symbols"] = sleeve_config.universe.active.max_symbols
     elif "max_symbols" in signature.parameters:
         kwargs["max_symbols"] = sleeve_config.universe.active.max_symbols
+    portfolio_parameters = dict(sleeve_config.portfolio.parameters)
+    for parameter_name in ("target_path", "default_market", "allowed_markets", "require_sleeve_id"):
+        if parameter_name in signature.parameters and parameter_name in portfolio_parameters:
+            kwargs[parameter_name] = portfolio_parameters[parameter_name]
+    if "max_age_hours" in signature.parameters:
+        if "max_age_hours" in portfolio_parameters:
+            kwargs["max_age_hours"] = portfolio_parameters["max_age_hours"]
+        elif "max_target_age_hours" in portfolio_parameters:
+            kwargs["max_age_hours"] = portfolio_parameters["max_target_age_hours"]
     return _validate_selection_model(loaded(**kwargs))
 
 

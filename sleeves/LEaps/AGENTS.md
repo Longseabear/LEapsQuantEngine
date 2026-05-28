@@ -42,35 +42,38 @@ metadata after deciding the symbol is actionable. If the window is missing, the
 temporal PPO portfolio path must fail closed rather than inventing candidates
 or repeating the latest token.
 
-Current LEaps alpha input wiring is intentional:
+Current LEaps live target wiring is intentionally alpha-less. The active
+`live_multi_sleeve` profile reads `data/operator-targets/LEaps/latest_target.json`
+through `selections/agent_daily_target.py` and
+`portfolios/agent_daily_target.py`.
 
 ```text
-leaps-stock-momentum       -> leaps-kospi-conviction
-leaps-etf-rotation         -> leaps-us-stability-hedge
-leaps-operational-symbols  -> leaps-volatility-trailing-stop
+agent daily target artifact
+  -> leaps-agent-daily-target selection
+  -> AgentDailyTargetPortfolioModel target percentages
+  -> risk
+  -> execution
 ```
 
-`leaps-stock-momentum` is KRX-only so US single stocks cannot consume KOSPI
-alpha candidate slots. ETF rotation is for US ETF hedge/stability candidates.
-Operational symbols exist so held/open/manual symbols remain visible to exit or
-stop logic even when they are not selected as fresh entries.
+Alpha research modules remain in the workspace, but the active config sets
+`alpha.modules=[]`. Do not reintroduce an alpha module into live just to make a
+portfolio target. If the target artifact is missing or stale, portfolio
+construction must fail closed by emitting no fresh batch. If the artifact is
+valid and omits a held KRX symbol, the portfolio model emits an explicit 0%
+target for that symbol so the complete-target rebalance is auditable.
+Operational symbols still exist so held/open/manual symbols remain visible to
+risk and execution even when they are not selected as fresh entries.
 
-`leaps-volatility-trailing-stop` emits `InsightDirection.FLAT`. Portfolio
-construction must respect active FLAT/DOWN insights for a symbol over UP
-insights from another alpha at the same or later timestamp. Do not work around
-exit signals by emitting broker orders from alpha code.
+The agent target artifact is a read-only operator input, not model-owned state.
+Do not write it from a sleeve model. If model diagnostics are needed, store only
+compact status through `StatePatch` under
+`leaps-agent-daily-target-portfolio/target_artifact`.
 
-The active RL portfolio constructor is configured as a complete target
-portfolio allocator for KRW buckets. When active KRW UP insights produce a new
-target set, any currently held KRW symbol missing from that set should receive
-a 0% target tagged `no_longer_in_target_portfolio`. If no actionable KRW
-insights exist, do not interpret that as an implicit all-sell signal; rely on
-explicit FLAT/DOWN insights or the next valid target set.
-
-Known current strategy risk: the active RL allocator plus daily rebalance can
-produce high turnover. If tuning this, adjust portfolio/risk policy such as
-rebalance cadence, minimum drift, cooldown, or turnover guard. Do not add hidden
-state mutations inside alpha/portfolio/execution modules.
+Agent operating memory lives under `agent_state/`. Read
+`agent_state/current_state.json` before making material LEaps decisions, and
+update it after changing the target portfolio, live application status,
+validation status, or the reasoning behind the current thesis. This file is
+memory only; it is not a runtime trading input.
 
 V4 candidate note: `configs/runtime/live_multi_sleeve_v4.json` uses
 `portfolios/v4_banded_momentum.py` as a deterministic replacement candidate for
@@ -98,18 +101,41 @@ cap after a configured low-to-current rebound is confirmed for multiple cycles.
 If `intraday_guard_hard_entry_freeze` is re-enabled, document that as a
 deliberate kill-switch style override and test it against live target output.
 
-Current per-symbol risk behavior: market guard caps the KRW budget, while the
-symbol guard decides whether an individual stock can be added, reduced, or
-exited. The symbol guard blocks adding to a held loser, blocks entries after
-large intraday selloffs or high-to-current drawdowns, halves positions on
-deeper per-symbol loss or 10-day-line breaks, and exits on severe loss,
-high-drawdown, or 20-day-line breaks. The live config enables volatility
-adjusted symbol thresholds using alpha metadata such as `volatility` or ATR
-percent: low-volatility names tighten faster, high-volatility names get wider
-held-position noise bands, and entry/add blocks have a separate upper
-multiplier so high volatility alone does not loosen new buys too far. Keep
-these controls in risk, not alpha or execution, and report their clamp reason
-as `symbol_guard_*`.
+Current per-symbol risk behavior: market guard caps the KRW budget first, while
+the symbol guard catches symbol-specific damage. For the agent daily target
+profile, do not let a single intraday high-to-current drawdown routinely defeat
+portfolio rebalancing. Symbol high-drawdown reduce/exit thresholds should be
+wide and reserved for severe damage; ordinary target drift after a pullback may
+be staged back toward target when unrealized loss, intraday move, trend
+metadata, and target freshness permit it. Missing SMA/alpha metadata should not
+by itself block an agent target rebalance; use it only when present. Complete
+symbol exits still need cooldown plus a fresh target artifact before re-entry.
+Keep these controls in risk, not alpha or execution, and report their clamp
+reason as `symbol_guard_*`.
+
+Execution anti-oscillation is a release blocker. Same-target drift rebalancing
+is allowed, but a reused `source_target_batch_id` must not produce a buyback
+after a sell, or a non-risk sell after a buy, just because minute prices or
+whole-share rounding moved. Keep these guards enabled in live configs:
+`whole_share_rounding_churn_guard`,
+`opposite_rebalance_require_small_change=false`, and
+`same_source_opposite_rebalance_guard=true`. Risk exits may still sell
+immediately, but risk-reduction tags such as `risk:symbol_guard_exit` and
+`risk:currency_policy_reduce` must be preserved so execution can block re-entry
+until the cooldown or a fresh target artifact. When validating changes, inspect
+both total turnover and same-source opposite transitions; `sell -> buy` under
+the same target artifact should be 0 unless it is an explicit manual/operator
+override.
+Rebalance noise guards should block rounding dust, not meaningful one-lot
+drift. For the agent daily target profile, keep `min_order_notional` near
+50,000 KRW, `reused_target_churn_lot_fraction` near 0.25, and execution
+`rebalance_no_trade_min_notional` near 100,000 KRW unless a backtest/live
+diagnostic shows renewed churn. High-priced KRX entries may use
+`whole_share_entry_floor_min_fraction=0.75` so a target worth at least three
+quarters of one share can enter one lot instead of staying permanently in cash.
+When `target_count=0`, first inspect order-sizing metadata such as
+`zero_delta_symbols`, `below_min_notional_suppressed_symbols`, and
+`reused_target_churn_suppressed_symbols`.
 
 ## Train/Live Parity Checklist
 

@@ -18,6 +18,47 @@ inside opt-in models. Always-on engine safety stays in core guards.
 
 ## Implemented Surfaces
 
+### Runtime Heartbeat And Supervisor Health
+
+Live component liveness is read from explicit artifacts, not from Windows PID or
+terminal command-line scans.
+
+Primary module:
+
+- `leaps_quant_engine.runtime_heartbeat`
+
+The multi-sleeve live order loop writes:
+
+```text
+data/runtime/live-order-loop/multi_sleeve_heartbeat.json
+```
+
+Portfolio report loops and the EOD snapshot scheduler write the same heartbeat
+shape beside their state/log files. The heartbeat includes `runtime_id`,
+`component`, `status`, `updated_at`, `config_path`, `sleeve_ids`,
+`cycle_index`, and metadata such as the current loop phase. `process_id` may be
+recorded for operator context, but health evaluation does not check whether that
+PID exists. This keeps supervisor checks bounded and avoids turning process
+enumeration into a startup bottleneck.
+
+Use:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/live_multi_sleeve.json `
+  --heartbeat data/runtime/live-order-loop/multi_sleeve_heartbeat.json `
+  --heartbeat-component multi_sleeve_live_order_loop
+```
+
+`tools/leaps_safe_start_live_stack.ps1` now uses:
+
+- HTTP `/health` for KIS gateway and broker-engine
+- heartbeat freshness for the multi-sleeve live loop, report loops, and EOD
+  scheduler
+- strict preflight for config/routes/order status
+
+Command-line process scanning is opt-in only through `-UseProcessScan true`.
+Normal startup should stay on HTTP health + heartbeat artifacts.
+
 ### Portfolio Mutation Audit
 
 Portfolio state changes from fills, not order intents.
@@ -58,6 +99,12 @@ Primary classes:
 This gives operators and agents a deterministic answer to "what changed this
 sleeve portfolio?"
 
+`MultiSleeveOrderOrchestrator` now keeps the same audit surface when it applies
+broker/order events. Its result exposes `fill_application_reports` and
+`portfolio_mutations`, so a live/paper submit cycle can explain the actual
+portfolio mutation without re-reading raw account files. `order-runtime-status`
+also includes recent per-sleeve portfolio mutations for operator/debug use.
+
 ### Lineage Summary
 
 Cycle output and cycle journals include a symbol-level lineage summary.
@@ -92,6 +139,38 @@ Primary module:
 
 - `leaps_quant_engine.lineage`
 
+### Unordered Quantity / Target Progress
+
+Fast risk and execution cycles must not depend on slowing the framework clock.
+The engine exposes working order state as an immutable execution-context read
+model:
+
+- open buy quantity by symbol
+- open sell quantity by symbol
+- remaining quantity for partial tickets
+- reserved buy notional
+- pending ticket ids, latest status, and oldest open-order age
+
+The standard execution path computes unordered quantity before creating normal
+order intents:
+
+```text
+projected_quantity = current_quantity + open_buy_quantity - open_sell_quantity
+unordered_delta = target_quantity - projected_quantity
+```
+
+This gives the LEAN-like behavior expected from target collection progress:
+
+- target 100, holding 70, open buy 30 -> no new normal order intent
+- target 100, holding 70, open buy 10 -> buy only 20
+- a reused target batch with unchanged state does not create duplicate intent
+- urgent stop/risk exits may bypass normal churn suppression but still pass
+  through order runtime and guards
+
+Primary module:
+
+- `leaps_quant_engine.execution.PendingOrderState`
+
 ### Market Calendar
 
 The runtime now has calendar/session reports for:
@@ -100,7 +179,9 @@ The runtime now has calendar/session reports for:
 - `overseas` / US
 
 Built-in rules cover weekends, regular session, and extended-session phases.
-Optional holiday JSON files improve accuracy:
+Default holiday JSON files live under `configs/market-calendars/` and are used
+when no explicit holiday file is passed. Optional override files use the same
+shape:
 
 ```json
 {
@@ -120,6 +201,14 @@ Runtime integration:
 
 - `runtime-preflight` includes `market_calendar` checks.
 - `runtime-health` includes `market_calendar` checks when route scope is known.
+- Both reports also emit `market_session_gate`, which says whether the current
+  session is trading/orderable for the route.
+- In strict live preflight, a non-trading or non-orderable session is a
+  warning. The service may still start so it can heartbeat and supervise order
+  state, but the live loop must not run models or submit orders for closed
+  markets.
+- The multi-sleeve live loop also checks weekends and configured market holidays
+  inside its sleeve schedule gate before running models or submitting orders.
 - Runtime session estimates use the calendar layer instead of raw synthetic
   session helpers.
 
@@ -154,6 +243,13 @@ Example universe metadata:
       "quantity_step": 1,
       "default_exchange_scope": "SOR"
     },
+    "KRX:069500": {
+      "market_scope": "domestic",
+      "currency": "KRW",
+      "asset_type": "etf",
+      "is_etf": true,
+      "default_exchange_scope": "KRX"
+    },
     "US:SMH": {
       "market_scope": "overseas",
       "currency": "USD",
@@ -165,8 +261,10 @@ Example universe metadata:
 }
 ```
 
-Domestic KRX default remains `SOR`. Explicit `KRX`, `NXT`, or `SOR` metadata
-can override it. Broker submit validation and engine guard use symbol
+Domestic KRX stocks default to `SOR`. Domestic ETF/ETN/ELW symbols default to
+`KRX`, because KIS/NXT best-execution routing is not available for every listed
+product class. Explicit `KRX`, `NXT`, or `SOR` metadata can override the default
+when a route has been tested. Broker submit validation and engine guard use symbol
 properties to reject invalid quantity steps, unsupported sessions, and invalid
 venue metadata before a live broker call.
 
@@ -278,6 +376,23 @@ Available helpers:
 - `object_merge`
 - `object_delete`
 - `patch`
+- `scope`
+
+Prefer `context.model_state.scope(...)` when a model repeatedly touches the
+same sleeve/model/namespace:
+
+```python
+trail = context.model_state.scope(
+    model_id="trailing-stop",
+    namespace="trailing_stop",
+).for_symbol("KRX:005930")
+
+state = trail.object_get(default={"high_watermark_price": 0})
+patch = trail.object_merge(
+    {"high_watermark_price": max(state["high_watermark_price"], latest_price)},
+    reason="trailing_stop_mark",
+)
+```
 
 Patches are committed by `FrameworkRunner` only after a successful cycle when a
 runtime state store is attached.

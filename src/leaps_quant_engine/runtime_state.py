@@ -385,6 +385,24 @@ class RuntimeModelStateView:
             generated_at=generated_at,
         )
 
+    def scope(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        model_id: str | None = None,
+        namespace: str = "default",
+        symbol_key: str = "",
+        position_id: str = "",
+    ) -> "RuntimeModelStateScope":
+        return RuntimeModelStateScope(
+            view=self,
+            sleeve_id=sleeve_id if sleeve_id is not None else self.default_sleeve_id,
+            model_id=model_id if model_id is not None else self.default_model_id,
+            namespace=namespace,
+            symbol_key=symbol_key,
+            position_id=position_id,
+        )
+
     def key(
         self,
         *,
@@ -400,6 +418,163 @@ class RuntimeModelStateView:
             namespace=namespace,
             symbol_key=symbol_key,
             position_id=position_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeModelStateScope:
+    """Bound state helper for one model-owned namespace."""
+
+    view: RuntimeModelStateView
+    sleeve_id: str
+    model_id: str
+    namespace: str = "default"
+    symbol_key: str = ""
+    position_id: str = ""
+
+    def key(
+        self,
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+    ) -> ModelStateKey:
+        return self.view.key(
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace if namespace is None else namespace,
+            symbol_key=self.symbol_key if symbol_key is None else symbol_key,
+            position_id=self.position_id if position_id is None else position_id,
+        )
+
+    def for_symbol(self, symbol_key: str) -> "RuntimeModelStateScope":
+        return RuntimeModelStateScope(
+            view=self.view,
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace,
+            symbol_key=str(symbol_key or ""),
+            position_id=self.position_id,
+        )
+
+    def for_position(self, position_id: str) -> "RuntimeModelStateScope":
+        return RuntimeModelStateScope(
+            view=self.view,
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace,
+            symbol_key=self.symbol_key,
+            position_id=str(position_id or ""),
+        )
+
+    def get(
+        self,
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+    ) -> ModelStateRecord | None:
+        return self.view.get(self.key(symbol_key=symbol_key, position_id=position_id, namespace=namespace))
+
+    def entries(
+        self,
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+    ) -> tuple[ModelStateRecord, ...]:
+        return self.view.entries(
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace if namespace is None else namespace,
+            symbol_key=self.symbol_key if symbol_key is None else symbol_key,
+            position_id=self.position_id if position_id is None else position_id,
+        )
+
+    def object_get(
+        self,
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+        default: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record = self.get(symbol_key=symbol_key, position_id=position_id, namespace=namespace)
+        if record is None:
+            return dict(default or {})
+        return dict(record.value)
+
+    def object_entries(
+        self,
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(record.value)
+            for record in self.entries(symbol_key=symbol_key, position_id=position_id, namespace=namespace)
+        )
+
+    def object_set(
+        self,
+        value: Mapping[str, Any],
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return self.view.object_set(
+            value,
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace if namespace is None else namespace,
+            symbol_key=self.symbol_key if symbol_key is None else symbol_key,
+            position_id=self.position_id if position_id is None else position_id,
+            reason=reason,
+            generated_at=generated_at,
+        )
+
+    def object_merge(
+        self,
+        value: Mapping[str, Any],
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return self.view.object_merge(
+            value,
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace if namespace is None else namespace,
+            symbol_key=self.symbol_key if symbol_key is None else symbol_key,
+            position_id=self.position_id if position_id is None else position_id,
+            reason=reason,
+            generated_at=generated_at,
+        )
+
+    def object_delete(
+        self,
+        *,
+        symbol_key: str | None = None,
+        position_id: str | None = None,
+        namespace: str | None = None,
+        reason: str = "",
+        generated_at: datetime | None = None,
+    ) -> StatePatch:
+        return self.view.object_delete(
+            sleeve_id=self.sleeve_id,
+            model_id=self.model_id,
+            namespace=self.namespace if namespace is None else namespace,
+            symbol_key=self.symbol_key if symbol_key is None else symbol_key,
+            position_id=self.position_id if position_id is None else position_id,
+            reason=reason,
+            generated_at=generated_at,
         )
 
 

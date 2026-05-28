@@ -25,6 +25,7 @@ class PortfolioConstructionContext:
     portfolio_equity_by_currency: Mapping[str, float] = field(default_factory=dict)
     target_portfolio_value_by_currency: Mapping[str, float] = field(default_factory=dict)
     model_state: RuntimeModelStateView = field(default_factory=RuntimeModelStateView)
+    excluded_active_insights: tuple[Insight, ...] = ()
 
     @property
     def equity(self) -> float:
@@ -159,9 +160,17 @@ class PortfolioTargetBatch:
 class RebalancePolicy:
     cash_reserve_pct: float = 0.0
     min_order_notional: float = 0.0
+    min_order_notional_equity_bps: float = 0.0
     min_quantity_delta: int = 1
     allow_exit_below_min_notional: bool = True
     cadence: str = "every_cycle"
+    target_churn_guard: bool = False
+    target_churn_max_quantity_delta: int = 1
+    target_churn_lot_fraction: float = 0.5
+    target_churn_equity_bps: float = 0.0
+    whole_share_entry_floor_min_fraction: float = 1.0
+    whole_share_rounding_churn_guard: bool = True
+    whole_share_rounding_churn_min_fraction: float = 0.25
     reused_target_churn_guard: bool = False
     reused_target_churn_max_quantity_delta: int = 1
     reused_target_churn_lot_fraction: float = 0.5
@@ -172,10 +181,22 @@ class RebalancePolicy:
             raise ValueError("cash_reserve_pct must be between 0 inclusive and 1 exclusive.")
         if self.min_order_notional < 0:
             raise ValueError("min_order_notional cannot be negative.")
+        if self.min_order_notional_equity_bps < 0:
+            raise ValueError("min_order_notional_equity_bps cannot be negative.")
         if self.min_quantity_delta < 0:
             raise ValueError("min_quantity_delta cannot be negative.")
         if not str(self.cadence).strip():
             raise ValueError("cadence cannot be empty.")
+        if self.target_churn_max_quantity_delta < 0:
+            raise ValueError("target_churn_max_quantity_delta cannot be negative.")
+        if self.target_churn_lot_fraction < 0:
+            raise ValueError("target_churn_lot_fraction cannot be negative.")
+        if self.target_churn_equity_bps < 0:
+            raise ValueError("target_churn_equity_bps cannot be negative.")
+        if not 0.0 <= self.whole_share_entry_floor_min_fraction <= 1.0:
+            raise ValueError("whole_share_entry_floor_min_fraction must be between 0 and 1.")
+        if not 0.0 <= self.whole_share_rounding_churn_min_fraction <= 1.0:
+            raise ValueError("whole_share_rounding_churn_min_fraction must be between 0 and 1.")
         if self.reused_target_churn_max_quantity_delta < 0:
             raise ValueError("reused_target_churn_max_quantity_delta cannot be negative.")
         if self.reused_target_churn_lot_fraction < 0:
@@ -192,10 +213,11 @@ class PortfolioConstructionEngine:
 
     def create_targets(self, context: PortfolioConstructionContext) -> PortfolioTargetBatch:
         prepared_context = self.prepare_context(context)
-        raw_targets = tuple(
+        model_targets = tuple(
             _coerce_allocation_target(prepared_context, target)
             for target in self.model.create_targets(prepared_context)
         )
+        raw_targets, excluded_targets = _targetable_allocation_targets(prepared_context, model_targets)
         state_patches = _state_patches_for_model(self.model, prepared_context, raw_targets)
         plans = self._build_plans(prepared_context, raw_targets)
         return PortfolioTargetBatch(
@@ -203,16 +225,22 @@ class PortfolioConstructionEngine:
             generated_at=context.data.time,
             targets=raw_targets,
             plans=plans,
-            source_insight_ids=tuple(insight.insight_id for insight in context.active_insights),
+            source_insight_ids=tuple(insight.insight_id for insight in prepared_context.active_insights),
             model_name=type(self.model).__name__,
             reason=self.reason,
             state_patches=state_patches,
-            metadata=self._metadata(prepared_context, raw_targets, plans),
+            metadata=self._metadata(prepared_context, raw_targets, plans, excluded_targets=excluded_targets),
         )
 
     def prepare_context(self, context: PortfolioConstructionContext) -> PortfolioConstructionContext:
-        relevant_symbols = _relevant_symbols(context)
-        equity_by_currency = _portfolio_equity_by_currency(context.portfolio, context.data, relevant_symbols)
+        targetable_insights, excluded_insights = _targetable_active_insights(context)
+        filtered_context = replace(
+            context,
+            active_insights=targetable_insights,
+            excluded_active_insights=excluded_insights,
+        )
+        relevant_symbols = _relevant_symbols(filtered_context)
+        equity_by_currency = _portfolio_equity_by_currency(filtered_context.portfolio, filtered_context.data, relevant_symbols)
         target_value_by_currency = {
             currency: equity * (1.0 - self.rebalance_policy.cash_reserve_pct)
             for currency, equity in equity_by_currency.items()
@@ -220,7 +248,7 @@ class PortfolioConstructionEngine:
         equity = _single_currency_value(equity_by_currency)
         target_value = _single_currency_value(target_value_by_currency)
         prepared_context = replace(
-            context,
+            filtered_context,
             portfolio_equity=equity,
             target_portfolio_value=target_value,
             portfolio_equity_by_currency=MappingProxyType(dict(equity_by_currency)),
@@ -239,9 +267,10 @@ class PortfolioConstructionEngine:
         metadata: Mapping[str, Any] | None = None,
     ) -> PortfolioTargetBatch:
         prepared_context = self.prepare_context(context)
+        targets, excluded_targets = _targetable_allocation_targets(prepared_context, targets)
         plans = self._build_plans(prepared_context, targets)
         batch_metadata = dict(source_batch.metadata)
-        batch_metadata.update(self._metadata(prepared_context, targets, plans))
+        batch_metadata.update(self._metadata(prepared_context, targets, plans, excluded_targets=excluded_targets))
         batch_metadata.update(dict(metadata or {}))
         batch_metadata["source_batch_id"] = source_batch.batch_id
         batch_metadata["source_generated_at"] = source_batch.generated_at.isoformat()
@@ -262,20 +291,43 @@ class PortfolioConstructionEngine:
         context: PortfolioConstructionContext,
         targets: tuple[PortfolioAllocationTarget, ...],
         plans: tuple[PortfolioTargetPlan, ...],
+        *,
+        excluded_targets: tuple[PortfolioAllocationTarget, ...] = (),
     ) -> dict[str, Any]:
         return {
-            "raw_target_count": len(targets),
+            "raw_target_count": len(targets) + len(excluded_targets),
             "filtered_target_count": len(targets),
-            "raw_plan_count": len(plans),
+            "raw_plan_count": len(plans) + len(excluded_targets),
             "filtered_plan_count": len(plans),
+            "raw_active_insight_count": len(context.active_insights) + len(context.excluded_active_insights),
+            "targetable_active_insight_count": len(context.active_insights),
+            "excluded_universe_mismatch_insight_count": len(context.excluded_active_insights),
+            "excluded_universe_mismatch_symbols": [
+                insight.symbol_key for insight in context.excluded_active_insights
+            ],
+            "excluded_universe_mismatch_insight_ids": [
+                insight.insight_id for insight in context.excluded_active_insights
+            ],
+            "parked_unpriced_target_count": len(excluded_targets),
+            "parked_unpriced_target_symbols": [
+                target.symbol.key for target in excluded_targets
+            ],
             "portfolio_equity": context.portfolio_equity,
             "target_portfolio_value": context.target_portfolio_value,
             "portfolio_equity_by_currency": dict(context.portfolio_equity_by_currency),
             "target_portfolio_value_by_currency": dict(context.target_portfolio_value_by_currency),
             "cash_reserve_pct": self.rebalance_policy.cash_reserve_pct,
             "min_order_notional": self.rebalance_policy.min_order_notional,
+            "min_order_notional_equity_bps": self.rebalance_policy.min_order_notional_equity_bps,
             "min_quantity_delta": self.rebalance_policy.min_quantity_delta,
             "cadence": self.rebalance_policy.cadence,
+            "target_churn_guard": self.rebalance_policy.target_churn_guard,
+            "target_churn_max_quantity_delta": self.rebalance_policy.target_churn_max_quantity_delta,
+            "target_churn_lot_fraction": self.rebalance_policy.target_churn_lot_fraction,
+            "target_churn_equity_bps": self.rebalance_policy.target_churn_equity_bps,
+            "whole_share_entry_floor_min_fraction": self.rebalance_policy.whole_share_entry_floor_min_fraction,
+            "whole_share_rounding_churn_guard": self.rebalance_policy.whole_share_rounding_churn_guard,
+            "whole_share_rounding_churn_min_fraction": self.rebalance_policy.whole_share_rounding_churn_min_fraction,
             "reused_target_churn_guard": self.rebalance_policy.reused_target_churn_guard,
             "reused_target_churn_max_quantity_delta": self.rebalance_policy.reused_target_churn_max_quantity_delta,
             "reused_target_churn_lot_fraction": self.rebalance_policy.reused_target_churn_lot_fraction,
@@ -364,6 +416,35 @@ def _insight_ids_by_symbol(insights: tuple[Insight, ...]) -> dict[str, tuple[str
     for insight in insights:
         result.setdefault(insight.symbol_key, []).append(insight.insight_id)
     return {symbol_key: tuple(insight_ids) for symbol_key, insight_ids in result.items()}
+
+
+def _targetable_active_insights(context: PortfolioConstructionContext) -> tuple[tuple[Insight, ...], tuple[Insight, ...]]:
+    targetable: list[Insight] = []
+    excluded: list[Insight] = []
+    for insight in context.active_insights:
+        if context.data.get(insight.symbol) is not None or context.portfolio.quantity(insight.symbol) != 0:
+            targetable.append(insight)
+        else:
+            excluded.append(insight)
+    return tuple(targetable), tuple(excluded)
+
+
+def _targetable_allocation_targets(
+    context: PortfolioConstructionContext,
+    targets: tuple[PortfolioAllocationTarget, ...],
+) -> tuple[tuple[PortfolioAllocationTarget, ...], tuple[PortfolioAllocationTarget, ...]]:
+    targetable: list[PortfolioAllocationTarget] = []
+    excluded: list[PortfolioAllocationTarget] = []
+    for target in targets:
+        if (
+            abs(target.target_percent) <= 1e-12
+            or context.data.get(target.symbol) is not None
+            or context.portfolio.quantity(target.symbol) != 0
+        ):
+            targetable.append(target)
+        else:
+            excluded.append(target)
+    return tuple(targetable), tuple(excluded)
 
 
 def _symbols_by_key(symbols: tuple[Symbol, ...]) -> dict[str, Symbol]:

@@ -16,6 +16,7 @@ from leaps_quant_engine.backtesting import (
     simulated_fill_model_for_slippage_bps,
     universe_with_default_indicator_resolution,
 )
+from leaps_quant_engine.cycle_journal import FileCycleJournalStore
 from leaps_quant_engine.framework import FrameworkRunner
 from leaps_quant_engine.indicators import IndicatorEngine
 from leaps_quant_engine.models import Bar, OrderSide, Symbol
@@ -311,7 +312,19 @@ def test_framework_backtest_replays_indicators_alpha_and_metrics():
     assert result.metrics.total_return == pytest.approx(0.08)
     assert result.metrics.trade_count == 1
     assert result.metrics.order_count == 2
-    assert result.to_report(include_orders=False)["order_count"] == 2
+    report = result.to_report(include_orders=False)
+    assert report["order_count"] == 2
+    turnover_breakdown = report["turnover_breakdown"]
+    assert turnover_breakdown["retargeting_turnover"]["first_target_abs_weight"] == pytest.approx(1.0)
+    assert turnover_breakdown["retargeting_turnover"]["total_abs_retarget_delta_ex_initial"] == pytest.approx(1.0)
+    assert turnover_breakdown["retargeting_turnover"]["one_way_retarget_turnover_ex_initial"] == pytest.approx(0.5)
+    assert turnover_breakdown["retargeting_turnover"]["retargeted_cycle_count"] == 1
+    assert turnover_breakdown["retargeting_turnover"]["retargeting_rate"] == pytest.approx(0.5)
+    assert turnover_breakdown["alpha_turnover"] == turnover_breakdown["retargeting_turnover"]
+    assert turnover_breakdown["execution_turnover"]["turnover"] == pytest.approx(result.metrics.turnover)
+    assert turnover_breakdown["execution_turnover"]["fill_count"] == 2
+    assert turnover_breakdown["replacement_rate"]["new_entry_count"] == 1
+    assert turnover_breakdown["replacement_rate"]["full_exit_count"] == 1
 
 
 def test_framework_backtest_enriches_alpha_context_with_temporal_feature_window():
@@ -566,6 +579,44 @@ def test_framework_backtest_report_can_include_insight_ledger_without_orders():
     assert report["insights"]["insight_count"] == 2
     assert report["insights"]["cycles"][0]["new_insights"][0]["alpha_id"] == "entry-then-flat"
     assert report["insights"]["cycles"][0]["active_insight_count"] == 1
+
+
+def test_framework_backtest_cycle_journal_records_data_gate_stage_decisions(tmp_path):
+    symbol = Symbol("005930", "KRX")
+    universe = parse_universe_definition(
+        {
+            "id": "framework-backtest-journal",
+            "market": "KRX",
+            "symbols": ["005930"],
+            "indicators": [{"name": "close", "type": "close", "period": 1, "resolution": "daily"}],
+        }
+    )
+    provider = VirtualMarketDataProvider.from_bars(
+        [
+            Bar(symbol, datetime(2026, 5, 8), 100, 101, 99, 100, 1000, resolution="daily"),
+        ]
+    )
+    journal = FileCycleJournalStore(tmp_path / "journal.jsonl")
+    runner = FrameworkRunner(
+        sleeve_id="framework-kor",
+        alpha_runtime=AlphaRuntime(active_models=(EntryThenFlatAlpha(datetime(2026, 5, 9)),)),
+    )
+
+    run_framework_backtest(
+        universe,
+        provider,
+        sleeve_id="framework-kor",
+        framework_runner=runner,
+        portfolio=Portfolio(cash=1_000),
+        cycle_journal_store=journal,
+        runtime_id="parity-test",
+    )
+
+    latest = journal.latest(sleeve_id="framework-kor")
+    assert latest is not None
+    assert latest.metadata["stage_decisions"]["data"]["data_slice_resolution"] == "daily"
+    assert latest.metadata["stage_decisions"]["data"]["indicator_snapshot_lane"] == "daily_confirmed"
+    assert latest.metadata["stage_decisions"]["data"]["allows_new_entries"] is True
 
 
 def test_framework_backtest_warms_indicators_before_evaluation_start():

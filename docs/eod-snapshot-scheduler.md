@@ -15,6 +15,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\leaps_eod_snapshot.ps1
 Default targets:
 
 - `LEaps` from `configs/runtime/live_multi_sleeve.json`
+- `kr-lowvol-defensive` from `configs/runtime/live_multi_sleeve.json`
 - `us_etf_rotation` from `configs/runtime/live_multi_sleeve.json`
 
 The EOD snapshot is still stored per sleeve. The shared config keeps it aligned
@@ -78,11 +79,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\leaps_eod_snapshot_sch
 Default schedules use KST:
 
 - `18:05` `krx-after-hours` for `LEaps`
+- `18:05` `krx-after-hours` for `kr-lowvol-defensive`
 - `06:10` `us-after-hours` for `us_etf_rotation`
 
 The scheduler writes one marker per date and label under
 `data/runtime/eod-snapshots/`, so a restarted scheduler will not duplicate the
 same daily capture.
+
+When multiple sleeves share the same date and label, such as domestic
+`LEaps` and `kr-lowvol-defensive`, the scheduler groups those targets into one
+snapshot run. This keeps one `krx-after-hours` marker while still writing a
+separate per-sleeve `portfolio-report/*_runtime_*.json` artifact for each
+target.
 
 Check scheduler output status without submitting orders:
 

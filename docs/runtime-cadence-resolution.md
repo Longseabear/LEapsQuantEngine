@@ -78,6 +78,9 @@ Working rules:
 Provider defaults:
 
 - daily history loaders stamp bars as `resolution="daily"`.
+- daily replay feeds build `DataSlice(resolution="daily")` when all bars in the
+  slice are daily bars, so backtests and live/replay diagnostics carry the same
+  resolution lane into cycle journals.
 - live market snapshots stamp provider bars as `resolution="live"` when the
   provider did not specify one.
 - snapshot worker reports expose `indicator_update_count` and
@@ -195,6 +198,13 @@ cycle's portfolio input, but the insight ledger is not cancelled solely because
 of a transient bad snapshot. This keeps contaminated current data out of new
 orders without erasing a valid previous daily thesis.
 
+Every framework cycle now records a `stage_decisions.data` block. It includes
+the `DataSlice` resolution, the `IndicatorSnapshot` lane, snapshot-quality
+payload, `allows_new_entries`, `allows_risk_checks`, and whether the snapshot
+was treated as invalid. Cycle journals store the same block for both backtest
+and live/paper runtime cycles, so an agent can compare "what stream drove this
+decision?" without re-running the strategy.
+
 ## Indicator Readiness
 
 Universe indicator definitions may mark a feature as optional for warmup:
@@ -250,6 +260,9 @@ Supported cadence values:
   weekday after the configured wall-clock time.
 - `every_5m` / `every_5_minutes`: interval cadence used mainly by portfolio
   construction.
+- `every_3_days` / `3d`: calendar-day interval cadence. This is useful when a
+  swing sleeve should rebuild portfolio targets only every few days while the
+  runner still reuses the last target for drift/order sizing between rebuilds.
 - `manual`: do not run automatically after startup unless the runtime adds an
   explicit trigger later.
 
@@ -492,7 +505,7 @@ from each sleeve's config:
 {
   "sleeve_id": "LEaps",
   "worker": {
-    "cycle_interval_seconds": 60
+    "cycle_interval_seconds": 10
   }
 }
 ```
@@ -504,7 +517,7 @@ multi-sleeve runner while allowing different strategy horizons:
 
 ```text
 supervisor tick: 10s
-LEaps worker.cycle_interval_seconds: 60
+LEaps worker.cycle_interval_seconds: 10
 us_etf_rotation worker.cycle_interval_seconds: 300
 future fast-risk sleeve/lane: 10-15s
 ```
@@ -631,6 +644,20 @@ Use these layers for urgent behavior:
 - Execution/order runtime: ticket lifecycle, duplicate submit protection,
   pending order awareness, and broker fill reconciliation.
 
+Pending order awareness is part of the execution context, not a strategy side
+lookup. The standard execution model uses open ticket quantities to compute
+unordered quantity before emitting normal intents:
+
+```text
+unordered_delta = target_quantity - (current_quantity + open_buy_quantity - open_sell_quantity)
+```
+
+This is why fast execution cadence is safe: a reused portfolio target can be
+checked every cycle, but already-working tickets count as progress toward the
+target. Hard stop/risk exits can still communicate urgency through tag or
+execution policy and bypass normal churn suppression, while broker submission
+remains guarded by order runtime.
+
 Daily alpha and daily portfolio cadence are for strategy thesis updates, not
 for all safety behavior.
 
@@ -640,18 +667,21 @@ The live config `configs/runtime/live_multi_sleeve.json` currently uses:
 
 ```text
 LEaps alpha:
-  leaps-kospi-conviction         -> every_cycle, daily
-  leaps-volatility-trailing-stop -> every_cycle, daily
+  leaps-kospi-conviction         -> every_5_minutes, daily indicators + live mark
+  leaps-kospi-pullback-reversion -> every_5_minutes, daily indicators + live mark
+  leaps-kospi-swing-rebalance    -> every_5_minutes, daily indicators + live mark
+  leaps-krx-etf-safety           -> every_5_minutes, daily/live safety context
+  leaps-volatility-trailing-stop -> every_5_minutes, daily indicators + live mark
 
 LEaps portfolio:
-  rl_ppo_constructor.py
-  rebalance.cadence = every_5_minutes
-  blend.enabled = true
-  blend.duration_minutes = 300
-  blend.clock = orderable_session
+  v4_banded_momentum.py
+  rebalance.cadence = every_3_days
+  worker cycle = 300 seconds
+  non-due cycles reuse the last target for five-minute drift sizing
+  blend.enabled = false
 
 LEaps indicators:
-  configs/universes/leaps_kr_research_core.json
+  configs/universes/leaps_kr_research_200.json
   strategy indicators are resolution=daily
 ```
 

@@ -14,6 +14,7 @@ from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrationR
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.order_status import OrderRuntimeStatusReport, build_order_runtime_status
 from leaps_quant_engine.orders import OrderCoordinationResult, OrderCoordinator
+from leaps_quant_engine.security import SecurityCatalog
 from leaps_quant_engine.virtual_account import VirtualSleeveAccountStore
 
 
@@ -100,6 +101,7 @@ class OrderRuntimeSubmitter:
     engine_guard: EngineGuard = EngineGuard()
     require_orderable_session: bool = False
     market_session: MarketSession | None = None
+    security_catalog: SecurityCatalog | None = None
 
     def submit_batches(
         self,
@@ -117,7 +119,11 @@ class OrderRuntimeSubmitter:
         initial_errors: tuple[str, ...] = (),
     ) -> OrderRuntimeSubmitReport:
         generated_at = generated_at or datetime.now()
-        batches_tuple = _enrich_batches_with_market_session(tuple(batches), self.market_session)
+        batches_tuple = _enrich_batches_with_runtime_metadata(
+            tuple(batches),
+            market_session=self.market_session,
+            security_catalog=self.security_catalog,
+        )
         coordination = self.coordinator.coordinate(batches_tuple, generated_at=generated_at)
         request_errors, warnings = _validate_submit_request(
             batches_tuple,
@@ -139,6 +145,7 @@ class OrderRuntimeSubmitter:
             commit=commit,
             require_orderable_session=self.require_orderable_session or (commit and broker == "broker-engine" and confirm_live_submit),
             market_session=self.market_session,
+            security_catalog=self.security_catalog,
             generated_at=generated_at,
         )
 
@@ -169,6 +176,7 @@ class OrderRuntimeSubmitter:
                     require_orderable_session=self.require_orderable_session
                     or (commit and broker == "broker-engine" and confirm_live_submit),
                     market_session=self.market_session,
+                    security_catalog=self.security_catalog,
                     generated_at=generated_at,
                 )
         errors = errors + guard.errors
@@ -390,16 +398,50 @@ def _enrich_batches_with_market_session(
     batches: tuple[OrderIntentBatch, ...],
     market_session: MarketSession | None,
 ) -> tuple[OrderIntentBatch, ...]:
-    if market_session is None:
+    return _enrich_batches_with_runtime_metadata(
+        batches,
+        market_session=market_session,
+        security_catalog=None,
+    )
+
+
+def _enrich_batches_with_runtime_metadata(
+    batches: tuple[OrderIntentBatch, ...],
+    *,
+    market_session: MarketSession | None,
+    security_catalog: SecurityCatalog | None,
+) -> tuple[OrderIntentBatch, ...]:
+    if market_session is None and security_catalog is None:
         return batches
     enriched_batches: list[OrderIntentBatch] = []
     for batch in batches:
         enriched_orders = tuple(
-            replace(order, metadata=_metadata_with_market_session(order.metadata, market_session))
+            replace(
+                order,
+                metadata=_metadata_with_runtime_metadata(
+                    order,
+                    market_session=market_session,
+                    security_catalog=security_catalog,
+                ),
+            )
             for order in batch.order_intents
         )
         enriched_batches.append(replace(batch, order_intents=enriched_orders))
     return tuple(enriched_batches)
+
+
+def _metadata_with_runtime_metadata(
+    order: OrderIntent,
+    *,
+    market_session: MarketSession | None,
+    security_catalog: SecurityCatalog | None,
+) -> dict[str, Any]:
+    enriched = dict(order.metadata)
+    if market_session is not None:
+        enriched = _metadata_with_market_session(enriched, market_session)
+    if security_catalog is not None and "symbol_properties" not in enriched:
+        enriched["symbol_properties"] = security_catalog.resolve(order.symbol).to_dict()
+    return enriched
 
 
 def _metadata_with_market_session(

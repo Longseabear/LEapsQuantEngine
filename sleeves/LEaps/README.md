@@ -22,6 +22,7 @@ sleeves/LEaps/
     etf_rotation.py
     operational_symbols.py
   portfolios/
+    agent_daily_target.py
     equal_weight.py
     research_adaptive_allocator.py
     rl_ppo_constructor.py
@@ -41,30 +42,31 @@ Runtime configs can set:
 
 With that setting, relative strategy module references such as `alphas/momentum.py` and `portfolios/equal_weight.py` resolve inside this workspace.
 
-Selection models can be wired with workspace-relative `module.py:ClassName` references:
+Selection models can be wired with workspace-relative `module.py:ClassName` references.
+The active live profile currently starts from an agent-authored daily target
+artifact, then adds ETF safety and operational symbols so risk/execution still
+receive required market data:
 
 ```json
 "universe": {
   "active": {
+    "cadence": "daily_at 08:45 Asia/Seoul",
     "selection_models": [
-      "selections/stock_momentum.py:StockMomentumSelectionModel",
+      "selections/agent_daily_target.py:AgentDailyTargetSelectionModel",
       "selections/krx_etf_safety.py:KrxEtfSafetySelectionModel",
-      "selections/etf_rotation.py:EtfRotationSelectionModel",
       "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
     ]
   }
 },
 "alpha": {
-  "input_selections": {
-    "leaps-kospi-conviction": "leaps-stock-momentum",
-    "leaps-krx-etf-safety": "leaps-krx-etf-safety",
-    "leaps-us-stability-hedge": "leaps-etf-rotation",
-    "leaps-volatility-trailing-stop": "leaps-operational-symbols",
-  }
+  "modules": [],
+  "input_selections": {}
 }
 ```
 
-This keeps selectors and alpha modules independent. Config decides which selected symbols each alpha receives.
+This keeps the live portfolio alpha-less: symbol choice and target weights come
+from the daily target artifact, while the engine still owns order sizing, risk,
+execution, fills, and account state.
 
 Manage active alpha modules through the runtime config:
 
@@ -83,29 +85,50 @@ py -3 -m leaps_quant_engine.cli sleeve-portfolio-set configs/runtime/leaps_works
 
 After changing active alpha modules or the portfolio model, send the emitted `reload_sleeve` command to apply the new config at a runtime boundary.
 
-The active `live_multi_sleeve` LEaps profile now uses
-`portfolios/research_adaptive_allocator.py` with a separate KRX ETF safety
-bucket. Stock momentum and pullback insights still form the growth book, while
-`leaps-krx-etf-safety` can reserve target weight for KRX cash-like ETFs,
-KODEX 200, and the 1x inverse ETF when the KODEX 200 regime deteriorates.
-Those ETF insights are explicitly excluded from the stock top-k ranking.
+The active `live_multi_sleeve` LEaps profile is wired in
+`configs/runtime/live_multi_sleeve.json` and uses
+`portfolios/agent_daily_target.py`. The portfolio model reads
+`data/operator-targets/LEaps/latest_target.json` once per trading day at 08:50
+KST. If the file is missing, expired, stale, has the wrong sleeve id, or is not
+valid JSON, the model fails closed and emits no new target batch. If the file is
+valid, it emits percentage targets only. Missing currently held KRX symbols get
+explicit 0% targets so the daily rebalance can move firmly to the operator or
+agent-approved portfolio. Setting `"flatten": true` emits 0% targets for all
+held KRX symbols.
 
-The v4 candidate profile is wired in `configs/runtime/live_multi_sleeve_v4.json`
-and uses `portfolios/v4_banded_momentum.py`. It is a deterministic
-portfolio-construction model, not a separately trained PPO policy. Alpha still
-decides which symbols have actionable UP/FLAT insights; v4 only decides target
-continuity and allocation. Its core rules are entry/hold/trim bands
-(`entry_top_n=12`, `hold_top_n=60`, `trim_top_n=85`), a three-trading-day
-minimum hold preference, hard exit pass-through for stop/exit insights, and a
-priority turnover budget (`max_target_turnover_pct=7%` per portfolio run,
-`daily_turnover_budget_pct=15%`). It blocks same-day re-entry after a hard exit
-or confirmed missing-target exit. A model-level drift threshold exists for
-experiments, but the candidate config keeps `target_drift_threshold_pct=0.0`
-because a 2.5% threshold reduced order count while worsening the 2026-05-11..15
-minute replay drawdown. The turnover cap allocates budget to top ranked,
-whole-share-buyable targets first instead of spreading tiny unfillable targets
-across many names. This keeps the model LEAN-style while reducing the same-day
-target churn seen in minute replays.
+The daily artifact schema is intentionally small:
+
+```json
+{
+  "sleeve_id": "LEaps",
+  "target_id": "leaps-agent-20260522",
+  "generated_at": "2026-05-22T08:40:00+09:00",
+  "expires_at": "2026-05-23T08:40:00+09:00",
+  "max_gross_exposure": 0.98,
+  "flatten": false,
+  "targets": [
+    {
+      "symbol": "KRX:005930",
+      "name": "Samsung Electronics",
+      "target_percent": 0.20,
+      "confidence": 0.75,
+      "reason": "daily_agent_target"
+    }
+  ]
+}
+```
+
+The model accepts `target_percent`, `weight`, or `target_weight`; values like
+`20` are interpreted as 20%. The live config allows only `KRX` symbols so KRW
+and USD buckets cannot be mixed accidentally. Risk and execution are unchanged:
+the KRW risk model still clamps concentration, exposure, stale snapshots, and
+symbol-level stop rules, and `executions/leaps_immediate.py` still controls
+limit order style, slicing, and anti-oscillation behavior.
+
+The live execution model now sizes each child order dynamically: the previous
+2,000,000 KRW slice cap is only a fallback, while normal operation uses roughly
+20% of current KRW sleeve equity, bounded to 1,000,000-5,000,000 KRW and capped
+again by 0.08% of rolling 20-day traded value when that metadata is available.
 
 The smoke/research RL config remains available via `portfolios/rl_ppo_constructor.py`,
 which wraps a Stable-Baselines3 PPO policy ensemble. In the active
@@ -277,25 +300,27 @@ window unless the target is tagged as an urgent exit. Empty raw target batches
 remain no-action by default; explicit 0% targets are required when a model wants
 to close everything.
 
-Alpha v0.3 notes:
+Alpha v0.4 notes:
 
 - `leaps-kospi-conviction` is the active KRW growth alpha. It only emits KRX
   UP insights and reflects the working thesis that KOSPI upside should receive
   the primary risk budget. Its current score includes recency-weighted
   momentum, trend strength, entry-timing metadata, liquidity, and a
-  volatility-regime adjustment. In high volatility it favors confirmed
-  breakouts near 20-day highs and penalizes choppy pullbacks or negative
-  short-term momentum.
+  volatility-regime adjustment. v0.4 runs every five minutes and uses the
+  live mark price when available, while keeping confirmed daily momentum/SMA
+  windows intact. In high volatility it now admits stronger confirmed breakouts
+  and penalizes volatility less than the defensive v0.3 profile.
 - `leaps-kospi-pullback-reversion` is active as the timing alpha for strong KRX
   stocks. It looks for healthy pullbacks or shallow rebreaks inside an existing
-  uptrend. In volatile windows it no longer treats every pullback as buyable:
-  falling pullbacks must stabilize first, while positive rebreaks can still
-  pass with a smaller volatility haircut.
+  uptrend. v0.4 widens the acceptable pullback/rebreak band, lowers the trend
+  hurdle, and runs every five minutes so fresh intraday marks can improve entry
+  timing without advancing daily indicators.
 - `leaps-kospi-swing-rebalance` is active as the swing alpha for a choppy
-  uptrend. It buys liquid KRX names on controlled pullbacks while 5-day and
-  20-day momentum stay positive, emits partial-trim FLAT insights on 10-day
-  moving-average breaks, volatility shocks, or near-high overextension, and
-  emits full-exit FLAT insights on 20-day moving-average breaks.
+  uptrend. v0.4 buys liquid KRX names on controlled pullbacks and can also buy
+  near-high breakout continuation when 5-day and 20-day momentum are both
+  strong. It still emits partial-trim FLAT insights on 10-day moving-average
+  breaks, volatility shocks, or near-high overextension, and emits full-exit
+  FLAT insights on 20-day moving-average breaks.
 - `leaps-krx-etf-safety` is active in `live_multi_sleeve` and the KR200
   candidate config. It reads KODEX 200 daily indicators as the local market
   proxy and emits target-bucket ETF insights for cash-like KRX ETFs, KODEX 200,
@@ -311,7 +336,8 @@ Alpha v0.3 notes:
   operationally watched or held symbols. It reads prior high-watermark state
   through `context.model_state` and requests updates with `StatePatch` records
   in the `trailing_stop` namespace; it does not read or write virtual account
-  files directly.
+  files directly. It now runs on the same five-minute alpha cadence; immediate
+  risk overrides still belong in the risk model rather than alpha.
 - `risks/kospi_growth_us_hedge.py` currently applies the KRW growth budget and
   regime exposure cap for this KRX-only LEaps profile. It also has an
   intraday KODEX 200 guard for minute/live cycles: before 09:40 it freezes new
@@ -332,6 +358,10 @@ Execution v0.2 notes:
   reductions keep full size.
 - KRX after-hours single-price remains blocked by default unless symbol/venue
   support is explicitly verified later.
+- Child order size is dynamic in live v4: fallback `max_slice_notional` is
+  2,000,000 KRW, but enabled policy uses 20% of sleeve KRW equity, bounded to
+  1,000,000-5,000,000 KRW and capped by rolling 20-day traded value when
+  supplied by the data slice.
 
 If the policy file is absent, the runtime model falls back to a deterministic
 configured exposure level so config validation and smoke tests still run.

@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 
 _MINUTE_CADENCE_PATTERN = re.compile(r"^(?:every_)?(\d+)(?:_?m|_?min|_?minute|_?minutes)$")
+_DAY_CADENCE_PATTERN = re.compile(r"^(?:every_)?(\d+)(?:_?d|_?day|_?days)$")
 _DAILY_AT_PATTERN = re.compile(r"^(?:daily_at|every_trading_day_at)\s+(\d{1,2}:\d{2})(?:\s+(\S+))?$")
 _WEEK_START_AT_PATTERN = re.compile(r"^week_start_at\s+(\d{1,2}:\d{2})(?:\s+(\S+))?$")
 _WEEKLY_AT_PATTERN = re.compile(r"^weekly_at\s+(\w+)\s+(\d{1,2}:\d{2})(?:\s+(\S+))?$")
@@ -45,6 +46,9 @@ def normalize_cadence(value: str | None) -> str:
     minute_interval = _minute_interval(cadence)
     if minute_interval is not None:
         return f"every_{minute_interval}_minutes"
+    day_interval = _day_interval(cadence)
+    if day_interval is not None:
+        return f"every_{day_interval}_days"
     return cadence or "every_cycle"
 
 
@@ -66,6 +70,9 @@ def cadence_due(cadence: str | None, as_of: datetime, last_run_at: datetime | No
     minute_interval = _minute_interval(normalized)
     if minute_interval is not None:
         return as_of - last_run_at >= timedelta(minutes=minute_interval)
+    day_interval = _day_interval(normalized)
+    if day_interval is not None:
+        return as_of.date() >= last_run_at.date() + timedelta(days=day_interval)
     if normalized == "manual":
         return False
     raise ValueError(f"Unsupported cadence: {cadence}")
@@ -157,6 +164,16 @@ def _minute_interval(cadence: str) -> int | None:
     interval = int(match.group(1))
     if interval <= 0:
         raise ValueError(f"Minute cadence must be positive: {cadence}")
+    return interval
+
+
+def _day_interval(cadence: str) -> int | None:
+    match = _DAY_CADENCE_PATTERN.match(cadence)
+    if match is None:
+        return None
+    interval = int(match.group(1))
+    if interval <= 0:
+        raise ValueError(f"Day cadence must be positive: {cadence}")
     return interval
 
 

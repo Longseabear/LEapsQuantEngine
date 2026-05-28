@@ -1,6 +1,6 @@
 # Current Status
 
-Last updated: 2026-05-17
+Last updated: 2026-05-22
 
 This document records what is currently implemented and what should come next. It is intentionally operational: keep it close to the code and update it whenever a public runtime contract changes.
 
@@ -36,8 +36,9 @@ ownership live in `docs/lean-core-hardening.md`.
   and regular/extended session rules are built in; holiday accuracy depends on
   configured calendar artifacts.
 - `SymbolProperties` and `SecurityCatalog` resolve symbol-level execution
-  properties from universe metadata plus defaults. Domestic KRX orders default
-  to broker `SOR`, while explicit `KRX`/`NXT`/`SOR` metadata can override.
+  properties from universe metadata plus defaults. Domestic KRX stocks default
+  to broker `SOR`, while domestic ETF/ETN/ELW symbols default to `KRX` unless
+  explicit `KRX`/`NXT`/`SOR` metadata overrides the route.
   Engine guard and broker submit validation use lot size, quantity step,
   sessions, and exchange metadata before a live KIS call is attempted.
 
@@ -109,6 +110,18 @@ ownership live in `docs/lean-core-hardening.md`.
   target-bucket insights, and `portfolios/research_adaptive_allocator.py`
   consumes those insights as a separate ETF bucket so they do not contaminate
   stock top-k ranking.
+- LEaps also has an alpha-less daily target mode for live experimentation.
+  `selections/agent_daily_target.py` and `portfolios/agent_daily_target.py`
+  read `data/operator-targets/LEaps/latest_target.json`, select only the
+  artifact symbols that exist in the KRX coarse universe, and emit
+  `PortfolioAllocationTarget` percentages. The active `live_multi_sleeve`
+  LEaps config currently uses this mode with `alpha.modules=[]`, active
+  universe refresh at 08:45 KST, portfolio target refresh at 08:50 KST, KRX-only
+  target validation, stale/missing artifact fail-closed behavior, and explicit
+  0% targets for held KRX symbols missing from a valid daily artifact.
+- `docs/agent-authored-sleeve-guide.md` now documents this reusable pattern for
+  other sleeves: target artifact boundaries, agent memory layout, inference
+  workflow, live readiness checks, and point-in-time backtesting.
 - LEaps KRW risk also has an intraday KODEX 200 guard for minute/live cycles.
   `risks/kospi_growth_us_hedge.py` stores the guard's session high through
   `context.model_state`/`StatePatch`, freezes new stock entries before the
@@ -321,15 +334,18 @@ is the default and participates in `required_warmup_bars`,
 `min_ready_ratio`, and `warmup_not_ready`; `readiness="optional"` indicators
 are still registered and updated when history exists, but missing optional
 values are reported separately and do not block fresh entries by themselves.
-The LEaps workspace config now uses `configs/universes/leaps_kr_research_core.json`,
-a KRX research universe. The active thesis is KRW/KOSPI upside:
+The LEaps workspace config now uses `configs/universes/leaps_kr_research_200.json`,
+a KRX research universe. The active thesis is aggressive KRW/KOSPI upside:
 `leaps-kospi-conviction` emits concentrated KRX growth insights,
 `leaps-kospi-pullback-reversion` adds pullback/rebreak timing insights, and
 `leaps-kospi-swing-rebalance` adds choppy-uptrend behavior by buying controlled
-pullbacks, partially trimming 10-day moving-average breaks or near-high
-overextension, and fully exiting 20-day moving-average breaks. Its trim/exit
-signals are FLAT insights consumed by portfolio construction; the alpha still
-does not create orders or touch broker state.
+pullbacks or confirmed breakout continuation, partially trimming 10-day
+moving-average breaks or near-high overextension, and fully exiting 20-day
+moving-average breaks. The growth alphas run every five minutes and may use
+`live_close` as the mark price, while confirmed daily momentum/SMA indicators
+remain on the daily lane. Their trim/exit signals are FLAT insights consumed by
+portfolio construction; alpha still does not create orders or touch broker
+state.
 `leaps-krx-etf-safety` has also been tightened for crash days: shock regimes
 now target a much larger cash-like plus KODEX Inverse safety book, and
 `risks/kospi_growth_us_hedge.py` treats the KODEX 200 intraday high-watermark
@@ -337,11 +353,15 @@ guard as a stock-risk cap rather than a cap on cash-like/inverse protection.
 The universe includes optional `live_close` so the ETF safety alpha can detect
 an intraday KODEX 200 shock without letting minute bars advance confirmed daily
 SMA/ROC indicators.
-`leaps-volatility-trailing-stop` remains the exit/risk-reduction alpha. US ETF
-rotation/stability is handled by the separate `us_etf_rotation` sleeve. The
-default sleeve is still present in the same config with zero cash and no alpha
-modules, so order/target activity should be isolated to LEaps when
-`--sleeve-id LEaps` is used.
+`leaps-volatility-trailing-stop` remains the exit/risk-reduction alpha and is
+also on the five-minute alpha cadence; immediate safety overrides belong in the
+risk model. `portfolios/v4_banded_momentum.py` is the active deterministic
+portfolio model for LEaps. Fresh target construction runs every three calendar
+days, while the five-minute worker cycle reuses the last target for drift
+sizing, risk, and execution. US ETF rotation/stability is handled by the
+separate `us_etf_rotation` sleeve. The default sleeve is still present in the
+same config with zero cash and no alpha modules, so order/target activity
+should be isolated to LEaps when `--sleeve-id LEaps` is used.
 Backtest reports now include `final_cash_by_currency`,
 `final_equity_by_currency`, and `metrics_by_currency`. For mixed KRW/USD runs,
 the aggregate `metrics` block is marked `valid_without_fx=false` and
@@ -1089,6 +1109,26 @@ Current v0 behavior:
 - Execution now has a small `ExecutionEngine` that wraps a sleeve execution model and returns an auditable `OrderIntentBatch`.
 - Sleeves can inject execution models through `execution.model` and `execution.parameters`. File-based execution model references resolve relative to `workspace_path`, matching alpha, portfolio, and risk loading.
 - Execution models convert approved targets into `OrderIntent` records only. `ImmediateExecutionModel` remains the default one-ticket limit model, while `StandardExecutionModel`, `LimitExecutionModel`, `MarketExecutionModel`, and `SlicedExecutionModel` can express market/limit style, time-in-force, limit offsets, quantity/notional slicing, and lifecycle policy metadata such as urgency, max order age, price drift tolerance, minimum replace interval, and max replacement count. They do not submit broker orders.
+- `ExecutionContext.pending_orders` now gives execution models an immutable,
+  broker-agnostic view of working order state for the current sleeve/account
+  route. Runtime live/paper paths build it from configured order runtime
+  stores, while backtests use the same interface with an empty or injected
+  pending state.
+- `StandardExecutionModel` now uses LEAN-style unordered quantity before
+  emitting normal order intents:
+
+```text
+projected_quantity = current_quantity + open_buy_quantity - open_sell_quantity
+unordered_delta = target_quantity - projected_quantity
+```
+
+  If pending open tickets already cover the target quantity, no duplicate
+  normal intent is emitted. If only part of the target is working, execution
+  emits only the remaining unordered quantity. Order metadata includes raw
+  delta, unordered delta, projected quantity, pending quantities, pending
+  ticket ids, target batch ids, and `target_lifecycle=order_intent_created`.
+  Urgent stop/risk exit tags can bypass this normal suppression, but broker
+  submission still goes through order runtime and engine guards.
 - Execution model interfaces are now session-aware without breaking older
   models. A custom model may keep the legacy four-argument `create_orders`
   signature, or opt into `execution_context` / `market_session`. The context
@@ -1181,8 +1221,11 @@ Current v0 behavior:
 - The bounded multi-sleeve live loop supports cycle-boundary hot reload through
   `data/runtime/control/live.jsonl`. `activate_sleeve` adds a configured sleeve
   to the active set, `deactivate_sleeve` removes one only when it has no open
-  tickets and no holdings, and `reload_config` / `reload_sleeve` swap validated
-  config/model changes for the next cycle. The active set is persisted at
+  tickets and no holdings, `suspend_sleeve` temporarily removes one from alpha /
+  portfolio / risk / execution cycles while preserving its holdings and virtual
+  account state, `resume_sleeve` adds a suspended sleeve back, and
+  `reload_config` / `reload_sleeve` swap validated config/model changes for the
+  next cycle. The active set is persisted at
   `data/runtime/live-order-loop/multi_sleeve_active_sleeves.json`.
 - Active does not mean every sleeve runs every minute. The live loop has a
   sleeve schedule gate before `runtime-run-multi-once`: by default `LEaps` runs
@@ -1198,6 +1241,8 @@ Example hot reload controls:
 $env:PYTHONPATH='src'
 py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command activate-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id new_sleeve --reason "operator activate"
 py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command reload-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --reason "model update"
+py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command suspend-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --reason "temporary pause with holdings preserved"
+py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command resume-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id LEaps --reason "resume trading cycles"
 py -3 -m leaps_quant_engine.cli runtime-control-submit --queue data/runtime/control/live.jsonl --command deactivate-sleeve --config configs/runtime/live_multi_sleeve.json --sleeve-id old_sleeve --reason "no positions"
 ```
 

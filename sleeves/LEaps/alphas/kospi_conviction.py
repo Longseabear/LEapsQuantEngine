@@ -6,28 +6,28 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-kospi-conviction"
-VERSION = "0.3.0"
-EVALUATION_CADENCE = "every_15_minutes"
+VERSION = "0.4.0"
+EVALUATION_CADENCE = "every_5_minutes"
 INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=10)
-MAX_SELECTED = 8
-MIN_SCORE = 0.025
-KOSPI_BIAS_BONUS = 0.04
-MAX_NORMALIZED_VOLATILITY = 0.16
-EXTREME_NORMALIZED_VOLATILITY = 0.22
-HIGH_VOL_MOMENTUM_EXCEPTION = 0.45
-HIGH_VOL_TREND_EXCEPTION = 0.18
-ENTRY_TIMING_WEIGHT = 0.12
-MAX_HEALTHY_PULLBACK = 0.14
-MIN_HEALTHY_PULLBACK = 0.012
-MAX_REBREAK_DISTANCE = 0.04
-MIN_REBREAK_MOMENTUM_5 = 0.015
-VOLATILITY_CHOP_START = 0.13
-VOLATILITY_STRESS_START = 0.16
-VOLATILITY_BREAKOUT_MIN_MOMENTUM_5 = 0.03
-VOLATILITY_BREAKOUT_MIN_TREND = 0.12
-VOLATILITY_BREAKOUT_MAX_PULLBACK = 0.05
-VOLATILITY_CHOP_MAX_PULLBACK = 0.08
+MAX_SELECTED = 12
+MIN_SCORE = 0.010
+KOSPI_BIAS_BONUS = 0.055
+MAX_NORMALIZED_VOLATILITY = 0.22
+EXTREME_NORMALIZED_VOLATILITY = 0.30
+HIGH_VOL_MOMENTUM_EXCEPTION = 0.35
+HIGH_VOL_TREND_EXCEPTION = 0.12
+ENTRY_TIMING_WEIGHT = 0.10
+MAX_HEALTHY_PULLBACK = 0.18
+MIN_HEALTHY_PULLBACK = 0.006
+MAX_REBREAK_DISTANCE = 0.07
+MIN_REBREAK_MOMENTUM_5 = 0.005
+VOLATILITY_CHOP_START = 0.18
+VOLATILITY_STRESS_START = 0.22
+VOLATILITY_BREAKOUT_MIN_MOMENTUM_5 = 0.015
+VOLATILITY_BREAKOUT_MIN_TREND = 0.08
+VOLATILITY_BREAKOUT_MAX_PULLBACK = 0.08
+VOLATILITY_CHOP_MAX_PULLBACK = 0.14
 MAX_PLAUSIBLE_DAILY_FEATURE_ABS = 3.0
 
 
@@ -43,7 +43,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
         if not symbol_key.startswith("KRX:"):
             continue
         krx_count += 1
-        close = _first_value(context, symbol_key, ("identity_close", "close"))
+        close = _mark_price(context, symbol_key)
         fast_average = _first_value(context, symbol_key, ("ema_8_close", "sma_5_close"))
         slow_average = _first_value(context, symbol_key, ("sma_20_close", "sma_5_close"))
         momentum_5 = _first_value(context, symbol_key, ("momentum_5_close",))
@@ -88,7 +88,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
             trend_strength=trend_strength,
             pullback_from_high=float(entry_timing["pullback_from_high"]),
         )
-        liquidity_bonus = 0.0 if liquidity is None else min(liquidity / 4_000_000_000_000.0, 0.04)
+        liquidity_bonus = 0.0 if liquidity is None else min(liquidity / 2_500_000_000_000.0, 0.06)
         raw_candidates.append(
             {
                 "symbol_key": symbol_key,
@@ -126,12 +126,12 @@ def generate(context: SnapshotContext) -> list[Insight]:
         score = (
             KOSPI_BIAS_BONUS
             + market_conviction_bonus
-            + (recency_weighted_momentum * 0.65)
-            + (trend_strength * 0.22)
+            + (recency_weighted_momentum * 0.82)
+            + (trend_strength * 0.30)
             + (float(item["entry_timing_score"]) * ENTRY_TIMING_WEIGHT)
             + float(item["liquidity_bonus"])
             + float(item["volatility_regime_adjustment"])
-            - min(volatility, 0.35) * 0.55
+            - min(volatility, 0.35) * 0.34
         )
         if score < MIN_SCORE:
             continue
@@ -303,6 +303,13 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
+
+
+def _mark_price(context: SnapshotContext, symbol_key: str) -> float | None:
+    live_close = context.value(symbol_key, "live_close", ready_only=False)
+    if live_close is not None:
+        return live_close
+    return _first_value(context, symbol_key, ("identity_close", "close"))
 
 
 def _has_implausible_daily_feature(*values: float | None) -> bool:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "LEaps Strategy Docs"
+  short_description: "Write UI-facing sleeve strategy documents with a Korean ABSTRACT first."
+  default_prompt: "Use this skill to create or update sleeves/<sleeve_id>/STRATEGY.md so the first section is a Korean ABSTRACT explaining the strategy philosophy, followed by concise LEAN-style model details."

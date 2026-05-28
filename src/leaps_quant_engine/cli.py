@@ -7,7 +7,7 @@ import time as perf_time
 from dataclasses import dataclass, replace
 from datetime import datetime, time as clock_time, timedelta, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from leaps_quant_engine.adapters.kis import (
@@ -19,6 +19,7 @@ from leaps_quant_engine.adapters.finance_datareader import (
     FinanceDataReaderFundamentalProvider,
     FinanceDataReaderMarketDataProvider,
 )
+from leaps_quant_engine.adapters.parquet_daily import ParquetDailyBarProvider
 from leaps_quant_engine.account_sync import KISVirtualAccountSync
 from leaps_quant_engine.account_sync import KISAccountClient
 from leaps_quant_engine.alpha import AlphaRuntime, PythonAlphaLoader, SnapshotContext
@@ -111,6 +112,7 @@ from leaps_quant_engine.runtime_preflight import build_runtime_preflight_report
 from leaps_quant_engine.runtime_recovery import build_recovery_account_report, build_recovery_report
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore, SQLiteRuntimeStateStore, fork_sqlite_runtime_state
 from leaps_quant_engine.rl import train_ppo_portfolio_constructor
+from leaps_quant_engine.security import SecurityCatalog, SymbolProperties, symbol_properties_from_metadata
 from leaps_quant_engine.snapshot_worker import BackgroundSnapshotWorker
 from leaps_quant_engine.temporal_features import temporal_feature_provider_from_portfolio_parameters
 from leaps_quant_engine.sleeve_workspace import (
@@ -205,6 +207,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "reload-sleeve",
             "activate-sleeve",
             "deactivate-sleeve",
+            "suspend-sleeve",
+            "resume-sleeve",
             "pause-worker",
             "resume-worker",
             "run-once",
@@ -442,8 +446,61 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_health.add_argument("--broker", default="paper", choices=("broker-engine", "paper"))
     runtime_health.add_argument("--max-cycle-age-seconds", type=float, default=300.0)
     runtime_health.add_argument("--max-open-ticket-age-seconds", type=float, default=600.0)
+    runtime_health.add_argument("--heartbeat", type=Path)
+    runtime_health.add_argument("--heartbeat-component")
+    runtime_health.add_argument("--max-heartbeat-age-seconds", type=float, default=120.0)
     runtime_health.add_argument("--recent-events", type=int, default=10)
     runtime_health.add_argument("--summary-only", action="store_true")
+
+    runtime_artifact_status = subparsers.add_parser("runtime-artifact-status")
+    runtime_artifact_status.add_argument("config", type=Path)
+    runtime_artifact_status.add_argument("--sleeve-id", action="append", default=[])
+    runtime_artifact_status.add_argument("--active-only", action="store_true")
+    runtime_artifact_status.add_argument(
+        "--active-sleeves-path",
+        type=Path,
+        default=Path("data/runtime/live-order-loop/multi_sleeve_active_sleeves.json"),
+    )
+    runtime_artifact_status.add_argument("--control-queue", type=Path, default=Path("data/runtime/control/live.jsonl"))
+    runtime_artifact_status.add_argument(
+        "--framework-state-dir",
+        type=Path,
+        default=Path("data/runtime/framework-state/multi-sleeve"),
+    )
+    runtime_artifact_status.add_argument(
+        "--order-batch",
+        type=Path,
+        default=Path("data/runtime/live-order-loop/multi_sleeve_candidate_orders.json"),
+    )
+    runtime_artifact_status.add_argument(
+        "--live-loop-log",
+        type=Path,
+        default=Path("data/runtime/live-order-loop/multi_sleeve.log"),
+    )
+    runtime_artifact_status.add_argument(
+        "--live-loop-heartbeat",
+        type=Path,
+        default=Path("data/runtime/live-order-loop/multi_sleeve_heartbeat.json"),
+    )
+    runtime_artifact_status.add_argument("--runtime-state", type=Path)
+    runtime_artifact_status.add_argument(
+        "--submit-state",
+        type=Path,
+        default=Path("data/runtime/live-order-loop/multi_sleeve_submit_state.json"),
+    )
+    runtime_artifact_status.add_argument(
+        "--report-dir",
+        type=Path,
+        default=Path("data/runtime/portfolio-reports"),
+    )
+    runtime_artifact_status.add_argument("--eod-snapshot-root", type=Path, default=Path("data/eod-snapshots"))
+    runtime_artifact_status.add_argument("--eod-state-dir", type=Path, default=Path("data/runtime/eod-snapshots"))
+    runtime_artifact_status.add_argument(
+        "--startup-status",
+        type=Path,
+        default=Path("data/runtime/startup/leaps_safe_start_live_stack_status.json"),
+    )
+    runtime_artifact_status.add_argument("--summary-only", action="store_true")
 
     operator_ui = subparsers.add_parser("operator-ui")
     operator_ui.add_argument("config", type=Path)
@@ -524,7 +581,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     framework_backtest.add_argument("--cash", type=float, default=100_000.0)
     framework_backtest.add_argument("--slippage-bps", type=float, default=0.0)
     framework_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
-    framework_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    framework_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache", "parquet-daily"))
     framework_backtest.add_argument("--refresh-history", action="store_true")
     framework_backtest.add_argument("--fundamentals-root", type=Path)
     framework_backtest.add_argument("--fundamentals-market")
@@ -545,7 +602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_backtest.add_argument("--currency")
     runtime_backtest.add_argument("--slippage-bps", type=float, default=0.0)
     runtime_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
-    runtime_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    runtime_backtest.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache", "parquet-daily"))
     runtime_backtest.add_argument("--refresh-history", action="store_true")
     runtime_backtest.add_argument("--fundamentals-root", type=Path)
     runtime_backtest.add_argument("--fundamentals-market")
@@ -569,7 +626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_minute_backtest.add_argument("--currency")
     runtime_minute_backtest.add_argument("--slippage-bps", type=float, default=0.0)
     runtime_minute_backtest.add_argument("--fee-model", choices=("none", "kis"), default="none")
-    runtime_minute_backtest.add_argument("--daily-source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    runtime_minute_backtest.add_argument("--daily-source", default="finance-datareader", choices=("finance-datareader", "kis-cache", "parquet-daily"))
     runtime_minute_backtest.add_argument("--refresh-history", action="store_true")
     runtime_minute_backtest.add_argument("--daily-warmup-cache", type=Path)
     runtime_minute_backtest.add_argument("--refresh-daily-warmup-cache", action="store_true")
@@ -636,7 +693,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_rl_constructor.add_argument("--sleeve-id", required=True)
     train_rl_constructor.add_argument("--start")
     train_rl_constructor.add_argument("--end")
-    train_rl_constructor.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache"))
+    train_rl_constructor.add_argument("--source", default="finance-datareader", choices=("finance-datareader", "kis-cache", "parquet-daily"))
     train_rl_constructor.add_argument("--timesteps", type=int, default=10_000)
     train_rl_constructor.add_argument("--seed", type=int, default=7)
     train_rl_constructor.add_argument("--ensemble-seed", type=int, action="append", default=[])
@@ -1570,6 +1627,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     broker=args.broker,
                     max_cycle_age_seconds=args.max_cycle_age_seconds,
                     max_open_ticket_age_seconds=args.max_open_ticket_age_seconds,
+                    heartbeat_path=_cwd_path(args.heartbeat) if args.heartbeat is not None else None,
+                    heartbeat_component=args.heartbeat_component,
+                    max_heartbeat_age_seconds=args.max_heartbeat_age_seconds,
                     kis_gateway_base_url=(
                         snapshot.config.market_data.gateway_base_url
                         if snapshot.config.market_data.provider == "kis-gateway"
@@ -1594,6 +1654,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                     indent=2,
                 )
             )
+        return 0
+    if args.command == "runtime-artifact-status":
+        snapshot = load_runtime_config_snapshot(args.config)
+        active_sleeve_payload = _read_runtime_json(_cwd_path(args.active_sleeves_path))
+        requested_sleeve_ids = tuple(args.sleeve_id)
+        active_sleeve_ids = _active_sleeve_ids_from_payload(active_sleeve_payload)
+        if requested_sleeve_ids:
+            sleeve_ids = requested_sleeve_ids
+        elif args.active_only and active_sleeve_ids:
+            sleeve_ids = active_sleeve_ids
+        else:
+            sleeve_ids = tuple(sleeve.sleeve_id for sleeve in snapshot.config.sleeves)
+        report = _build_runtime_artifact_status_report(
+            snapshot,
+            sleeve_ids=sleeve_ids,
+            active_sleeve_ids=active_sleeve_ids,
+            active_sleeves_path=_cwd_path(args.active_sleeves_path),
+            active_sleeves_payload=active_sleeve_payload,
+            control_queue_path=_cwd_path(args.control_queue),
+            framework_state_dir=_cwd_path(args.framework_state_dir),
+            order_batch_path=_cwd_path(args.order_batch),
+            live_loop_log_path=_cwd_path(args.live_loop_log),
+            live_loop_heartbeat_path=_cwd_path(args.live_loop_heartbeat),
+            runtime_state_path=_cwd_path(args.runtime_state)
+            if args.runtime_state is not None
+            else _cwd_path(Path("data/runtime/runtime-state") / f"{snapshot.config.runtime_id}.sqlite"),
+            submit_state_path=_cwd_path(args.submit_state),
+            report_dir=_cwd_path(args.report_dir),
+            eod_snapshot_root=_cwd_path(args.eod_snapshot_root),
+            eod_state_dir=_cwd_path(args.eod_state_dir),
+            startup_status_path=_cwd_path(args.startup_status),
+            include_details=not args.summary_only,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if args.command == "operator-ui":
         from leaps_quant_engine.operator_ui import build_operator_dashboard_snapshot, serve_operator_ui
@@ -2105,6 +2199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             and not args.refresh_compiled_replay_cache
         ):
             feed, compiled_replay_cache_report = load_compiled_minute_replay_cache(compiled_cache_path)
+            feed = _slice_replay_feed(feed, start=start, end=end)
             feed_source = "compiled-replay-cache"
         else:
             source_signature = None
@@ -2179,6 +2274,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             if temporal_feature_provider is not None:
                 temporal_feature_provider.update(daily_warmup_bars)
         timings["daily_warmup_ms"] = _perf_elapsed_ms(warmup_started)
+        daily_replay_bars: list[Bar] = []
+        daily_replay_started = perf_time.perf_counter()
+        if feed:
+            daily_replay_start_at = (warmup_end + timedelta(days=1)) if warmup_end is not None else feed[0].time
+            daily_replay_start = datetime.combine(daily_replay_start_at.date(), clock_time.min)
+            daily_replay_end = end or feed[-1].time
+            daily_replay_bars = load_daily_warmup_bars_for_backtest(
+                daily_provider,
+                universe,
+                start=daily_replay_start,
+                end=daily_replay_end,
+                refresh_history=args.refresh_history,
+            )
+        timings["daily_replay_load_ms"] = _perf_elapsed_ms(daily_replay_started)
         universe_market = getattr(universe, "market", None)
         journal_store = FileCycleJournalStore(args.journal) if args.journal is not None else None
         journal_mode = _resolve_backtest_journal_mode(args)
@@ -2213,6 +2322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             warmup_data_slice_count=daily_warmup_bar_count,
             temporal_feature_provider=temporal_feature_provider,
             cycle_journal_include_lineage=journal_mode == "full",
+            daily_indicator_bars=daily_replay_bars,
         )
         timings["framework_replay_ms"] = _perf_elapsed_ms(replay_started)
         report_started = perf_time.perf_counter()
@@ -2245,9 +2355,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         report["minute_backtest"] = {
             "minute_feed": str(minute_feed_path) if minute_feed_path is not None else None,
             "minute_data_slice_count": len(feed),
+            "requested_start": start.isoformat() if start is not None else None,
+            "requested_end": end.isoformat() if end is not None else None,
+            "effective_start": _feed_start(feed),
+            "effective_end": _feed_end(feed),
             "daily_warmup_bar_count": daily_warmup_bar_count,
             "daily_warmup_start": warmup_start.isoformat() if warmup_start else None,
             "daily_warmup_end": warmup_end.isoformat() if warmup_end else None,
+            "daily_replay_bar_count": len(daily_replay_bars),
             "indicator_default_resolution": "daily",
         }
         if minute_cache_report is not None:
@@ -3199,11 +3314,35 @@ def _minute_backtest_warmup_end(feed, *, start: datetime | None) -> datetime | N
     return evaluation_start - timedelta(days=1)
 
 
+def _slice_replay_feed(feed, *, start: datetime | None, end: datetime | None):
+    if start is None and end is None:
+        return feed
+    return [
+        data
+        for data in feed
+        if (start is None or data.time >= start) and (end is None or data.time <= end)
+    ]
+
+
+def _feed_start(feed) -> str | None:
+    if not feed:
+        return None
+    return min(data.time for data in feed).isoformat()
+
+
+def _feed_end(feed) -> str | None:
+    if not feed:
+        return None
+    return max(data.time for data in feed).isoformat()
+
+
 def _daily_backtest_provider(source: str):
     if source == "finance-datareader":
         return FinanceDataReaderMarketDataProvider()
     if source == "kis-cache":
         return KISCachedMarketDataProvider.from_env()
+    if source == "parquet-daily":
+        return ParquetDailyBarProvider()
     raise ValueError(f"Unsupported daily backtest source: {source}")
 
 
@@ -3387,6 +3526,282 @@ def _runtime_journal_path(snapshot, explicit_path: Path | None) -> Path | None:
 def _runtime_journal_store(snapshot, explicit_path: Path | None):
     journal_path = _runtime_journal_path(snapshot, explicit_path)
     return FileCycleJournalStore(journal_path) if journal_path is not None else None
+
+
+def _build_runtime_artifact_status_report(
+    snapshot,
+    *,
+    sleeve_ids: tuple[str, ...],
+    active_sleeve_ids: tuple[str, ...],
+    active_sleeves_path: Path,
+    active_sleeves_payload: object,
+    control_queue_path: Path,
+    framework_state_dir: Path,
+    order_batch_path: Path,
+    live_loop_log_path: Path,
+    live_loop_heartbeat_path: Path,
+    runtime_state_path: Path,
+    submit_state_path: Path,
+    report_dir: Path,
+    eod_snapshot_root: Path,
+    eod_state_dir: Path,
+    startup_status_path: Path,
+    include_details: bool = True,
+) -> dict[str, object]:
+    selected_sleeves = tuple(snapshot.config.sleeve(sleeve_id) for sleeve_id in sleeve_ids)
+    journal_path = _runtime_journal_path(snapshot, None)
+    routes = _resolve_order_runtime_routes(snapshot, None, None, None, sleeve_ids)
+    warnings: list[str] = []
+
+    route_payloads = []
+    for route in routes:
+        route_sleeve_ids = tuple(
+            sleeve.sleeve_id
+            for sleeve in selected_sleeves
+            if route.account_id is None
+            or route.account_id in configured_account_ids_for_sleeve(sleeve)
+        )
+        if not route.account_store_path.exists():
+            warnings.append(f"missing_account_store:{route.account_id or 'default'}:{route.account_store_path}")
+        if not route.order_store_path.exists():
+            warnings.append(f"missing_order_store:{route.account_id or 'default'}:{route.order_store_path}")
+        route_payloads.append(
+            {
+                "account_id": route.account_id,
+                "market_scope": route.market_scope,
+                "currency": route.currency,
+                "sleeve_ids": list(route_sleeve_ids),
+                "account_store": _path_status(route.account_store_path),
+                "order_store": _path_status(route.order_store_path),
+            }
+        )
+
+    sleeve_payloads = [
+        _runtime_artifact_status_for_sleeve(
+            snapshot,
+            sleeve,
+            active_sleeve_ids=active_sleeve_ids,
+            framework_state_dir=framework_state_dir,
+            report_dir=report_dir,
+        )
+        for sleeve in selected_sleeves
+    ]
+    for sleeve_payload in sleeve_payloads:
+        framework_state = sleeve_payload.get("framework_state")
+        if isinstance(framework_state, Mapping) and not framework_state.get("exists"):
+            warnings.append(f"missing_framework_state:{sleeve_payload.get('sleeve_id')}:{framework_state.get('path')}")
+
+    if not active_sleeves_path.exists():
+        warnings.append(f"missing_active_sleeves_file:{active_sleeves_path}")
+    if journal_path is not None and not journal_path.exists():
+        warnings.append(f"missing_cycle_journal:{journal_path}")
+
+    active_payload: dict[str, object] = {
+        "path": _path_status(active_sleeves_path),
+        "active_sleeve_ids": list(active_sleeve_ids),
+    }
+    if isinstance(active_sleeves_payload, Mapping):
+        active_payload.update(
+            {
+                "updated_at": active_sleeves_payload.get("updated_at"),
+                "source": active_sleeves_payload.get("source"),
+                "config": active_sleeves_payload.get("config"),
+                "hot_reload": active_sleeves_payload.get("hot_reload"),
+            }
+        )
+
+    market_snapshot_store = (
+        _path_status(resolve_runtime_path(snapshot, snapshot.config.market_data.snapshot_store_path).resolve())
+        if snapshot.config.market_data.snapshot_store_path is not None
+        else None
+    )
+    report: dict[str, object] = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "read_only": True,
+        "runtime_id": snapshot.config.runtime_id,
+        "mode": snapshot.config.mode,
+        "config": {
+            "path": _path_status(snapshot.source_path.resolve()),
+            "version": snapshot.version,
+            "loaded_at": snapshot.loaded_at,
+        },
+        "selected_sleeve_ids": list(sleeve_ids),
+        "active_sleeves": active_payload,
+        "market_data": {
+            "provider": snapshot.config.market_data.provider,
+            "history_provider": snapshot.config.market_data.history_provider,
+            "rate_limit_per_second": snapshot.config.market_data.rate_limit_per_second,
+            "gateway_base_url": snapshot.config.market_data.gateway_base_url,
+            "snapshot_store": market_snapshot_store,
+        },
+        "journal": _path_status(journal_path) if journal_path is not None else None,
+        "runtime_control": {
+            "control_queue": _path_status(control_queue_path),
+        },
+        "live_order_loop": {
+            "log": _path_status(live_loop_log_path),
+            "heartbeat": {
+                "path": _path_status(live_loop_heartbeat_path),
+                "payload": _read_runtime_json(live_loop_heartbeat_path),
+            },
+            "order_batch": _path_status(order_batch_path),
+            "runtime_run_latest": _path_status(live_loop_log_path.parent / "multi_sleeve_runtime_run_latest.json"),
+            "submit_latest": _path_status(live_loop_log_path.parent / "multi_sleeve_submit_latest.json"),
+            "submit_state": _path_status(submit_state_path),
+            "runtime_state": _path_status(runtime_state_path),
+            "framework_state_dir": _path_status(framework_state_dir),
+            "start_stdout": _path_status(live_loop_log_path.parent / "multi_sleeve_start_stdout.log"),
+            "start_stderr": _path_status(live_loop_log_path.parent / "multi_sleeve_start_stderr.log"),
+        },
+        "portfolio_reports": {
+            "directory": _path_status(report_dir),
+        },
+        "eod_snapshots": {
+            "snapshot_root": _path_status(eod_snapshot_root),
+            "state_dir": _path_status(eod_state_dir),
+        },
+        "startup": {
+            "safe_start_status": _path_status(startup_status_path),
+        },
+        "routes": route_payloads,
+        "sleeves": sleeve_payloads,
+        "summary": {
+            "selected_sleeve_count": len(sleeve_ids),
+            "active_selected_sleeve_count": sum(1 for sleeve_id in sleeve_ids if sleeve_id in active_sleeve_ids),
+            "route_count": len(route_payloads),
+            "warning_count": len(warnings),
+            "warnings": warnings,
+        },
+    }
+    if include_details:
+        report["operator_rules"] = {
+            "strategy_workspace": "sleeves/<sleeve_id> contains strategy code and sleeve docs only.",
+            "runtime_config": "configs/runtime/*.json owns live wiring and account routes.",
+            "runtime_artifacts": "data/runtime, data/order-runtime, data/virtual-accounts, data/cycle-journal, and data/eod-snapshots are runtime state/read models.",
+            "safety": "This command is read-only and does not sync KIS, run models, submit orders, or mutate virtual accounts.",
+        }
+    return report
+
+
+def _runtime_artifact_status_for_sleeve(
+    snapshot,
+    sleeve,
+    *,
+    active_sleeve_ids: tuple[str, ...],
+    framework_state_dir: Path,
+    report_dir: Path,
+) -> dict[str, object]:
+    workspace = resolve_runtime_path(snapshot, sleeve.workspace_path).resolve()
+    safe_id = _safe_sleeve_filename(sleeve.sleeve_id)
+    latest_report = _latest_matching_path(report_dir, f"{sleeve.sleeve_id}_runtime_*.json")
+    report_log_name = _portfolio_report_log_name(sleeve.sleeve_id)
+    routes = []
+    route_map = dict(sleeve.broker_account_routes)
+    if not route_map and sleeve.broker_account_id:
+        route_map = {"default": sleeve.broker_account_id}
+    for market_scope, account_id in route_map.items():
+        try:
+            account = snapshot.config.broker_account(account_id)
+            routes.append(
+                {
+                    "market_scope": market_scope,
+                    "account_id": account.account_id,
+                    "currency": account.currency,
+                    "broker_gateway": account.broker_gateway,
+                    "account_store": _path_status(resolve_runtime_path(snapshot, account.account_store_path).resolve()),
+                    "order_store": _path_status(resolve_runtime_path(snapshot, account.order_store_path).resolve())
+                    if account.order_store_path is not None
+                    else None,
+                }
+            )
+        except KeyError:
+            routes.append({"market_scope": market_scope, "account_id": account_id, "error": "unknown_broker_account"})
+    return {
+        "sleeve_id": sleeve.sleeve_id,
+        "active": sleeve.sleeve_id in active_sleeve_ids,
+        "workspace": _path_status(workspace),
+        "strategy_doc": _path_status(workspace / "STRATEGY.md"),
+        "agents_doc": _path_status(workspace / "AGENTS.md"),
+        "readme": _path_status(workspace / "README.md"),
+        "framework_state": _path_status(framework_state_dir / f"{safe_id}.json"),
+        "latest_portfolio_report": _path_status(latest_report) if latest_report is not None else None,
+        "report_loop": {
+            "log": _path_status(report_dir / f"{report_log_name}.log"),
+            "state": _path_status(report_dir / f"{report_log_name}.state.json"),
+            "start_stdout": _path_status(report_dir / f"{report_log_name}_start_stdout.log"),
+            "start_stderr": _path_status(report_dir / f"{report_log_name}_start_stderr.log"),
+        },
+        "routes": routes,
+    }
+
+
+def _path_status(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {"path": str(resolved), "exists": False}
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "kind": "directory" if resolved.is_dir() else "file",
+        "size_bytes": stat.st_size if resolved.is_file() else None,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
+    }
+
+
+def _cwd_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else (Path.cwd() / candidate).resolve()
+
+
+def _read_runtime_json(path: Path | None) -> object:
+    if path is None:
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _active_sleeve_ids_from_payload(payload: object) -> tuple[str, ...]:
+    if not isinstance(payload, Mapping):
+        return ()
+    raw = payload.get("active_sleeve_ids")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(item) for item in raw if str(item).strip())
+
+
+def _latest_matching_path(root: Path, pattern: str) -> Path | None:
+    if not root.exists():
+        return None
+    matches = [path for path in root.glob(pattern) if path.is_file()]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _safe_sleeve_filename(sleeve_id: str) -> str:
+    return "".join(char if char.isalnum() or char in "._-" else "_" for char in sleeve_id)
+
+
+def _portfolio_report_log_name(sleeve_id: str) -> str:
+    known = {
+        "LEaps": "LEaps_portfolio_report_loop",
+        "kr-lowvol-defensive": "kr_lowvol_defensive_portfolio_report_loop",
+        "us_etf_rotation": "us_etf_rotation_portfolio_report_loop",
+    }
+    if sleeve_id in known:
+        return known[sleeve_id]
+    return f"{_safe_sleeve_filename(sleeve_id).replace('-', '_')}_portfolio_report_loop"
 
 
 def _runtime_state_store_from_args(snapshot, explicit_path: Path | None, *, read_only: bool):
@@ -3687,6 +4102,7 @@ def _routed_batches_for_submit(
 
 
 def _run_order_runtime_submit_for_route(snapshot, args, route: _OrderRuntimeRoute, sleeve_ids: tuple[str, ...], batches) -> object:
+    batches_tuple = tuple(batches)
     account_store = VirtualSleeveAccountStore(
         route.account_store_path,
         default_cash_by_sleeve=_default_cash_by_sleeve(snapshot, route.currency, route.account_id),
@@ -3722,8 +4138,9 @@ def _run_order_runtime_submit_for_route(snapshot, args, route: _OrderRuntimeRout
         market_scope=route.market_scope,
         currency=route.currency,
         market_session=_market_session_for_route(route),
+        security_catalog=_security_catalog_for_sleeves(snapshot, _sleeve_ids_for_batches(batches_tuple) or sleeve_ids),
     ).submit_batches(
-        batches,
+        batches_tuple,
         allowed_sleeve_ids=sleeve_ids,
         broker=args.broker,
         commit=args.commit,
@@ -3750,6 +4167,25 @@ def _max_submit_notional_for_route(args, route: _OrderRuntimeRoute) -> float | N
         if key.strip().lower() in route_keys:
             return float(value)
     return args.max_submit_notional
+
+
+def _security_catalog_for_sleeves(snapshot, sleeve_ids: Sequence[str]) -> SecurityCatalog | None:
+    properties: dict[str, SymbolProperties] = {}
+    for sleeve_id in sleeve_ids:
+        sleeve = snapshot.config.sleeve(sleeve_id)
+        try:
+            universe = load_universe_definition(resolve_runtime_path(snapshot, sleeve.universe.coarse_path))
+        except FileNotFoundError:
+            continue
+        for symbol in universe.symbols:
+            properties.setdefault(symbol.key, symbol_properties_from_metadata(symbol, universe.properties_for(symbol)))
+    if not properties:
+        return None
+    return SecurityCatalog(properties)
+
+
+def _sleeve_ids_for_batches(batches) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(str(batch.sleeve_id) for batch in batches if str(batch.sleeve_id)))
 
 
 def _market_session_for_route(route: _OrderRuntimeRoute):
@@ -4065,6 +4501,14 @@ def _build_runtime_control_command(args) -> RuntimeControlCommand:
         if args.config is None or not args.sleeve_id:
             raise SystemExit("runtime-control-submit --command deactivate-sleeve requires --config and --sleeve-id.")
         return RuntimeControlCommand.deactivate_sleeve(args.config, args.sleeve_id, reason=args.reason)
+    if args.control_command == "suspend-sleeve":
+        if args.config is None or not args.sleeve_id:
+            raise SystemExit("runtime-control-submit --command suspend-sleeve requires --config and --sleeve-id.")
+        return RuntimeControlCommand.suspend_sleeve(args.config, args.sleeve_id, reason=args.reason)
+    if args.control_command == "resume-sleeve":
+        if args.config is None or not args.sleeve_id:
+            raise SystemExit("runtime-control-submit --command resume-sleeve requires --config and --sleeve-id.")
+        return RuntimeControlCommand.resume_sleeve(args.config, args.sleeve_id, reason=args.reason)
     if args.control_command == "pause-worker":
         return RuntimeControlCommand.pause_worker(reason=args.reason)
     if args.control_command == "resume-worker":

@@ -7,8 +7,8 @@ from leaps_quant_engine.runtime_state import StatePatch
 
 
 ALPHA_ID = "leaps-volatility-trailing-stop"
-VERSION = "0.1.1"
-EVALUATION_CADENCE = "every_cycle"
+VERSION = "0.1.3"
+EVALUATION_CADENCE = "every_5_minutes"
 INPUT_RESOLUTION = "daily"
 HORIZON = timedelta(days=1)
 ATR_MULTIPLIER = 2.5
@@ -78,7 +78,7 @@ def state_patches(context: SnapshotContext, insights: tuple[Insight, ...] = ()) 
 
 
 def _trailing_mark(context: SnapshotContext, symbol_key: str) -> dict[str, float | None] | None:
-    close = _first_value(context, symbol_key, ("identity_close", "close"))
+    close = _mark_price(context, symbol_key)
     if close is None or close <= 0:
         return None
     rolling_high = _first_value(context, symbol_key, ("rolling_max_20_close", "max_20_close"))
@@ -140,3 +140,10 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
+
+
+def _mark_price(context: SnapshotContext, symbol_key: str) -> float | None:
+    live_close = context.value(symbol_key, "live_close", ready_only=False)
+    if live_close is not None:
+        return live_close
+    return _first_value(context, symbol_key, ("identity_close", "close"))

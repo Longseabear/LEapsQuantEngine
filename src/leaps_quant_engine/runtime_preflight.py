@@ -73,6 +73,10 @@ class RuntimePreflightReport:
                 actions.append("review_virtual_account_allocations")
             elif check.name in {"kis_gateway_liveness"}:
                 actions.append("start_or_check_kis_gateway")
+            elif check.name in {"market_data_gateway_policy"}:
+                actions.append("route_live_market_data_through_kis_gateway")
+            elif check.name in {"market_session_gate"}:
+                actions.append("respect_market_schedule_gate")
         return tuple(dict.fromkeys(actions))
 
     def to_dict(self, *, include_details: bool = True) -> dict[str, Any]:
@@ -120,7 +124,7 @@ def build_runtime_preflight_report(
     checks.extend(_file_checks(code_identity, strict_live=strict_live))
     checks.extend(_route_checks(snapshot, selected_sleeve_ids, strict_live=strict_live))
     checks.extend(_gateway_checks(snapshot, strict_live=strict_live))
-    checks.extend(_calendar_checks(snapshot, selected_sleeve_ids, generated_at=generated_at))
+    checks.extend(_calendar_checks(snapshot, selected_sleeve_ids, generated_at=generated_at, strict_live=strict_live))
     checks.extend(_journal_checks(snapshot, selected_sleeve_ids, code_identity, journal_store, journal_path))
     checks.extend(_order_status_checks(order_statuses))
     if check_bootstrap:
@@ -137,21 +141,35 @@ def build_runtime_preflight_report(
 
 def _gateway_checks(snapshot: RuntimeConfigSnapshot, *, strict_live: bool) -> tuple[RuntimePreflightCheck, ...]:
     market_data = snapshot.config.market_data
+    checks: list[RuntimePreflightCheck] = []
+    if snapshot.config.mode == "live" and market_data.provider != "kis-gateway":
+        checks.append(
+            RuntimePreflightCheck(
+                "market_data_gateway_policy",
+                "critical" if strict_live else "warning",
+                reason="live_market_data_must_use_kis_gateway",
+                metadata={
+                    "provider": market_data.provider,
+                    "expected_provider": "kis-gateway",
+                },
+            )
+        )
     if market_data.provider != "kis-gateway":
-        return ()
+        return tuple(checks)
     base_url = market_data.gateway_base_url
     if not base_url:
-        return (
+        checks.append(
             RuntimePreflightCheck(
                 "kis_gateway_liveness",
                 "critical" if strict_live and snapshot.config.mode == "live" else "warning",
                 reason="missing_gateway_base_url",
             ),
         )
+        return tuple(checks)
     try:
         health = fetch_kis_gateway_health(base_url, timeout_seconds=3.0)
     except Exception as exc:  # noqa: BLE001 - preflight must report failures without raising.
-        return (
+        checks.append(
             RuntimePreflightCheck(
                 "kis_gateway_liveness",
                 "critical" if strict_live and snapshot.config.mode == "live" else "warning",
@@ -159,8 +177,9 @@ def _gateway_checks(snapshot: RuntimeConfigSnapshot, *, strict_live: bool) -> tu
                 metadata={"base_url": base_url},
             ),
         )
+        return tuple(checks)
     status = str(health.get("status") or "").lower()
-    return (
+    checks.append(
         RuntimePreflightCheck(
             "kis_gateway_liveness",
             "ok" if status == "ok" else ("critical" if strict_live and snapshot.config.mode == "live" else "warning"),
@@ -173,6 +192,7 @@ def _gateway_checks(snapshot: RuntimeConfigSnapshot, *, strict_live: bool) -> tu
             },
         ),
     )
+    return tuple(checks)
 
 
 def _file_checks(code_identity: RuntimeCodeIdentity, *, strict_live: bool) -> tuple[RuntimePreflightCheck, ...]:
@@ -241,6 +261,7 @@ def _calendar_checks(
     sleeve_ids: tuple[str, ...],
     *,
     generated_at: datetime,
+    strict_live: bool,
 ) -> tuple[RuntimePreflightCheck, ...]:
     scopes: set[str] = set()
     for sleeve_id in sleeve_ids:
@@ -258,6 +279,30 @@ def _calendar_checks(
                 status,
                 reason=";".join(report.quality.warnings),
                 metadata=report.to_dict(),
+            )
+        )
+        gate_status = "ok"
+        gate_reason = ""
+        if not report.is_trading_day:
+            gate_status = "warning"
+            gate_reason = "non_trading_day"
+        elif not report.session.is_orderable:
+            gate_status = "warning"
+            gate_reason = f"session_not_orderable:{report.session.session_phase}"
+        checks.append(
+            RuntimePreflightCheck(
+                "market_session_gate",
+                gate_status,
+                reason=gate_reason,
+                metadata={
+                    "market_scope": scope,
+                    "session_phase": report.session.session_phase,
+                    "is_orderable": report.session.is_orderable,
+                    "is_regular_market_open": report.session.is_regular_market_open,
+                    "is_trading_day": report.is_trading_day,
+                    "next_open": report.next_open.isoformat() if report.next_open else None,
+                    "next_close": report.next_close.isoformat() if report.next_close else None,
+                },
             )
         )
     return tuple(checks)

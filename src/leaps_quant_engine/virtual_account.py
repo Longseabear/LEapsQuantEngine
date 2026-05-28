@@ -186,6 +186,37 @@ class PortfolioMutationRecord:
             "applied_at": self.applied_at.isoformat() if self.applied_at else None,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "PortfolioMutationRecord":
+        raw_symbol = payload.get("symbol")
+        symbol = (
+            _symbol_from_dict(dict(raw_symbol))
+            if isinstance(raw_symbol, Mapping)
+            else _symbol_from_key(str(raw_symbol or ""))
+        )
+        return cls(
+            sleeve_id=str(payload.get("sleeve_id") or ""),
+            symbol=symbol,
+            side=OrderSide(str(payload.get("side") or "buy")),
+            quantity=int(payload.get("quantity") or 0),
+            fill_price=float(payload.get("fill_price") or 0.0),
+            fee=float(payload.get("fee") or 0.0),
+            realized_pnl_estimate=float(payload.get("realized_pnl_estimate") or 0.0),
+            before_quantity=int(payload.get("before_quantity") or 0),
+            after_quantity=int(payload.get("after_quantity") or 0),
+            before_average_price=float(payload.get("before_average_price") or 0.0),
+            after_average_price=float(payload.get("after_average_price") or 0.0),
+            before_cash=float(payload.get("before_cash") or 0.0),
+            after_cash=float(payload.get("after_cash") or 0.0),
+            currency=str(payload.get("currency") or ""),
+            fill_id=str(payload.get("fill_id") or ""),
+            order_intent_id=str(payload.get("order_intent_id") or ""),
+            ticket_id=str(payload.get("ticket_id") or ""),
+            event_id=str(payload.get("event_id") or ""),
+            broker_order_id=str(payload.get("broker_order_id") or ""),
+            applied_at=_parse_optional_datetime(payload.get("applied_at")),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class FillApplicationReport:
@@ -1087,6 +1118,30 @@ class VirtualSleeveAccountStore(PortfolioProvider):
         state = self._load_state()
         return fill_id in state["fills"]
 
+    def portfolio_mutations(
+        self,
+        *,
+        sleeve_id: str | None = None,
+        symbol_key: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[PortfolioMutationRecord, ...]:
+        state = self._load_state()
+        mutations = [
+            PortfolioMutationRecord.from_dict(payload)
+            for payload in state.get("portfolio_mutations", {}).values()
+            if isinstance(payload, dict)
+        ]
+        if sleeve_id is not None:
+            mutations = [mutation for mutation in mutations if mutation.sleeve_id == sleeve_id]
+        if symbol_key is not None:
+            mutations = [mutation for mutation in mutations if mutation.symbol.key == symbol_key]
+        mutations.sort(key=lambda mutation: (mutation.applied_at or datetime.min, mutation.fill_id))
+        if limit == 0:
+            return ()
+        if limit is not None and limit > 0:
+            mutations = mutations[-limit:]
+        return tuple(mutations)
+
     def _resolve_ownership(self, state: dict[str, Any], fill: VirtualFillEvent) -> OrderOwnership | None:
         order_id = fill.order_id
         if order_id not in state["order_ownership"] and fill.broker_order_id:
@@ -1541,6 +1596,10 @@ def _symbol_to_dict(symbol: Symbol) -> dict[str, str]:
 
 def _symbol_from_dict(payload: dict[str, Any]) -> Symbol:
     return Symbol(str(payload["ticker"]), str(payload.get("market") or "KR"))
+
+
+def _symbol_from_key(symbol_key: str) -> Symbol:
+    return _symbol_from_dict(_symbol_dict_from_key(symbol_key))
 
 
 def _symbol_dict_from_key(symbol_key: str) -> dict[str, str]:

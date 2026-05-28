@@ -49,6 +49,31 @@ def test_parse_universe_definition_accepts_symbol_metadata_for_mixed_exchanges()
     assert universe.properties_for(universe.symbols[1])["exchange"] == "NYS"
 
 
+def test_parse_universe_definition_applies_operator_blacklist_without_blocking_common_stock():
+    universe = parse_universe_definition(
+        {
+            "id": "kr-operator-filter",
+            "market": "KRX",
+            "symbols": [
+                {"ticker": "005930", "name": "삼성전자", "asset_type": "stock"},
+                {"ticker": "500001", "name": "KODEX 삼성전자단일종목레버리지", "asset_type": "etf"},
+                {"ticker": "500002", "name": "TIGER 삼성전자 인버스2X", "asset_type": "etf"},
+                {"ticker": "114800", "name": "KODEX Inverse", "asset_type": "etf"},
+                {"ticker": "999999", "name": "Manual blocked product", "asset_type": "etf"},
+            ],
+            "metadata": {
+                "operator_excluded_symbols": ["KRX:999999"],
+                "operator_excluded_name_rules": [
+                    {"all": ["삼성전자"], "any": ["레버리지", "인버스", "2X"]}
+                ],
+            },
+            "indicators": [{"name": "close", "type": "close", "period": 1}],
+        }
+    )
+
+    assert universe.symbol_keys == ("KRX:005930", "KRX:114800")
+
+
 def test_parse_universe_definition_accepts_optional_indicator_readiness():
     universe = parse_universe_definition(
         {

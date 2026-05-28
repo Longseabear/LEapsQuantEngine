@@ -1,0 +1,7 @@
+{
+  "market": "US",
+  "holidays": [
+    "2026-05-25"
+  ],
+  "notes": "Minimal live safety calendar. 2026-05-25 is Memorial Day."
+}

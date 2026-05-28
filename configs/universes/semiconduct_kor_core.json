@@ -10,25 +10,7 @@
   ],
   "symbols": [
     {"ticker": "005930", "market": "KRX", "name": "Samsung Electronics", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_memory", "theme": ["semiconductor", "memory", "hbm"], "country": "KR"},
-    {"ticker": "000660", "market": "KRX", "name": "SK hynix", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_memory", "theme": ["semiconductor", "memory", "hbm"], "country": "KR"},
-    {"ticker": "042700", "market": "KRX", "name": "Hanmi Semiconductor", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "hbm", "packaging", "equipment"], "country": "KR"},
-    {"ticker": "000990", "market": "KRX", "name": "DB HiTek", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_foundry", "theme": ["semiconductor", "foundry"], "country": "KR"},
-    {"ticker": "403870", "market": "KRX", "name": "HPSP", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "equipment"], "country": "KR"},
-    {"ticker": "058470", "market": "KRX", "name": "LEENO Industrial", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_test", "theme": ["semiconductor", "test", "probe"], "country": "KR"},
-    {"ticker": "095340", "market": "KRX", "name": "ISC", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_test", "theme": ["semiconductor", "test", "socket"], "country": "KR"},
-    {"ticker": "108320", "market": "KRX", "name": "LX Semicon", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_fabless", "theme": ["semiconductor", "fabless"], "country": "KR"},
-    {"ticker": "067310", "market": "KRX", "name": "Hana Micron", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_osat", "theme": ["semiconductor", "packaging", "test", "osat"], "country": "KR"},
-    {"ticker": "036540", "market": "KRX", "name": "SFA Semicon", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_osat", "theme": ["semiconductor", "packaging", "test", "osat"], "country": "KR"},
-    {"ticker": "240810", "market": "KRX", "name": "Wonik IPS", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "equipment"], "country": "KR"},
-    {"ticker": "036930", "market": "KRX", "name": "Jusung Engineering", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "equipment"], "country": "KR"},
-    {"ticker": "319660", "market": "KRX", "name": "PSK", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "equipment"], "country": "KR"},
-    {"ticker": "095610", "market": "KRX", "name": "TES", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "equipment"], "country": "KR"},
-    {"ticker": "039030", "market": "KRX", "name": "EO Technics", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "laser", "equipment"], "country": "KR"},
-    {"ticker": "084370", "market": "KRX", "name": "Eugene Technology", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_equipment", "theme": ["semiconductor", "equipment"], "country": "KR"},
-    {"ticker": "357780", "market": "KRX", "name": "Soulbrain", "asset_type": "stock", "sector": "materials", "industry": "semiconductor_materials", "theme": ["semiconductor", "materials"], "country": "KR"},
-    {"ticker": "222800", "market": "KRX", "name": "Simmtech", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_substrate", "theme": ["semiconductor", "substrate", "pcb"], "country": "KR"},
-    {"ticker": "195870", "market": "KRX", "name": "Haesung DS", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_substrate", "theme": ["semiconductor", "leadframe", "package_substrate"], "country": "KR"},
-    {"ticker": "348210", "market": "KRX", "name": "Nextin", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_inspection", "theme": ["semiconductor", "inspection", "equipment"], "country": "KR"}
+    {"ticker": "000660", "market": "KRX", "name": "SK hynix", "asset_type": "stock", "sector": "technology", "industry": "semiconductor_memory", "theme": ["semiconductor", "memory", "hbm"], "country": "KR"}
   ],
   "indicators": [
     {"name": "close", "type": "close", "period": 1, "field": "close", "resolution": "daily"},
@@ -53,6 +35,16 @@
     {"name": "volume", "type": "volume", "period": 1, "resolution": "daily"},
     {"name": "rolling_volume_20", "type": "rolling_volume", "period": 20, "resolution": "daily"},
     {"name": "rolling_dollar_volume_20", "type": "rolling_dollar_volume", "period": 20, "resolution": "daily"},
-    {"name": "vwap_20", "type": "vwap", "period": 20, "resolution": "daily", "readiness": "optional"}
+    {"name": "vwap_20", "type": "vwap", "period": 20, "resolution": "daily", "readiness": "optional"},
+    {"name": "minute_close", "type": "close", "period": 1, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_sma_5_close", "type": "sma", "period": 5, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_sma_20_close", "type": "sma", "period": 20, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_roc_5_close", "type": "roc", "period": 5, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_roc_15_close", "type": "roc", "period": 15, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_rolling_max_30_close", "type": "rolling_max", "period": 30, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_rolling_min_30_close", "type": "rolling_min", "period": 30, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_return_1_close", "type": "bar_return", "period": 1, "field": "close", "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_close_location_value", "type": "close_location_value", "period": 1, "resolution": "minute", "readiness": "optional"},
+    {"name": "minute_vwap_20", "type": "vwap", "period": 20, "resolution": "minute", "readiness": "optional"}
   ]
 }

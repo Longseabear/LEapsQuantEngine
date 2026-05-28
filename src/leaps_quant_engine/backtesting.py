@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time as dt_time
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 import csv
 import gzip
@@ -323,6 +323,12 @@ class FrameworkBacktestResult:
                 )
                 for currency, metrics in self.metrics_by_currency.items()
             },
+            "turnover_breakdown": _framework_turnover_breakdown_report(
+                self.framework_cycles,
+                self.order_events,
+                self.snapshots,
+                initial_equity=self.metrics.initial_equity,
+            ),
         }
         if include_orders:
             payload["orders"] = [_order_to_report(order) for order in self.orders]
@@ -424,10 +430,28 @@ def build_replay_feed(
         for bar in series:
             bars_by_time.setdefault(bar.time, {})[symbol_key] = bar
     return [
-        DataSlice(time=time, bars=bars_by_time[time])
+        DataSlice(time=time, bars=bars_by_time[time], resolution=_resolution_from_bars(bars_by_time[time].values()))
         for time in sorted(bars_by_time)
         if bars_by_time[time]
     ]
+
+
+def _resolution_from_bars(bars: Iterable[Bar]) -> str:
+    resolutions = {str(bar.resolution or DataResolution.ANY.value).strip().lower() for bar in bars}
+    resolutions.discard("")
+    if len(resolutions) == 1:
+        return next(iter(resolutions))
+    lanes = {normalize_snapshot_lane(resolution) for resolution in resolutions}
+    lanes.discard("unknown")
+    if len(lanes) == 1:
+        lane = next(iter(lanes))
+        if lane == "daily_confirmed":
+            return DataResolution.DAILY_CONFIRMED.value
+        if lane == "minute":
+            return DataResolution.MINUTE.value
+        if lane == "quote":
+            return DataResolution.QUOTE.value
+    return DataResolution.ANY.value
 
 
 def _with_daily_bar_time(series: list[Bar], daily_bar_time: dt_time) -> list[Bar]:
@@ -1009,6 +1033,7 @@ def run_framework_replay(
     warmup_data_slice_count: int = 0,
     temporal_feature_provider: TemporalFeatureWindowProvider | None = None,
     cycle_journal_include_lineage: bool = True,
+    daily_indicator_bars: Iterable[Bar] | None = None,
 ) -> FrameworkBacktestResult:
     replay_started = perf_time.perf_counter()
     indicator_engine = indicator_engine or IndicatorEngine()
@@ -1031,10 +1056,31 @@ def run_framework_replay(
     coordinator = OrderCoordinator()
     fill_model = fill_model or SimulatedFillModel()
     replay_stage_timings: dict[str, float] = {}
+    daily_bars_by_date = _daily_bars_by_date(daily_indicator_bars or ())
+    applied_daily_dates: set[date] = set()
 
     for index, data in enumerate(sorted(feed, key=lambda item: item.time), start=1):
         for bar in data.bars.values():
             last_prices[bar.symbol.key] = bar.close
+        due_daily_dates = [
+            bar_date
+            for bar_date in sorted(daily_bars_by_date)
+            if bar_date < data.time.date() and bar_date not in applied_daily_dates
+        ]
+        if due_daily_dates:
+            stage_started = perf_time.perf_counter()
+            due_daily_bars = [
+                bar
+                for bar_date in due_daily_dates
+                for bar in daily_bars_by_date[bar_date]
+            ]
+            indicator_engine.warm_up(sleeve_id, due_daily_bars)
+            applied_daily_dates.update(due_daily_dates)
+            _add_timing_ms(replay_stage_timings, "replay_daily_indicator_update_ms", stage_started)
+            if temporal_feature_provider is not None:
+                stage_started = perf_time.perf_counter()
+                temporal_feature_provider.update(due_daily_bars)
+                _add_timing_ms(replay_stage_timings, "replay_daily_temporal_update_ms", stage_started)
         stage_started = perf_time.perf_counter()
         indicator_engine.on_data(data)
         _add_timing_ms(replay_stage_timings, "replay_indicator_update_ms", stage_started)
@@ -1165,6 +1211,17 @@ def run_framework_replay(
             **_rounded_timings(replay_stage_timings),
         },
     )
+
+
+def _daily_bars_by_date(bars: Iterable[Bar]) -> dict[date, list[Bar]]:
+    grouped: dict[date, list[Bar]] = {}
+    for bar in bars:
+        daily_bar = replace(bar, resolution=DataResolution.DAILY.value)
+        grouped.setdefault(daily_bar.time.date(), []).append(daily_bar)
+    return {
+        bar_date: sorted(day_bars, key=lambda item: (item.time, item.symbol.key))
+        for bar_date, day_bars in grouped.items()
+    }
 
 
 def run_backtest(
@@ -1612,6 +1669,175 @@ def _max_drawdown(snapshots: list[BacktestSnapshot]) -> float:
 def _turnover(traded_notional: float, snapshots: list[BacktestSnapshot], initial_equity: float) -> float:
     denominator = _average([snapshot.equity for snapshot in snapshots]) if snapshots else initial_equity
     return traded_notional / denominator if denominator > 0 else 0.0
+
+
+def _framework_turnover_breakdown_report(
+    framework_cycles: list[FrameworkCycleResult],
+    order_events: list[OrderEvent],
+    snapshots: list[BacktestSnapshot],
+    *,
+    initial_equity: float,
+) -> dict[str, object]:
+    retargeting_turnover = _retargeting_turnover_report(framework_cycles)
+    execution_turnover = _execution_turnover_report(order_events, snapshots, initial_equity=initial_equity)
+    replacement_rate = _replacement_rate_report(order_events, cycle_count=len(framework_cycles))
+    return {
+        "retargeting_turnover": retargeting_turnover,
+        "alpha_turnover": retargeting_turnover,
+        "execution_turnover": execution_turnover,
+        "replacement_rate": replacement_rate,
+        "notes": {
+            "retargeting_turnover": "Target weight change from fresh portfolio target batches only; excludes reused target tracking/rebalancing cycles.",
+            "alpha_turnover": "Compatibility alias for retargeting_turnover.",
+            "execution_turnover": "Actual simulated fill notional divided by average equity, matching metrics.turnover.",
+            "replacement_rate": "Actual position membership changes from fills: new entries plus full exits.",
+        },
+    }
+
+
+def _retargeting_turnover_report(framework_cycles: list[FrameworkCycleResult]) -> dict[str, object]:
+    previous_weights: dict[str, float] | None = None
+    first_target_abs_weight = 0.0
+    total_abs_delta_ex_initial = 0.0
+    max_abs_delta = 0.0
+    retargeted_cycle_count = 0
+    fresh_target_cycle_count = 0
+    reused_target_cycle_count = 0
+    skipped_target_cycle_count = 0
+    target_new_symbol_count = 0
+    target_removed_symbol_count = 0
+
+    for cycle in framework_cycles:
+        batch = cycle.portfolio_target_batch
+        if _reused_target_batch(batch):
+            reused_target_cycle_count += 1
+            continue
+        if _skip_target_turnover_batch(batch):
+            skipped_target_cycle_count += 1
+            continue
+        weights = _target_weight_map(batch)
+        if previous_weights is None:
+            first_target_abs_weight = sum(abs(weight) for weight in weights.values())
+            previous_weights = weights
+            fresh_target_cycle_count += 1
+            continue
+        fresh_target_cycle_count += 1
+        keys = set(previous_weights) | set(weights)
+        abs_delta = sum(abs(weights.get(key, 0.0) - previous_weights.get(key, 0.0)) for key in keys)
+        if abs_delta > 1e-12:
+            retargeted_cycle_count += 1
+            total_abs_delta_ex_initial += abs_delta
+            max_abs_delta = max(max_abs_delta, abs_delta)
+            for key in keys:
+                previous = previous_weights.get(key, 0.0)
+                current = weights.get(key, 0.0)
+                if abs(previous) <= 1e-12 and abs(current) > 1e-12:
+                    target_new_symbol_count += 1
+                elif abs(previous) > 1e-12 and abs(current) <= 1e-12:
+                    target_removed_symbol_count += 1
+        previous_weights = weights
+
+    comparable_fresh_target_cycle_count = max(0, fresh_target_cycle_count - 1)
+    return {
+        "fresh_target_cycle_count": fresh_target_cycle_count,
+        "comparable_fresh_target_cycle_count": comparable_fresh_target_cycle_count,
+        "retargeted_cycle_count": retargeted_cycle_count,
+        "retargeting_rate": (
+            retargeted_cycle_count / comparable_fresh_target_cycle_count
+            if comparable_fresh_target_cycle_count > 0
+            else 0.0
+        ),
+        "reused_target_tracking_cycle_count": reused_target_cycle_count,
+        "skipped_target_cycle_count": skipped_target_cycle_count,
+        "first_target_abs_weight": first_target_abs_weight,
+        "total_abs_retarget_delta_ex_initial": total_abs_delta_ex_initial,
+        "one_way_retarget_turnover_ex_initial": total_abs_delta_ex_initial / 2.0,
+        "avg_abs_retarget_delta_per_fresh_cycle": (
+            total_abs_delta_ex_initial / comparable_fresh_target_cycle_count
+            if comparable_fresh_target_cycle_count > 0
+            else 0.0
+        ),
+        "max_abs_retarget_delta": max_abs_delta,
+        "retarget_new_symbol_count": target_new_symbol_count,
+        "retarget_removed_symbol_count": target_removed_symbol_count,
+    }
+
+
+def _execution_turnover_report(
+    order_events: list[OrderEvent],
+    snapshots: list[BacktestSnapshot],
+    *,
+    initial_equity: float,
+) -> dict[str, object]:
+    fill_events = _sorted_fill_events(order_events)
+    buy_notional = sum(event.notional for event in fill_events if event.side is OrderSide.BUY)
+    sell_notional = sum(event.notional for event in fill_events if event.side is OrderSide.SELL)
+    traded_notional = buy_notional + sell_notional
+    average_equity = _average([snapshot.equity for snapshot in snapshots]) if snapshots else initial_equity
+    return {
+        "turnover": _turnover(traded_notional, snapshots, initial_equity),
+        "traded_notional": traded_notional,
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+        "average_equity": average_equity,
+        "fill_count": len(fill_events),
+        "buy_fill_count": sum(1 for event in fill_events if event.side is OrderSide.BUY),
+        "sell_fill_count": sum(1 for event in fill_events if event.side is OrderSide.SELL),
+    }
+
+
+def _replacement_rate_report(order_events: list[OrderEvent], *, cycle_count: int) -> dict[str, object]:
+    quantity_by_symbol: dict[str, int] = {}
+    new_entry_count = 0
+    full_exit_count = 0
+    for event in _sorted_fill_events(order_events):
+        before = quantity_by_symbol.get(event.symbol.key, 0)
+        delta = int(event.quantity) if event.side is OrderSide.BUY else -int(event.quantity)
+        after = before + delta
+        if before <= 0 < after:
+            new_entry_count += 1
+        if before > 0 and after <= 0:
+            full_exit_count += 1
+        quantity_by_symbol[event.symbol.key] = after
+    replacement_count = new_entry_count + full_exit_count
+    return {
+        "replacement_count": replacement_count,
+        "new_entry_count": new_entry_count,
+        "full_exit_count": full_exit_count,
+        "cycle_count": cycle_count,
+        "replacement_rate_per_cycle": replacement_count / cycle_count if cycle_count > 0 else 0.0,
+        "new_entry_rate_per_cycle": new_entry_count / cycle_count if cycle_count > 0 else 0.0,
+        "full_exit_rate_per_cycle": full_exit_count / cycle_count if cycle_count > 0 else 0.0,
+    }
+
+
+def _sorted_fill_events(order_events: list[OrderEvent]) -> list[OrderEvent]:
+    return sorted(
+        (
+            event
+            for event in order_events
+            if event.is_fill and event.quantity > 0 and event.fill_price is not None
+        ),
+        key=lambda event: (event.occurred_at, event.event_id),
+    )
+
+
+def _target_weight_map(batch) -> dict[str, float]:
+    return {
+        target.symbol.key: float(target.target_percent)
+        for target in batch.targets
+    }
+
+
+def _reused_target_batch(batch) -> bool:
+    return bool(batch.metadata.get("reused"))
+
+
+def _skip_target_turnover_batch(batch) -> bool:
+    if batch.targets:
+        return False
+    skipped_reason = str(batch.metadata.get("portfolio_skipped_reason") or "").strip()
+    return bool(skipped_reason)
 
 
 def _avg_holding_days(closed_trades: list[ClosedTrade]) -> float:

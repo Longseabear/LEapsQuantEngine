@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from leaps_quant_engine.brokerage import BrokerExecutionService, PaperBrokerExecutionGateway
+from leaps_quant_engine.brokerage import BrokerEngineExecutionGateway, BrokerExecutionService, PaperBrokerExecutionGateway
 from leaps_quant_engine.order_state import FileOrderRuntimeStateStore
 from leaps_quant_engine.order_orchestrator import MultiSleeveOrderOrchestrator
 from leaps_quant_engine.order_submit import OrderRuntimeSubmitter, load_order_intent_batches, write_order_intent_batches
@@ -9,6 +9,8 @@ from leaps_quant_engine.execution import OrderIntentBatch
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import OrderIntent, OrderSide, OrderType, Symbol, TimeInForce
 from leaps_quant_engine.orders import OrderCoordinator
+from leaps_quant_engine.security import SecurityCatalog
+from leaps_quant_engine.universe.definition import UniverseDefinition
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
 
@@ -19,6 +21,15 @@ def _batch(*orders, batch_id="batch-1"):
         order_intents=tuple(orders),
         batch_id=batch_id,
     )
+
+
+class _CallRecordingBrokerClient:
+    def __init__(self):
+        self.calls = []
+
+    def call_operation(self, operation, arguments=None):
+        self.calls.append({"operation": operation, "arguments": dict(arguments or {})})
+        return {"branch_no": "001", "order_no": "00012345"}
 
 
 def test_load_order_intent_batches_accepts_framework_execution_json(tmp_path):
@@ -417,3 +428,73 @@ def test_order_runtime_submitter_stamps_order_session_on_tickets(tmp_path):
     assert ticket.metadata["order_session"] == "after_hours_close"
     assert ticket.metadata["market_session_phase"] == "after_hours_close"
     assert ticket.metadata["market_session_scope"] == "domestic"
+
+
+def test_order_runtime_submitter_uses_security_catalog_exchange_scope_for_domestic_etf(tmp_path):
+    symbol = Symbol("069500", "KRX")
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    broker_client = _CallRecordingBrokerClient()
+    orchestrator = MultiSleeveOrderOrchestrator(
+        broker=BrokerExecutionService(
+            BrokerEngineExecutionGateway(
+                client=broker_client,
+                use_command_queue=False,
+            )
+        ),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+    catalog = SecurityCatalog.from_universe(
+        UniverseDefinition(
+            id="kr-etf-test",
+            market="KRX",
+            symbols=(symbol,),
+            indicators=(),
+            symbol_properties={symbol.key: {"asset_type": "etf", "is_etf": True}},
+        )
+    )
+    batch = _batch(
+        OrderIntent(
+            "LEaps",
+            symbol,
+            OrderSide.BUY,
+            1,
+            100_000,
+            limit_price=100_000,
+        ),
+        batch_id="batch-etf",
+    )
+
+    report = OrderRuntimeSubmitter(
+        runtime_id="test-runtime",
+        order_state_store=order_store,
+        account_store=account_store,
+        broker_account_id="kis-domestic",
+        market_scope="domestic",
+        orchestrator=orchestrator,
+        market_session=MarketSession(
+            market_scope="domestic",
+            session_phase="regular_continuous",
+            is_orderable=True,
+            is_regular_market_open=True,
+            source="test",
+        ),
+        security_catalog=catalog,
+    ).submit_batches(
+        (batch,),
+        allowed_sleeve_ids=("LEaps",),
+        broker="broker-engine",
+        commit=True,
+        confirm_live_submit=True,
+        generated_at=datetime(2026, 5, 22, 14, 40),
+    )
+
+    ticket = report.coordination.tickets[0]
+    assert report.status == "submitted"
+    assert ticket.metadata["symbol_properties"]["default_exchange_scope"] == "KRX"
+    assert broker_client.calls[0]["operation"] == "place_domestic_cash_order"
+    assert broker_client.calls[0]["arguments"]["exchange_scope"] == "KRX"

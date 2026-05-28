@@ -71,32 +71,37 @@
       "portfolio": {
         "model": "portfolios/inverse_vol.py",
         "parameters": {
-          "top_k": 12,
-          "core_gross_exposure": 0.88,
-          "neutral_gross_exposure": 0.65,
-          "defensive_gross_exposure": 0.40,
-          "max_position_pct": 0.10,
+          "top_k": 15,
+          "core_gross_exposure": 1.0,
+          "neutral_gross_exposure": 0.9,
+          "defensive_gross_exposure": 0.75,
+          "max_position_pct": 0.22,
           "min_position_pct": 0.015,
-          "emit_zero_for_missing_held_targets": true
+          "emit_zero_for_missing_held_targets": false,
+          "stale_target_max_age_days": 28,
+          "flat_stale_days": 14,
+          "flat_return_band_pct": 0.015,
+          "min_lot_value_multiple": 1.1
         },
         "rebalance": {
-          "cash_reserve_pct": 0.05,
-          "min_order_notional": 250000.0,
+          "cash_reserve_pct": 0.02,
+          "min_order_notional": 150000.0,
+          "min_order_notional_equity_bps": 200.0,
           "min_quantity_delta": 1,
           "allow_exit_below_min_notional": true,
-          "cadence": "monthly",
+          "cadence": "week_start_at 08:55 Asia/Seoul",
           "reused_target_churn_guard": true,
-          "reused_target_churn_max_quantity_delta": 1,
-          "reused_target_churn_lot_fraction": 0.5,
-          "reused_target_churn_equity_bps": 20.0
+          "reused_target_churn_max_quantity_delta": 2,
+          "reused_target_churn_lot_fraction": 1.0,
+          "reused_target_churn_equity_bps": 50.0
         },
         "target_resolution": {
           "mode": "patch"
         },
         "blend": {
           "enabled": true,
-          "duration_minutes": 360,
-          "target_drift_threshold_pct": 0.08,
+          "duration_minutes": 720,
+          "target_drift_threshold_pct": 0.15,
           "clock": "orderable_session"
         }
       },
@@ -104,9 +109,9 @@
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 0.11,
-          "max_total_exposure_pct": 0.90,
-          "cash_buffer_pct": 0.05,
+          "max_position_pct": 0.23,
+          "max_total_exposure_pct": 0.98,
+          "cash_buffer_pct": 0.02,
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }
@@ -124,7 +129,10 @@
           "max_order_age_seconds": 1200,
           "price_drift_bps": 70,
           "min_replace_interval_seconds": 240,
-          "max_replacements": 2
+          "max_replacements": 2,
+          "allow_sells": true,
+          "buy_window": "09:05-14:50 Asia/Seoul",
+          "window_timezone": "Asia/Seoul"
         }
       },
       "worker": {

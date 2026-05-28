@@ -244,7 +244,7 @@ class YFinanceMinuteBarProvider:
                 time.sleep(self.sleep_seconds)
             frame = self._download_frame(yf, request_ticker, start=chunk_start, end=chunk_end, interval=interval)
             if frame is None or getattr(frame, "empty", True):
-                if chunk_start.date() != chunk_end.date():
+                if self._should_retry_empty_chunk_by_day(interval) and chunk_start.date() != chunk_end.date():
                     for retry_start, retry_end in _chunk_time_range(chunk_start, chunk_end, max_days=1):
                         if self.sleep_seconds > 0:
                             time.sleep(self.sleep_seconds)
@@ -290,6 +290,12 @@ class YFinanceMinuteBarProvider:
         if interval_minutes >= 5:
             return max(self.max_request_days, 30)
         return self.max_request_days
+
+    def _should_retry_empty_chunk_by_day(self, interval: str) -> bool:
+        try:
+            return _interval_to_minutes(interval) < 60
+        except ValueError:
+            return True
 
     def _download_frame(self, yf_module, ticker: str, *, start: datetime, end: datetime, interval: str):
         request_start = start.date().isoformat()

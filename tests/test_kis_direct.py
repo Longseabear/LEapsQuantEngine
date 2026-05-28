@@ -523,6 +523,61 @@ def test_direct_kis_domestic_order_falls_back_to_krx_when_sor_is_unavailable(tmp
     assert result["exchange_scope"] == "KRX"
 
 
+def test_direct_kis_domestic_order_falls_back_to_krx_on_apbk3026_nxt_message(tmp_path):
+    class _NxtSymbolMissingThenSuccessSession(_FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.order_attempts = 0
+
+        def post(self, url, *, json=None, headers=None, timeout=None):
+            if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
+                self.order_attempts += 1
+                self.post_calls.append({"url": url, "json": dict(json or {}), "headers": dict(headers or {})})
+                if json["EXCG_ID_DVSN_CD"] == "SOR":
+                    return _FakeResponse(
+                        {
+                            "rt_cd": "1",
+                            "msg_cd": "APBK3026",
+                            "msg1": "해당 종목정보가 없습니다. NXT 상장종목인지 확인하세요.",
+                        }
+                    )
+                return _FakeResponse(
+                    {
+                        "rt_cd": "0",
+                        "msg_cd": "ok",
+                        "msg1": "accepted",
+                        "output": {
+                            "KRX_FWDG_ORD_ORGNO": "001",
+                            "ODNO": "00054322",
+                            "ORD_TMD": "144001",
+                        },
+                    }
+                )
+            return super().post(url, json=json, headers=headers, timeout=timeout)
+
+    _TOKEN_CACHE.clear()
+    session = _NxtSymbolMissingThenSuccessSession()
+    client = KISDirectClient(settings=_settings(), session=session, cache_dir=tmp_path)
+
+    result = client.call_operation(
+        "place_domestic_cash_order",
+        {
+            "side": "buy",
+            "symbol": "069500",
+            "quantity": 1,
+            "price": 40000,
+            "order_division": "00",
+            "exchange_scope": "SOR",
+        },
+    )
+
+    assert session.order_attempts == 2
+    assert session.post_calls[-2]["json"]["EXCG_ID_DVSN_CD"] == "SOR"
+    assert session.post_calls[-1]["json"]["EXCG_ID_DVSN_CD"] == "KRX"
+    assert result["order_no"] == "00054322"
+    assert result["exchange_scope"] == "KRX"
+
+
 def test_direct_kis_order_timeout_is_not_retried_to_avoid_duplicate_order(tmp_path):
     class _TimeoutOrderSession(_FakeSession):
         def __init__(self):

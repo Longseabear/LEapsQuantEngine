@@ -6,31 +6,37 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-kospi-swing-rebalance"
-VERSION = "0.2.0"
-EVALUATION_CADENCE = "every_15_minutes"
+VERSION = "0.4.0"
+EVALUATION_CADENCE = "every_5_minutes"
 INPUT_RESOLUTION = "daily"
-HORIZON = timedelta(days=3)
+HORIZON = timedelta(days=5)
 
-MAX_SELECTED_BUYS = 6
+MAX_SELECTED_BUYS = 10
 MAX_SELECTED_TRIMS = 8
-MIN_MOMENTUM_5 = 0.0
-MIN_MOMENTUM_20 = 0.04
-MAX_BUY_PULLBACK = 0.085
-MIN_BUY_PULLBACK = 0.018
-MAX_NEAR_HIGH_DISTANCE = 0.11
-MIN_LIQUIDITY = 2_000_000_000.0
-VOLATILE_BUY_THRESHOLD = 0.12
-MAX_BUY_VOLATILITY = 0.18
-VOLATILE_BUY_MIN_MOMENTUM_5 = 0.025
-VOLATILE_BUY_MAX_PULLBACK = 0.055
-VOLATILITY_SHOCK_THRESHOLD = 0.12
-VOLATILITY_SHOCK_PULLBACK = 0.09
-VOLATILITY_SHOCK_MOMENTUM_5 = -0.015
+MIN_MOMENTUM_5 = -0.005
+MIN_MOMENTUM_20 = 0.02
+MAX_BUY_PULLBACK = 0.16
+MIN_BUY_PULLBACK = 0.006
+MAX_NEAR_HIGH_DISTANCE = 0.18
+MIN_LIQUIDITY = 1_000_000_000.0
+VOLATILE_BUY_THRESHOLD = 0.18
+MAX_BUY_VOLATILITY = 0.27
+VOLATILE_BUY_MIN_MOMENTUM_5 = 0.005
+VOLATILE_BUY_MAX_PULLBACK = 0.12
+VOLATILITY_SHOCK_THRESHOLD = 0.20
+VOLATILITY_SHOCK_PULLBACK = 0.16
+VOLATILITY_SHOCK_MOMENTUM_5 = -0.050
 TEN_DAY_BREAK_BUFFER = 0.995
 TWENTY_DAY_EXIT_BUFFER = 0.995
-TAKE_PROFIT_MOMENTUM_5 = 0.065
-TAKE_PROFIT_EXTENSION_TO_SMA10 = 0.035
-TAKE_PROFIT_NEAR_HIGH = 0.012
+TAKE_PROFIT_MOMENTUM_5 = 0.10
+TAKE_PROFIT_EXTENSION_TO_SMA10 = 0.08
+TAKE_PROFIT_NEAR_HIGH = 0.006
+BREAKOUT_CONTINUATION_MIN_MOMENTUM_5 = 0.04
+BREAKOUT_CONTINUATION_MIN_MOMENTUM_20 = 0.08
+BREAKOUT_CONTINUATION_MIN_TREND = 0.04
+BREAKOUT_CONTINUATION_MIN_EXTENSION_TO_SMA10 = 0.015
+BREAKOUT_CONTINUATION_MAX_PULLBACK = 0.05
+BREAKOUT_CONTINUATION_MAX_VOLATILITY = 0.27
 MAX_PLAUSIBLE_DAILY_FEATURE_ABS = 3.0
 
 
@@ -81,6 +87,17 @@ def generate(context: SnapshotContext) -> list[Insight]:
             )
             continue
 
+        if allow_buys and _is_breakout_continuation(item):
+            buy_candidates.append(
+                {
+                    **item,
+                    "score": _breakout_score(item),
+                    "buy_reason": "breakout_continuation",
+                    "buy_action": "buy_breakout",
+                }
+            )
+            continue
+
         if (
             pullback <= TAKE_PROFIT_NEAR_HIGH
             and momentum_5 >= TAKE_PROFIT_MOMENTUM_5
@@ -98,7 +115,14 @@ def generate(context: SnapshotContext) -> list[Insight]:
 
         if not allow_buys or not _is_buyable_swing(item):
             continue
-        buy_candidates.append({**item, "score": _buy_score(item)})
+        buy_candidates.append(
+            {
+                **item,
+                "score": _buy_score(item),
+                "buy_reason": "pullback",
+                "buy_action": "buy_pullback",
+            }
+        )
 
     insights: list[Insight] = []
     for rank, item in enumerate(
@@ -129,7 +153,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
 
 
 def _features(context: SnapshotContext, symbol_key: str) -> dict[str, float | str] | None:
-    close = _first_value(context, symbol_key, ("identity_close", "close"))
+    close = _mark_price(context, symbol_key)
     sma10 = _first_value(context, symbol_key, ("sma_10_close", "ema_8_close", "sma_5_close"))
     sma20 = _first_value(context, symbol_key, ("sma_20_close",))
     momentum_5 = _first_value(context, symbol_key, ("momentum_5_close",))
@@ -199,20 +223,52 @@ def _is_volatility_shock_trim(item: dict[str, float | str]) -> bool:
     return float(item["momentum_5"]) <= VOLATILITY_SHOCK_MOMENTUM_5 and float(item["extension_to_sma10"]) < 0.0
 
 
+def _is_breakout_continuation(item: dict[str, float | str]) -> bool:
+    if float(item["liquidity"]) < MIN_LIQUIDITY:
+        return False
+    if float(item["volatility"]) > BREAKOUT_CONTINUATION_MAX_VOLATILITY:
+        return False
+    return (
+        float(item["pullback_from_high"]) <= BREAKOUT_CONTINUATION_MAX_PULLBACK
+        and float(item["momentum_5"]) >= BREAKOUT_CONTINUATION_MIN_MOMENTUM_5
+        and float(item["momentum_20"]) >= BREAKOUT_CONTINUATION_MIN_MOMENTUM_20
+        and float(item["trend_strength"]) >= BREAKOUT_CONTINUATION_MIN_TREND
+        and float(item["extension_to_sma10"]) >= BREAKOUT_CONTINUATION_MIN_EXTENSION_TO_SMA10
+    )
+
+
 def _buy_score(item: dict[str, float | str]) -> float:
     pullback = float(item["pullback_from_high"])
     ideal_pullback = 0.045
     pullback_score = max(0.0, 1.0 - abs(pullback - ideal_pullback) / ideal_pullback)
-    liquidity_bonus = min(float(item["liquidity"]) / 4_000_000_000_000.0, 0.04)
-    volatility_penalty = float(item["volatility"]) * 0.35
+    liquidity_bonus = min(float(item["liquidity"]) / 2_500_000_000_000.0, 0.055)
+    volatility_penalty = float(item["volatility"]) * 0.24
     if float(item["volatility"]) >= VOLATILE_BUY_THRESHOLD:
-        volatility_penalty += min((float(item["volatility"]) - VOLATILE_BUY_THRESHOLD) * 0.45, 0.04)
+        volatility_penalty += min((float(item["volatility"]) - VOLATILE_BUY_THRESHOLD) * 0.24, 0.025)
     return (
-        0.05
-        + pullback_score * 0.18
-        + float(item["momentum_5"]) * 0.30
-        + float(item["momentum_20"]) * 0.22
-        + float(item["trend_strength"]) * 0.18
+        0.06
+        + pullback_score * 0.16
+        + float(item["momentum_5"]) * 0.38
+        + float(item["momentum_20"]) * 0.30
+        + float(item["trend_strength"]) * 0.24
+        + liquidity_bonus
+        - volatility_penalty
+    )
+
+
+def _breakout_score(item: dict[str, float | str]) -> float:
+    liquidity_bonus = min(float(item["liquidity"]) / 2_500_000_000_000.0, 0.05)
+    volatility_penalty = float(item["volatility"]) * 0.22
+    extension_bonus = min(
+        max(float(item["extension_to_sma10"]) - TAKE_PROFIT_EXTENSION_TO_SMA10, 0.0) * 0.25,
+        0.03,
+    )
+    return (
+        0.08
+        + float(item["momentum_5"]) * 0.42
+        + float(item["momentum_20"]) * 0.30
+        + float(item["trend_strength"]) * 0.26
+        + extension_bonus
         + liquidity_bonus
         - volatility_penalty
     )
@@ -236,6 +292,14 @@ def _exit_score(close: float, sma20: float) -> float:
 def _buy_insight(context: SnapshotContext, item: dict[str, float | str], *, rank: int, selected_count: int) -> Insight:
     score = float(item["score"])
     symbol_key = str(item["symbol_key"])
+    buy_reason = str(item.get("buy_reason") or "pullback")
+    action = str(item.get("buy_action") or "buy_pullback")
+    reason = (
+        "kospi_swing_buy_breakout_continuation"
+        if buy_reason == "breakout_continuation"
+        else "kospi_swing_buy_pullback_in_uptrend"
+    )
+    magnitude = float(item["momentum_5"]) if buy_reason == "breakout_continuation" else float(item["pullback_from_high"])
     return Insight(
         sleeve_id=context.sleeve_id,
         symbol=context.symbol(symbol_key),
@@ -245,16 +309,16 @@ def _buy_insight(context: SnapshotContext, item: dict[str, float | str], *, rank
         source_snapshot_id=context.source_snapshot_id,
         alpha_id=ALPHA_ID,
         alpha_version=VERSION,
-        magnitude=float(item["pullback_from_high"]),
+        magnitude=magnitude,
         confidence=min(0.93, 0.58 + score * 1.4),
         weight=min(0.26, max(0.06, score)),
         score=score,
         group_id="krw-growth",
-        reason="kospi_swing_buy_pullback_in_uptrend",
+        reason=reason,
         metadata=_with_temporal_features(
             context,
             symbol_key,
-            _metadata(item, rank=rank, selected_count=selected_count, action="buy_pullback"),
+            _metadata(item, rank=rank, selected_count=selected_count, action=action),
         ),
     )
 
@@ -365,6 +429,13 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
+
+
+def _mark_price(context: SnapshotContext, symbol_key: str) -> float | None:
+    live_close = context.value(symbol_key, "live_close", ready_only=False)
+    if live_close is not None:
+        return live_close
+    return _first_value(context, symbol_key, ("identity_close", "close"))
 
 
 def _has_implausible_daily_feature(*values: float | None) -> bool:

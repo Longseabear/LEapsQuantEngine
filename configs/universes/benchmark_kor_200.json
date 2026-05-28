@@ -241,5 +241,13 @@
     {"name": "pvt", "type": "pvt", "period": 1},
     {"name": "accumulation_distribution", "type": "accumulation_distribution", "period": 1},
     {"name": "money_flow_volume", "type": "money_flow_volume", "period": 1}
-  ]
+  ],
+  "metadata": {
+    "operator_excluded_name_rules": [
+      {
+        "all": ["삼성전자"],
+        "any": ["레버리지", "인버스", "2X"]
+      }
+    ]
+  }
 }

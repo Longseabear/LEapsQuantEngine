@@ -6,23 +6,23 @@ from leaps_quant_engine.alpha import Insight, InsightDirection, SnapshotContext
 
 
 ALPHA_ID = "leaps-kospi-pullback-reversion"
-VERSION = "0.3.0"
-EVALUATION_CADENCE = "every_15_minutes"
+VERSION = "0.4.0"
+EVALUATION_CADENCE = "every_5_minutes"
 INPUT_RESOLUTION = "daily"
-HORIZON = timedelta(days=2)
-MAX_SELECTED = 4
-MIN_SCORE = 0.07
-MIN_TREND_MOMENTUM = 0.08
-MAX_PULLBACK_DEPTH = 0.16
-MIN_PULLBACK_DEPTH = 0.015
-MAX_NORMALIZED_VOLATILITY = 0.17
-MAX_REBREAK_DISTANCE = 0.05
-MIN_REBREAK_MOMENTUM_5 = 0.015
-VOLATILITY_STABILIZATION_START = 0.11
-MAX_VOLATILE_PULLBACK = 0.19
-VOLATILE_REBREAK_MIN_MOMENTUM_5 = 0.02
-VOLATILE_PULLBACK_MAX_DEPTH = 0.09
-VOLATILE_PULLBACK_MAX_FAST_DISTANCE = 0.035
+HORIZON = timedelta(days=3)
+MAX_SELECTED = 8
+MIN_SCORE = 0.045
+MIN_TREND_MOMENTUM = 0.04
+MAX_PULLBACK_DEPTH = 0.22
+MIN_PULLBACK_DEPTH = 0.006
+MAX_NORMALIZED_VOLATILITY = 0.24
+MAX_REBREAK_DISTANCE = 0.08
+MIN_REBREAK_MOMENTUM_5 = 0.005
+VOLATILITY_STABILIZATION_START = 0.16
+MAX_VOLATILE_PULLBACK = 0.27
+VOLATILE_REBREAK_MIN_MOMENTUM_5 = 0.010
+VOLATILE_PULLBACK_MAX_DEPTH = 0.14
+VOLATILE_PULLBACK_MAX_FAST_DISTANCE = 0.060
 MAX_PLAUSIBLE_DAILY_FEATURE_ABS = 3.0
 
 
@@ -34,7 +34,7 @@ def generate(context: SnapshotContext) -> list[Insight]:
     for symbol_key in context.symbol_keys:
         if not symbol_key.startswith("KRX:"):
             continue
-        close = _first_value(context, symbol_key, ("identity_close", "close"))
+        close = _mark_price(context, symbol_key)
         fast_average = _first_value(context, symbol_key, ("ema_8_close", "sma_5_close"))
         slow_average = _first_value(context, symbol_key, ("sma_20_close", "sma_5_close"))
         momentum_20 = _first_value(context, symbol_key, ("roc_20_close", "momentum_20_close"))
@@ -86,15 +86,15 @@ def generate(context: SnapshotContext) -> list[Insight]:
         if rolling_low is not None and rolling_low > 0 and close <= rolling_low * 1.01:
             continue
 
-        liquidity_bonus = 0.0 if liquidity is None else min(liquidity / 4_000_000_000_000.0, 0.035)
+        liquidity_bonus = 0.0 if liquidity is None else min(liquidity / 2_500_000_000_000.0, 0.05)
         score = (
-            0.035
-            + (trend_strength * 0.40)
-            + (momentum_20 * 0.22)
-            + (timing["score"] * 0.85)
+            0.045
+            + (trend_strength * 0.48)
+            + (momentum_20 * 0.30)
+            + (timing["score"] * 0.92)
             + liquidity_bonus
             + float(volatility_profile["adjustment"])
-            - (volatility * 0.42)
+            - (volatility * 0.30)
         )
         if score < MIN_SCORE:
             continue
@@ -255,6 +255,13 @@ def _first_value(context: SnapshotContext, symbol_key: str, names: tuple[str, ..
         if value is not None:
             return value
     return None
+
+
+def _mark_price(context: SnapshotContext, symbol_key: str) -> float | None:
+    live_close = context.value(symbol_key, "live_close", ready_only=False)
+    if live_close is not None:
+        return live_close
+    return _first_value(context, symbol_key, ("identity_close", "close"))
 
 
 def _has_implausible_daily_feature(*values: float | None) -> bool:

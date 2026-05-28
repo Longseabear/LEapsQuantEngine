@@ -10,6 +10,7 @@ from leaps_quant_engine.framework.portfolio_blend import ACTIVE_TRANSITION_NAMES
 from leaps_quant_engine.kis_gateway import fetch_kis_gateway_health
 from leaps_quant_engine.market_calendar import session_report_for_market_scope
 from leaps_quant_engine.order_status import OrderRuntimeStatusReport
+from leaps_quant_engine.runtime_heartbeat import evaluate_runtime_heartbeat
 from leaps_quant_engine.runtime_integrity import current_engine_source_fingerprint
 from leaps_quant_engine.runtime_state import RuntimeStateStore
 
@@ -68,6 +69,10 @@ class RuntimeHealthReport:
                 actions.append("reload_runtime_or_run_preflight")
             elif check.name == "kis_gateway_liveness":
                 actions.append("start_or_check_kis_gateway")
+            elif check.name == "runtime_heartbeat":
+                actions.append("check_live_runner_heartbeat_or_restart_supervisor")
+            elif check.name == "market_session_gate":
+                actions.append("respect_market_schedule_gate")
         return tuple(dict.fromkeys(actions))
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,6 +99,9 @@ def build_runtime_health_report(
     max_open_ticket_age_seconds: float = 600.0,
     portfolio_blend_overdue_grace_seconds: float = 300.0,
     kis_gateway_base_url: str | None = None,
+    heartbeat_path: Path | None = None,
+    heartbeat_component: str | None = None,
+    max_heartbeat_age_seconds: float = 120.0,
     repeated_error_window: int = 3,
     generated_at: datetime | None = None,
 ) -> RuntimeHealthReport:
@@ -175,6 +183,23 @@ def build_runtime_health_report(
             )
         )
 
+    if heartbeat_path is not None:
+        heartbeat = evaluate_runtime_heartbeat(
+            heartbeat_path,
+            runtime_id=runtime_id,
+            component=heartbeat_component,
+            max_age_seconds=max_heartbeat_age_seconds,
+            now=generated_at,
+        )
+        checks.append(
+            RuntimeHealthCheck(
+                heartbeat.name,
+                heartbeat.status,
+                reason=heartbeat.reason,
+                metadata=dict(heartbeat.metadata),
+            )
+        )
+
     if kis_gateway_base_url:
         checks.append(_kis_gateway_health_check(kis_gateway_base_url))
 
@@ -187,6 +212,30 @@ def build_runtime_health_report(
                     "warning" if calendar_report.quality.status == "degraded" else "ok",
                     reason=";".join(calendar_report.quality.warnings),
                     metadata=calendar_report.to_dict(),
+                )
+            )
+            gate_status = "ok"
+            gate_reason = ""
+            if not calendar_report.is_trading_day:
+                gate_status = "warning"
+                gate_reason = "non_trading_day"
+            elif not calendar_report.session.is_orderable:
+                gate_status = "warning"
+                gate_reason = f"session_not_orderable:{calendar_report.session.session_phase}"
+            checks.append(
+                RuntimeHealthCheck(
+                    "market_session_gate",
+                    gate_status,
+                    reason=gate_reason,
+                    metadata={
+                        "market_scope": order_status.market_scope,
+                        "session_phase": calendar_report.session.session_phase,
+                        "is_orderable": calendar_report.session.is_orderable,
+                        "is_regular_market_open": calendar_report.session.is_regular_market_open,
+                        "is_trading_day": calendar_report.is_trading_day,
+                        "next_open": calendar_report.next_open.isoformat() if calendar_report.next_open else None,
+                        "next_close": calendar_report.next_close.isoformat() if calendar_report.next_close else None,
+                    },
                 )
             )
         if order_status.unallocated_fill_count:

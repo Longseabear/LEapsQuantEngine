@@ -94,13 +94,13 @@ if ($seedRuntimeStateEnabled) {
 if ($includeLiveLoopsEnabled -and $includeMultiSleeveLiveLoopEnabled) {
     Start-StackProcess `
         -Name "Multi-sleeve live order loop" `
-        -Needles @("leaps_multi_sleeve_live_order_loop.ps1", "live_multi_sleeve.json", "LEaps", "us_etf_rotation") `
+        -Needles @("leaps_multi_sleeve_live_order_loop.ps1", "live_multi_sleeve.json", "LEaps", "kr-lowvol-defensive", "us_etf_rotation") `
         -Arguments @(
             "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", "tools/leaps_multi_sleeve_live_order_loop.ps1",
             "-Config", "configs/runtime/live_multi_sleeve.json",
-            "-SleeveIds", "LEaps,us_etf_rotation",
-            "-IntervalSeconds", "60",
+            "-SleeveIds", "LEaps,kr-lowvol-defensive,us_etf_rotation",
+            "-IntervalSeconds", "10",
             "-OrderBatchOutput", "data/runtime/live-order-loop/multi_sleeve_candidate_orders.json",
             "-Journal", "data/cycle-journal/live_multi_sleeve.jsonl",
             "-LogPath", "data/runtime/live-order-loop/multi_sleeve.log",

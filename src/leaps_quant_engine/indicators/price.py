@@ -120,6 +120,28 @@ class RollingStandardDeviation(RollingVariance):
         return math.sqrt(variance) if variance is not None else None
 
 
+class RollingReturnStandardDeviation(Indicator):
+    def __init__(self, period: int, *, field: str = "close", name: str | None = None) -> None:
+        super().__init__(name or f"return_stddev_{period}_{field}", warmup_period=period + 1)
+        self.period = period
+        self.field = field
+        self.previous: float | None = None
+        self.window: RollingWindow[float] = RollingWindow(period)
+
+    def compute_next_value(self, bar: Bar) -> float | None:
+        value = _bar_value(bar, self.field)
+        previous = self.previous
+        self.previous = value
+        if previous in (None, 0):
+            return None
+        self.window.add((value / previous) - 1.0)
+        if not self.window.is_ready:
+            return None
+        mean = sum(self.window.values) / len(self.window)
+        variance = sum((item - mean) ** 2 for item in self.window.values) / len(self.window)
+        return math.sqrt(variance)
+
+
 class ZScore(Indicator):
     def __init__(self, period: int, *, field: str = "close", name: str | None = None) -> None:
         super().__init__(name or f"zscore_{period}_{field}", warmup_period=period)

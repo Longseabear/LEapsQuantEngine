@@ -15,6 +15,7 @@ from leaps_quant_engine.orders import (
 )
 from leaps_quant_engine.order_state import OrderRuntimeStateStore
 from leaps_quant_engine.portfolio import Portfolio
+from leaps_quant_engine.virtual_account import FillApplicationReport, PortfolioMutationRecord
 
 
 class OrderAccountStore(Protocol):
@@ -37,6 +38,7 @@ class MultiSleeveOrderOrchestrationResult:
     submission: BrokerExecutionResult
     polling: BrokerExecutionResult
     applied_event_ids: tuple[str, ...]
+    fill_application_reports: tuple[FillApplicationReport, ...]
     touched_sleeve_ids: tuple[str, ...]
     sleeve_portfolios: dict[str, Portfolio]
 
@@ -70,6 +72,8 @@ class MultiSleeveOrderOrchestrationResult:
             "collision_count": len(self.coordination.collisions),
             "has_collisions": self.has_collisions,
             "applied_event_ids": list(self.applied_event_ids),
+            "portfolio_mutation_count": len(self.portfolio_mutations),
+            "portfolio_mutations": [mutation.to_dict() for mutation in self.portfolio_mutations],
             "touched_sleeve_ids": list(self.touched_sleeve_ids),
             "coordination": self.coordination.to_dict() if include_details else {
                 "ticket_count": len(self.coordination.tickets),
@@ -90,6 +94,14 @@ class MultiSleeveOrderOrchestrationResult:
                 for sleeve_id, portfolio in self.sleeve_portfolios.items()
             },
         }
+
+    @property
+    def portfolio_mutations(self) -> tuple[PortfolioMutationRecord, ...]:
+        return tuple(
+            report.mutation
+            for report in self.fill_application_reports
+            if report.mutation is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,13 +130,17 @@ class MultiSleeveOrderOrchestrator:
 
         submission = self.broker.submit(coordination.tickets, occurred_at=generated_at)
         self._record_events(submission.events, recorded_at=generated_at)
-        applied_event_ids = list(self._apply_events(submission.events))
+        submitted_event_ids, fill_application_reports = self._apply_events(submission.events)
+        applied_event_ids = list(submitted_event_ids)
+        application_reports = list(fill_application_reports)
 
         should_poll = self.poll_after_submit if poll_after_submit is None else poll_after_submit
         if should_poll:
             polling = self.broker.poll(submission.tickets, occurred_at=generated_at)
             self._record_events(polling.events, recorded_at=generated_at)
-            applied_event_ids.extend(self._apply_events(polling.events))
+            polled_event_ids, polled_application_reports = self._apply_events(polling.events)
+            applied_event_ids.extend(polled_event_ids)
+            application_reports.extend(polled_application_reports)
         else:
             polling = BrokerExecutionResult(
                 generated_at=generated_at,
@@ -143,6 +159,7 @@ class MultiSleeveOrderOrchestrator:
             submission=submission,
             polling=polling,
             applied_event_ids=tuple(applied_event_ids),
+            fill_application_reports=tuple(application_reports),
             touched_sleeve_ids=touched_sleeve_ids,
             sleeve_portfolios=sleeve_portfolios,
         )
@@ -160,12 +177,18 @@ class MultiSleeveOrderOrchestrator:
             poll_after_submit=poll_after_submit,
         )
 
-    def _apply_events(self, events: Iterable[OrderEvent]) -> tuple[str, ...]:
+    def _apply_events(self, events: Iterable[OrderEvent]) -> tuple[tuple[str, ...], tuple[FillApplicationReport, ...]]:
         applied: list[str] = []
+        reports: list[FillApplicationReport] = []
         for event in events:
-            self.account_store.apply_order_event(event)
+            report_producer = getattr(self.account_store, "apply_order_event_with_report", None)
+            if callable(report_producer):
+                report = report_producer(event)
+                reports.append(report)
+            else:
+                self.account_store.apply_order_event(event)
             applied.append(event.event_id)
-        return tuple(applied)
+        return tuple(applied), tuple(reports)
 
     def _record_tickets(self, tickets: Iterable[OrderTicket], *, recorded_at: datetime) -> None:
         if self.order_state_store is None:

@@ -304,6 +304,9 @@ Cadence fields are optional but recommended for non-intraday models:
   wall-clock time before generating the day's alpha. Use this when the model
   depends on pre-open confirmed daily features and should not run on an earlier
   startup cycle.
+- Interval cadences such as `every_5_minutes` are appropriate when a model uses
+  live mark prices or quote-lane metadata for timing, but still reads confirmed
+  daily indicators for the slow thesis.
 - `INPUT_RESOLUTION = "daily"` documents the expected snapshot resolution for
   reviewers and agents. Indicator update protection is enforced by the universe
   indicator definitions' `resolution` field.
@@ -323,6 +326,11 @@ model formula:
   }
 }
 ```
+
+Calendar-day interval aliases are also supported, for example
+`"cadence": "every_3_days"` or `"cadence": "3d"`. Use these for swing sleeves
+that rebuild portfolio weights only every few days while a faster worker cycle
+reuses the last target for drift sizing, risk, and execution.
 
 For patient entries, configure the execution model rather than hiding clock
 checks in alpha or portfolio code:
@@ -403,6 +411,26 @@ patch = context.model_state.object_merge(
 Use `object_set(...)` for full replacement, `object_merge(...)` for patch-style
 updates, and `object_delete(...)` when a position or model state should be
 cleared at a cycle boundary.
+
+When a model owns a stable state namespace, bind it once with
+`context.model_state.scope(...)` and then read or patch through that scope:
+
+```python
+trail = context.model_state.scope(
+    model_id="trailing-stop",
+    namespace="trailing_stop",
+).for_symbol("KRX:005930")
+
+state = trail.object_get(default={"high_watermark_price": 0})
+patch = trail.object_merge(
+    {"high_watermark_price": 84000},
+    reason="trailing_stop_mark",
+)
+```
+
+Use `.for_position(position_id)` when the state belongs to one position
+instance rather than the whole symbol. This keeps backtest, research, paper,
+and live behavior on the same state-key shape.
 
 Alpha example:
 
@@ -558,6 +586,14 @@ Notes:
   insights in portfolio construction. In LEaps, the RL constructor treats a
   same-or-newer non-UP insight as a reason to avoid a long target and to emit an
   exit target for held quantities.
+- Alpha-less operator or agent target models are allowed when they still obey
+  the same portfolio boundary. The model may read a configured, read-only target
+  artifact, validate sleeve id, freshness, market/currency, and target weights,
+  then emit `PortfolioAllocationTarget` percentages. It must not call market
+  data providers, brokers, KIS, order stores, or mutate account state. Missing
+  or stale artifacts should fail closed with an empty raw batch; a deliberate
+  all-cash move should be represented by explicit 0% targets or a documented
+  `flatten` artifact flag.
 
 Example:
 
@@ -819,6 +855,58 @@ Built-in execution model choices:
 - `time_in_force`: `day`, `gtc`, `ioc`, or `fok`
 - `metadata`: execution lineage such as slice index/count
 
+### Pending Orders And Unordered Quantity
+
+Execution receives order-runtime facts through `ExecutionContext.pending_orders`.
+This is the LEAN-style boundary that lets fast risk/execution cycles run
+without repeatedly re-ordering the same reused target batch.
+
+The default `StandardExecutionModel` computes:
+
+```text
+projected_quantity = current_quantity + open_buy_quantity - open_sell_quantity
+unordered_delta = target_quantity - projected_quantity
+```
+
+If `unordered_delta` is zero, no normal order intent is emitted. For example,
+a target of 100 shares with 70 currently held and an open buy ticket for the
+remaining 30 should produce no new buy. If the open buy is only 10 shares, the
+model emits a buy intent for 20.
+
+The pending state is immutable and broker-agnostic. It can expose:
+
+- `open_buy_quantity(symbol)`
+- `open_sell_quantity(symbol)`
+- `projected_quantity(symbol, current_quantity)`
+- `unordered_delta(symbol, target_quantity=..., current_quantity=...)`
+- per-symbol metadata such as pending ticket ids, latest status, open-order
+  age, and reserved buy notional
+
+Custom execution models should use this view instead of reading order stores,
+KIS, broker-engine, or virtual account files directly.
+
+```python
+class PendingAwareExecutionModel:
+    def create_orders(self, sleeve_id, portfolio, data, targets, execution_context=None):
+        pending = execution_context.pending_orders
+        for target in targets:
+            current = portfolio.quantity(target.symbol)
+            unordered_delta = pending.unordered_delta(
+                target.symbol,
+                target_quantity=target.quantity,
+                current_quantity=current,
+            )
+            if unordered_delta == 0:
+                continue
+            ...
+```
+
+Hard exits, stops, and risk reductions may intentionally bypass normal churn
+suppression when the tag or execution urgency communicates that intent, for
+example `hard_exit`, `trailing_stop`, `risk_exit`, or `urgent`. That bypass
+only affects intent creation; broker submission still passes through order
+runtime, engine guards, route checks, and fill reconciliation.
+
 Custom model contract:
 
 ```python
@@ -884,11 +972,12 @@ Notes:
   `00`, `market/day` to `01`, `limit/ioc` to `11`, `limit/fok` to `12`,
   `market/ioc` to `13`, and `market/fok` to `14`. Keep broker-specific codes
   out of strategy models; set `order_type` and `time_in_force` instead.
-- Domestic live broker submission defaults to KIS `exchange_scope=SOR` so the
-  broker can route Korean orders across supported venues. A model should leave
-  this unset for normal operation. Only set `exchange_scope`, `venue_policy`, or
-  related venue metadata when the strategy intentionally wants `KRX` or `NXT`
-  for a tested venue-specific reason.
+- Domestic live broker submission defaults are resolved by `SecurityCatalog`:
+  listed stocks use KIS `exchange_scope=SOR`, while domestic ETF/ETN/ELW
+  symbols use `KRX` unless metadata explicitly overrides the route. A model
+  should leave this unset for normal operation. Only set `exchange_scope`,
+  `venue_policy`, or related venue metadata when the strategy intentionally
+  wants `KRX`, `NXT`, or `SOR` for a tested venue-specific reason.
 - Execution models may choose market, limit, and slicing policy, but broker
   capability checks are core guards. KIS routes are whole-share only in v0.
   Domestic KRX limit prices are rounded to the KRX tick grid at broker-submit
@@ -923,6 +1012,10 @@ Notes:
 - Stale open tickets and stale partial fills are maintained by the order
   supervisor. Strategy models should not cancel or replace broker orders
   directly.
+- Fill events are the portfolio mutation boundary. Live/paper orchestration
+  exposes `fill_application_reports` and recent `portfolio_mutations`; models
+  should read portfolio state on the next cycle instead of assuming an
+  `OrderIntent` changed holdings.
 - `day` order expiry is also order-runtime responsibility. A model may choose
   `time_in_force=day`, but it should not manually clear stale pending tickets;
   the supervisor expires them after the relevant market-local date rolls over.
@@ -965,6 +1058,11 @@ Before enabling a model in runtime:
   submit path.
 - Inspect the journal/status output for selected symbols, insight counts,
   target counts, risk decisions, and order intent counts.
+
+For sleeves whose target portfolio is authored by an operator or agent instead
+of alpha modules, see `docs/agent-authored-sleeve-guide.md`. That pattern uses
+a dated target artifact as portfolio input, keeps agent memory separate from
+live runtime input, and requires point-in-time target artifacts for backtests.
 
 Useful commands:
 

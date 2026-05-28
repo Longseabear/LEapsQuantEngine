@@ -96,6 +96,70 @@ def test_portfolio_construction_engine_creates_target_batch_with_cash_reserve():
     assert batch.metadata["filtered_plan_count"] == 2
 
 
+def test_portfolio_construction_excludes_unheld_insight_missing_current_price_before_budgeting():
+    priced = Symbol("AAA", "US")
+    missing = Symbol("MISS", "US")
+    data = _slice(_bar(priced, 100.0))
+    priced_insight = _insight(priced)
+    missing_insight = _insight(missing)
+    engine = PortfolioConstructionEngine(model=EqualWeightPortfolioConstructionModel())
+
+    batch = engine.create_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=data,
+            portfolio=Portfolio(cash=1_000),
+            active_insights=(priced_insight, missing_insight),
+            managed_symbols=(),
+        )
+    )
+
+    assert batch.targets == (
+        PortfolioAllocationTarget(symbol=priced, target_percent=1.0, tag="framework:alpha-a:up"),
+    )
+    assert batch.plans[0].desired_value == pytest.approx(1_000.0)
+    assert batch.source_insight_ids == (priced_insight.insight_id,)
+    assert batch.metadata["raw_active_insight_count"] == 2
+    assert batch.metadata["targetable_active_insight_count"] == 1
+    assert batch.metadata["excluded_universe_mismatch_insight_count"] == 1
+    assert batch.metadata["excluded_universe_mismatch_symbols"] == ["US:MISS"]
+    assert batch.metadata["excluded_universe_mismatch_insight_ids"] == [missing_insight.insight_id]
+
+
+def test_portfolio_construction_parks_reused_unheld_target_missing_current_price():
+    priced = Symbol("AAA", "US")
+    missing = Symbol("MISS", "US")
+    source_batch = PortfolioTargetBatch(
+        sleeve_id="test-sleeve",
+        generated_at=datetime(2026, 5, 9, 9, 0),
+        targets=(
+            PortfolioAllocationTarget(symbol=priced, target_percent=0.5),
+            PortfolioAllocationTarget(symbol=missing, target_percent=0.5),
+        ),
+    )
+    engine = PortfolioConstructionEngine(model=EqualWeightPortfolioConstructionModel())
+
+    batch = engine.build_target_batch_from_targets(
+        PortfolioConstructionContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(priced, 100.0)),
+            portfolio=Portfolio(cash=1_000),
+            active_insights=(),
+            managed_symbols=(),
+        ),
+        source_batch,
+        source_batch.targets,
+        metadata={"reused": True},
+    )
+
+    assert batch.targets == (PortfolioAllocationTarget(symbol=priced, target_percent=0.5),)
+    assert batch.plans[0].desired_value == pytest.approx(500.0)
+    assert batch.metadata["raw_target_count"] == 2
+    assert batch.metadata["filtered_target_count"] == 1
+    assert batch.metadata["parked_unpriced_target_count"] == 1
+    assert batch.metadata["parked_unpriced_target_symbols"] == ["US:MISS"]
+
+
 def test_order_sizing_recomputes_reused_percent_target_from_current_portfolio_state():
     symbol = Symbol("AAA", "US")
     first_data = _slice(_bar(symbol, 100.0))
@@ -315,6 +379,76 @@ def test_order_sizing_can_suppress_reused_batch_adjacent_lot_buy_back_churn():
     assert sized.metadata["reused_target_churn_suppressed_count"] == 1
 
 
+def test_order_sizing_keeps_meaningful_reused_batch_one_share_rebalance():
+    symbol = Symbol("036930", "KRX")
+    expensive = Symbol("009150", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.2375)
+    expensive_target = PortfolioAllocationTarget(symbol=expensive, target_percent=0.12)
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 28, 14, 30),
+        targets=(target, expensive_target),
+        metadata={"reused": True, "source_batch_id": "portfolio-targets-1"},
+    )
+    portfolio = Portfolio(
+        cash=6_800_000,
+        holdings={symbol.key: Holding(symbol, quantity=10, average_price=217_000)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            min_order_notional=50_000,
+            reused_target_churn_guard=True,
+            reused_target_churn_lot_fraction=0.25,
+            reused_target_churn_equity_bps=5.0,
+            whole_share_entry_floor_min_fraction=0.75,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 200_000), _bar(expensive, 1_500_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert PortfolioTarget(symbol=symbol, quantity=11) in sized.targets
+    assert sized.metadata["reused_target_churn_suppressed_count"] == 0
+    assert sized.metadata["below_min_notional_suppressed_count"] == 0
+
+
+def test_order_sizing_metadata_explains_min_notional_and_zero_delta_filters():
+    zero_delta_symbol = Symbol("005930", "KRX")
+    small_delta_symbol = Symbol("000660", "KRX")
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 28, 14, 30),
+        targets=(
+            PortfolioAllocationTarget(symbol=zero_delta_symbol, target_percent=5 / 12),
+            PortfolioAllocationTarget(symbol=small_delta_symbol, target_percent=0.011),
+        ),
+    )
+    portfolio = Portfolio(
+        cash=700_000,
+        holdings={zero_delta_symbol.key: Holding(zero_delta_symbol, quantity=5, average_price=100_000)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(min_order_notional=50_000)
+    ).size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(zero_delta_symbol, 100_000), _bar(small_delta_symbol, 10_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["zero_delta_symbols"] == ["KRX:005930"]
+    assert sized.metadata["below_min_notional_suppressed_symbols"] == ["KRX:000660"]
+
+
 def test_order_sizing_reused_batch_churn_guard_keeps_fresh_and_exit_targets():
     symbol = Symbol("005380", "KRX")
     target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.138)
@@ -362,6 +496,221 @@ def test_order_sizing_reused_batch_churn_guard_keeps_fresh_and_exit_targets():
     assert exit_sized.targets == (PortfolioTarget(symbol=symbol, quantity=0, tag="framework:stop:flat"),)
 
 
+def test_order_sizing_reused_churn_guard_does_not_use_min_order_notional_as_noise_threshold():
+    symbol = Symbol("069500", "KRX")
+    price = 129_375.0
+    current_quantity = 22
+    current_value = current_quantity * price
+    target_value = 15_000_000.0
+    desired_value = current_value - 80_000.0
+    target = PortfolioAllocationTarget(
+        symbol=symbol,
+        target_percent=desired_value / target_value,
+        tag="agent_narrative_target:id=test-reused",
+    )
+    batch = PortfolioTargetBatch(
+        sleeve_id="semiconduct-kor",
+        generated_at=datetime(2026, 5, 28, 14, 30),
+        targets=(target,),
+        metadata={"reused": True},
+    )
+    portfolio = Portfolio(
+        cash=target_value - current_value,
+        holdings={symbol.key: Holding(symbol, quantity=current_quantity, average_price=129_290.0)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            min_order_notional=100_000.0,
+            reused_target_churn_guard=True,
+            reused_target_churn_max_quantity_delta=1,
+            reused_target_churn_lot_fraction=0.25,
+            reused_target_churn_equity_bps=5.0,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="semiconduct-kor",
+            data=_slice(_bar(symbol, price)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == (
+        PortfolioTarget(symbol=symbol, quantity=21, tag="agent_narrative_target:id=test-reused"),
+    )
+    assert sized.metadata["below_min_notional_count"] == 0
+    assert sized.metadata["reused_target_churn_suppressed_count"] == 0
+
+
+def test_order_sizing_reused_churn_guard_still_suppresses_tiny_adjacent_lot_noise():
+    symbol = Symbol("069500", "KRX")
+    price = 129_375.0
+    current_quantity = 22
+    current_value = current_quantity * price
+    target_value = 15_000_000.0
+    desired_value = current_value - 20_000.0
+    target = PortfolioAllocationTarget(
+        symbol=symbol,
+        target_percent=desired_value / target_value,
+        tag="agent_narrative_target:id=test-reused",
+    )
+    batch = PortfolioTargetBatch(
+        sleeve_id="semiconduct-kor",
+        generated_at=datetime(2026, 5, 28, 14, 31),
+        targets=(target,),
+        metadata={"reused": True},
+    )
+    portfolio = Portfolio(
+        cash=target_value - current_value,
+        holdings={symbol.key: Holding(symbol, quantity=current_quantity, average_price=129_290.0)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            min_order_notional=100_000.0,
+            reused_target_churn_guard=True,
+            reused_target_churn_max_quantity_delta=1,
+            reused_target_churn_lot_fraction=0.25,
+            reused_target_churn_equity_bps=5.0,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="semiconduct-kor",
+            data=_slice(_bar(symbol, price)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["below_min_notional_count"] == 0
+    assert sized.metadata["reused_target_churn_suppressed_count"] == 1
+    assert sized.metadata["reused_target_churn_suppressed_symbols"] == ["KRX:069500"]
+    detail = sized.metadata["reused_target_churn_suppressed_details"][0]
+    assert detail["drift_notional"] == 20_000.0
+    assert detail["threshold_notional"] == price * 0.25
+
+
+def test_order_sizing_records_zero_delta_and_below_min_notional_metadata():
+    zero_symbol = Symbol("009150", "KRX")
+    small_symbol = Symbol("091160", "KRX")
+    zero_target = PortfolioAllocationTarget(symbol=zero_symbol, target_percent=1_500_000.0 / 10_500_000.0)
+    small_target = PortfolioAllocationTarget(symbol=small_symbol, target_percent=50.0 / 10_500_000.0)
+    batch = PortfolioTargetBatch(
+        sleeve_id="semiconduct-kor",
+        generated_at=datetime(2026, 5, 28, 14, 32),
+        targets=(zero_target, small_target),
+    )
+    portfolio = Portfolio(
+        cash=9_000_000.0,
+        holdings={zero_symbol.key: Holding(zero_symbol, quantity=1, average_price=1_500_000.0)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(min_order_notional=200_000.0)
+    ).size(
+        OrderSizingContext(
+            sleeve_id="semiconduct-kor",
+            data=_slice(_bar(zero_symbol, 1_500_000.0), _bar(small_symbol, 50.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["zero_delta_symbols"] == ["KRX:009150"]
+    assert sized.metadata["below_min_notional_symbols"] == ["KRX:091160"]
+    assert sized.metadata["below_min_notional_details"][0]["symbol"] == "KRX:091160"
+    assert sized.metadata["below_min_notional_details"][0]["delta_notional"] == 50.0
+    assert sized.metadata["below_min_notional_details"][0]["threshold_notional"] == 200_000.0
+
+
+def test_order_sizing_keeps_meaningful_entry_but_suppresses_small_lowvol_rebalance_noise():
+    add_symbol = Symbol("050890", "KRX")
+    small_add = Symbol("005290", "KRX")
+    tiny_add = Symbol("055550", "KRX")
+    targets = (
+        PortfolioAllocationTarget(symbol=add_symbol, target_percent=0.03454251577095184),
+        PortfolioAllocationTarget(symbol=small_add, target_percent=0.055446442618563636),
+        PortfolioAllocationTarget(symbol=tiny_add, target_percent=0.0955425416751486),
+    )
+    batch = PortfolioTargetBatch(
+        sleeve_id="kr-lowvol-defensive",
+        generated_at=datetime(2026, 5, 28, 14, 45),
+        targets=targets,
+        metadata={"reused": True},
+    )
+    portfolio = Portfolio(
+        cash=11_135_262.0,
+        holdings={
+            small_add.key: Holding(small_add, quantity=10, average_price=61_960.0),
+            tiny_add.key: Holding(tiny_add, quantity=11, average_price=96_661.11),
+        },
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            cash_reserve_pct=0.02,
+            min_order_notional=150_000.0,
+            min_order_notional_equity_bps=200.0,
+            reused_target_churn_guard=True,
+            reused_target_churn_max_quantity_delta=2,
+            reused_target_churn_lot_fraction=1.0,
+            reused_target_churn_equity_bps=50.0,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="kr-lowvol-defensive",
+            data=_slice(
+                _bar(add_symbol, 15_570.0),
+                _bar(small_add, 56_900.0),
+                _bar(tiny_add, 92_800.0),
+            ),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert [target.symbol.key for target in sized.targets] == ["KRX:050890"]
+    assert sized.targets[0].quantity >= 27
+    assert sized.metadata["below_min_notional_symbols"] == ["KRX:005290", "KRX:055550"]
+    assert sized.metadata["below_min_notional_details"][0]["threshold_notional"] == pytest.approx(249_411.20)
+
+
+def test_order_sizing_target_churn_guard_suppresses_fresh_small_retargeting_noise():
+    symbol = Symbol("005380", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.138)
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 5, 13, 13, 30),
+        targets=(target,),
+    )
+    portfolio = Portfolio(
+        cash=10_581_159.420289854,
+        holdings={symbol.key: Holding(symbol, quantity=3, average_price=671_778)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            target_churn_guard=True,
+            target_churn_lot_fraction=0.5,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 700_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["target_churn_guard_enabled"] is True
+    assert sized.metadata["target_churn_suppressed_count"] == 1
+    assert sized.metadata["target_churn_suppressed_symbols"] == ["KRX:005380"]
+
+
 def test_rebalance_policy_filters_small_target_delta():
     symbol = Symbol("AAA", "US")
     target = PortfolioTarget(symbol=symbol, quantity=10, tag="static")
@@ -397,6 +746,181 @@ def test_rebalance_policy_filters_small_target_delta():
     assert sized.metadata["filtered_target_count"] == 0
     assert batch.metadata["raw_plan_count"] == 1
     assert sized.metadata["filtered_plan_count"] == 0
+
+
+def test_order_sizing_filters_small_delta_by_equity_bps_threshold():
+    symbol = Symbol("AAA", "US")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=1.0)
+    batch = PortfolioTargetBatch(
+        sleeve_id="test-sleeve",
+        generated_at=datetime(2026, 5, 13, 13, 30),
+        targets=(target,),
+    )
+    portfolio = Portfolio(cash=50.0, holdings={symbol.key: Holding(symbol, quantity=19, average_price=50.0)})
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(min_order_notional=0.0, min_order_notional_equity_bps=1_000.0)
+    ).size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 50.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["min_order_notional"] == 0.0
+    assert sized.metadata["min_order_notional_equity_bps"] == 1_000.0
+
+
+def test_order_sizing_reports_min_quantity_delta_suppressed_targets():
+    symbol = Symbol("AAA", "US")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=1.0)
+    batch = PortfolioTargetBatch(
+        sleeve_id="test-sleeve",
+        generated_at=datetime(2026, 5, 13, 13, 30),
+        targets=(target,),
+    )
+    portfolio = Portfolio(cash=100.0, holdings={symbol.key: Holding(symbol, quantity=9, average_price=100.0)})
+
+    sized = OrderSizingEngine(rebalance_policy=RebalancePolicy(min_quantity_delta=2)).size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 100.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["min_quantity_delta_suppressed_count"] == 1
+    assert sized.metadata["min_quantity_delta_suppressed_symbols"] == ["US:AAA"]
+    detail = sized.metadata["min_quantity_delta_suppressed_details"][0]
+    assert detail["delta_quantity"] == 1
+    assert detail["delta_notional"] == 100.0
+    assert detail["threshold_notional"] == 2.0
+
+
+def test_order_sizing_allows_meaningful_one_share_rebalance_when_min_quantity_is_one():
+    symbol = Symbol("005930", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=1.0)
+    batch = PortfolioTargetBatch(
+        sleeve_id="kr-domestic-4401",
+        generated_at=datetime(2026, 5, 28, 9, 5),
+        targets=(target,),
+    )
+    portfolio = Portfolio(
+        cash=500_000.0,
+        holdings={symbol.key: Holding(symbol, quantity=2, average_price=293_750.0)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            min_quantity_delta=1,
+            min_order_notional=50_000.0,
+            min_order_notional_equity_bps=50.0,
+            target_churn_guard=True,
+            target_churn_equity_bps=50.0,
+            target_churn_lot_fraction=1.0,
+            reused_target_churn_guard=True,
+            reused_target_churn_equity_bps=50.0,
+            reused_target_churn_lot_fraction=1.0,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="kr-domestic-4401",
+            data=_slice(_bar(symbol, 304_500.0)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == (PortfolioTarget(symbol=symbol, quantity=3),)
+    assert sized.metadata["min_quantity_delta_suppressed_count"] == 0
+
+
+def test_order_sizing_can_floor_fractional_entry_to_one_whole_share():
+    symbol = Symbol("009150", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.035)
+    batch = PortfolioTargetBatch(
+        sleeve_id="test-sleeve",
+        generated_at=datetime(2026, 5, 13, 13, 30),
+        targets=(target,),
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(whole_share_entry_floor_min_fraction=0.35)
+    ).size(
+        OrderSizingContext(
+            sleeve_id="test-sleeve",
+            data=_slice(_bar(symbol, 1_300_000.0)),
+            portfolio=Portfolio(cash=18_000_000),
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == (PortfolioTarget(symbol=symbol, quantity=1),)
+    assert round(sized.plans[0].desired_value, 2) == 630_000.0
+    assert sized.plans[0].rounded_value == 1_300_000.0
+
+
+def test_order_sizing_suppresses_one_share_rounding_exit_for_positive_target():
+    symbol = Symbol("000660", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.10)
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 4, 21, 12, 0),
+        targets=(target,),
+    )
+    portfolio = Portfolio(
+        cash=7_200_000,
+        holdings={symbol.key: Holding(symbol, quantity=1, average_price=1_217_500)},
+    )
+
+    sized = OrderSizingEngine(
+        rebalance_policy=RebalancePolicy(
+            whole_share_rounding_churn_guard=True,
+            whole_share_rounding_churn_min_fraction=0.25,
+        )
+    ).size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 1_217_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == ()
+    assert sized.metadata["whole_share_rounding_churn_suppressed_count"] == 1
+    assert sized.metadata["whole_share_rounding_churn_suppressed_symbols"] == ["KRX:000660"]
+
+
+def test_order_sizing_keeps_explicit_zero_exit_despite_rounding_guard():
+    symbol = Symbol("000660", "KRX")
+    target = PortfolioAllocationTarget(symbol=symbol, target_percent=0.0, tag="agent_daily_target:missing_from_daily_artifact")
+    batch = PortfolioTargetBatch(
+        sleeve_id="LEaps",
+        generated_at=datetime(2026, 4, 22, 9, 0),
+        targets=(target,),
+    )
+    portfolio = Portfolio(
+        cash=7_200_000,
+        holdings={symbol.key: Holding(symbol, quantity=1, average_price=1_217_500)},
+    )
+
+    sized = OrderSizingEngine().size(
+        OrderSizingContext(
+            sleeve_id="LEaps",
+            data=_slice(_bar(symbol, 1_232_000)),
+            portfolio=portfolio,
+            portfolio_targets=batch,
+        )
+    )
+
+    assert sized.targets == (PortfolioTarget(symbol=symbol, quantity=0, tag="agent_daily_target:missing_from_daily_artifact"),)
+    assert sized.metadata["whole_share_rounding_churn_suppressed_count"] == 0
 
 
 def test_rebalance_policy_preserves_small_exit_targets_by_default():

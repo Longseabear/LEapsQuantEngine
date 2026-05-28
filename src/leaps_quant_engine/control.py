@@ -18,6 +18,8 @@ class RuntimeControlCommandType(str, Enum):
     RELOAD_SLEEVE = "reload_sleeve"
     ACTIVATE_SLEEVE = "activate_sleeve"
     DEACTIVATE_SLEEVE = "deactivate_sleeve"
+    SUSPEND_SLEEVE = "suspend_sleeve"
+    RESUME_SLEEVE = "resume_sleeve"
     PAUSE_WORKER = "pause_worker"
     RESUME_WORKER = "resume_worker"
     RUN_ONCE = "run_once"
@@ -78,6 +80,34 @@ class RuntimeControlCommand:
     ) -> "RuntimeControlCommand":
         return cls(
             command_type=RuntimeControlCommandType.DEACTIVATE_SLEEVE,
+            payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
+            reason=reason,
+        )
+
+    @classmethod
+    def suspend_sleeve(
+        cls,
+        config_path: str | Path,
+        sleeve_id: str,
+        *,
+        reason: str | None = None,
+    ) -> "RuntimeControlCommand":
+        return cls(
+            command_type=RuntimeControlCommandType.SUSPEND_SLEEVE,
+            payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
+            reason=reason,
+        )
+
+    @classmethod
+    def resume_sleeve(
+        cls,
+        config_path: str | Path,
+        sleeve_id: str,
+        *,
+        reason: str | None = None,
+    ) -> "RuntimeControlCommand":
+        return cls(
+            command_type=RuntimeControlCommandType.RESUME_SLEEVE,
             payload={"config_path": str(config_path), "sleeve_id": sleeve_id},
             reason=reason,
         )
@@ -246,6 +276,8 @@ class RuntimeConfigController:
                 RuntimeControlCommandType.RELOAD_SLEEVE,
                 RuntimeControlCommandType.ACTIVATE_SLEEVE,
                 RuntimeControlCommandType.DEACTIVATE_SLEEVE,
+                RuntimeControlCommandType.SUSPEND_SLEEVE,
+                RuntimeControlCommandType.RESUME_SLEEVE,
             }:
                 self.snapshot = self.loader(command.config_path())
             elif command.command_type == RuntimeControlCommandType.PAUSE_WORKER:

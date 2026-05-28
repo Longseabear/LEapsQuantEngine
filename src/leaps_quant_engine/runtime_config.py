@@ -232,9 +232,17 @@ class AlphaRuntimeConfig:
 class RebalancePolicyRuntimeConfig:
     cash_reserve_pct: float = 0.0
     min_order_notional: float = 0.0
+    min_order_notional_equity_bps: float = 0.0
     min_quantity_delta: int = 1
     allow_exit_below_min_notional: bool = True
     cadence: str = "every_cycle"
+    target_churn_guard: bool = False
+    target_churn_max_quantity_delta: int = 1
+    target_churn_lot_fraction: float = 0.5
+    target_churn_equity_bps: float = 0.0
+    whole_share_entry_floor_min_fraction: float = 1.0
+    whole_share_rounding_churn_guard: bool = True
+    whole_share_rounding_churn_min_fraction: float = 0.25
     reused_target_churn_guard: bool = False
     reused_target_churn_max_quantity_delta: int = 1
     reused_target_churn_lot_fraction: float = 0.5
@@ -244,10 +252,19 @@ class RebalancePolicyRuntimeConfig:
         if not 0.0 <= self.cash_reserve_pct < 1.0:
             raise ConfigurationValidationError("portfolio.rebalance.cash_reserve_pct must be between 0 inclusive and 1 exclusive.")
         _validate_non_negative("portfolio.rebalance.min_order_notional", self.min_order_notional)
+        _validate_non_negative("portfolio.rebalance.min_order_notional_equity_bps", self.min_order_notional_equity_bps)
         if self.min_quantity_delta < 0:
             raise ConfigurationValidationError("portfolio.rebalance.min_quantity_delta must be non-negative.")
         if not self.cadence.strip():
             raise ConfigurationValidationError("portfolio.rebalance.cadence cannot be empty.")
+        if self.target_churn_max_quantity_delta < 0:
+            raise ConfigurationValidationError("portfolio.rebalance.target_churn_max_quantity_delta must be non-negative.")
+        _validate_non_negative("portfolio.rebalance.target_churn_lot_fraction", self.target_churn_lot_fraction)
+        _validate_non_negative("portfolio.rebalance.target_churn_equity_bps", self.target_churn_equity_bps)
+        if not 0.0 <= self.whole_share_entry_floor_min_fraction <= 1.0:
+            raise ConfigurationValidationError("portfolio.rebalance.whole_share_entry_floor_min_fraction must be between 0 and 1.")
+        if not 0.0 <= self.whole_share_rounding_churn_min_fraction <= 1.0:
+            raise ConfigurationValidationError("portfolio.rebalance.whole_share_rounding_churn_min_fraction must be between 0 and 1.")
         if self.reused_target_churn_max_quantity_delta < 0:
             raise ConfigurationValidationError("portfolio.rebalance.reused_target_churn_max_quantity_delta must be non-negative.")
         _validate_non_negative("portfolio.rebalance.reused_target_churn_lot_fraction", self.reused_target_churn_lot_fraction)
@@ -257,9 +274,17 @@ class RebalancePolicyRuntimeConfig:
         return {
             "cash_reserve_pct": self.cash_reserve_pct,
             "min_order_notional": self.min_order_notional,
+            "min_order_notional_equity_bps": self.min_order_notional_equity_bps,
             "min_quantity_delta": self.min_quantity_delta,
             "allow_exit_below_min_notional": self.allow_exit_below_min_notional,
             "cadence": self.cadence,
+            "target_churn_guard": self.target_churn_guard,
+            "target_churn_max_quantity_delta": self.target_churn_max_quantity_delta,
+            "target_churn_lot_fraction": self.target_churn_lot_fraction,
+            "target_churn_equity_bps": self.target_churn_equity_bps,
+            "whole_share_entry_floor_min_fraction": self.whole_share_entry_floor_min_fraction,
+            "whole_share_rounding_churn_guard": self.whole_share_rounding_churn_guard,
+            "whole_share_rounding_churn_min_fraction": self.whole_share_rounding_churn_min_fraction,
             "reused_target_churn_guard": self.reused_target_churn_guard,
             "reused_target_churn_max_quantity_delta": self.reused_target_churn_max_quantity_delta,
             "reused_target_churn_lot_fraction": self.reused_target_churn_lot_fraction,
@@ -401,6 +426,7 @@ class SleeveRuntimeConfig:
     sleeve_id: str
     universe: UniverseRuntimeConfig
     workspace_path: Path | None = None
+    display_name: str = ""
     broker_account_id: str | None = None
     broker_account_routes: Mapping[str, str] = field(default_factory=dict)
     cash: float = 100_000.0
@@ -442,6 +468,7 @@ class SleeveRuntimeConfig:
         return {
             "sleeve_id": self.sleeve_id,
             "workspace_path": _path_to_config_str(self.workspace_path),
+            "display_name": self.display_name,
             "broker_account_id": self.broker_account_id,
             "broker_account_routes": dict(self.broker_account_routes),
             "cash": self.cash,
@@ -601,6 +628,7 @@ def _parse_sleeve_runtime_config(payload: Any) -> SleeveRuntimeConfig:
         sleeve_id=str(data.get("sleeve_id", data.get("id", ""))).strip(),
         universe=_parse_universe_runtime_config(_object(data.get("universe"))),
         workspace_path=_optional_path(data.get("workspace_path", data.get("workspace"))),
+        display_name=str(data.get("display_name", data.get("name", "")) or "").strip(),
         broker_account_id=_optional_text(data.get("broker_account_id", data.get("account_id"))),
         broker_account_routes=_parse_broker_account_routes(data.get("broker_account_routes", data.get("account_routes"))),
         cash=float(data.get("cash", data.get("portfolio_cash", 100_000.0))),
@@ -728,9 +756,19 @@ def _parse_rebalance_policy_runtime_config(payload: Mapping[str, Any]) -> Rebala
     return RebalancePolicyRuntimeConfig(
         cash_reserve_pct=float(payload.get("cash_reserve_pct", 0.0)),
         min_order_notional=float(payload.get("min_order_notional", 0.0)),
+        min_order_notional_equity_bps=float(payload.get("min_order_notional_equity_bps", 0.0)),
         min_quantity_delta=int(payload.get("min_quantity_delta", 1)),
         allow_exit_below_min_notional=bool(payload.get("allow_exit_below_min_notional", True)),
         cadence=str(payload.get("cadence", "every_cycle")).strip(),
+        target_churn_guard=bool(payload.get("target_churn_guard", False)),
+        target_churn_max_quantity_delta=int(payload.get("target_churn_max_quantity_delta", 1)),
+        target_churn_lot_fraction=float(payload.get("target_churn_lot_fraction", 0.5)),
+        target_churn_equity_bps=float(payload.get("target_churn_equity_bps", 0.0)),
+        whole_share_entry_floor_min_fraction=float(payload.get("whole_share_entry_floor_min_fraction", 1.0)),
+        whole_share_rounding_churn_guard=bool(payload.get("whole_share_rounding_churn_guard", True)),
+        whole_share_rounding_churn_min_fraction=float(
+            payload.get("whole_share_rounding_churn_min_fraction", 0.25)
+        ),
         reused_target_churn_guard=bool(payload.get("reused_target_churn_guard", False)),
         reused_target_churn_max_quantity_delta=int(payload.get("reused_target_churn_max_quantity_delta", 1)),
         reused_target_churn_lot_fraction=float(payload.get("reused_target_churn_lot_fraction", 0.5)),

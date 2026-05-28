@@ -107,3 +107,40 @@ def test_order_orchestrator_records_ticket_and_events_to_runtime_state_store(tmp
     assert snapshot.open_tickets[0].status is OrderTicketStatus.SUBMITTED
     assert snapshot.open_tickets[0].broker_order_id.startswith("paper:")
     assert account_store.current_portfolio("LEaps").holdings == {}
+
+
+def test_order_orchestrator_reports_fill_driven_portfolio_mutations(tmp_path):
+    account_store = VirtualSleeveAccountStore(
+        tmp_path / "accounts.json",
+        default_cash_by_sleeve={"LEaps": 1_000_000},
+    )
+    order_store = FileOrderRuntimeStateStore(tmp_path / "orders.jsonl")
+    orchestrator = MultiSleeveOrderOrchestrator(
+        broker=BrokerExecutionService(PaperBrokerExecutionGateway(fill_on_poll=True)),
+        account_store=account_store,
+        order_state_store=order_store,
+    )
+
+    result = orchestrator.run_batches(
+        (_batch(quantity=3),),
+        generated_at=datetime(2026, 5, 9, 9, 31),
+        poll_after_submit=True,
+    )
+
+    assert result.final_tickets[0].status is OrderTicketStatus.FILLED
+    assert result.applied_event_ids == tuple(event.event_id for event in result.submission.events + result.polling.events)
+    assert len(result.fill_application_reports) == 2
+    assert len(result.portfolio_mutations) == 1
+    mutation = result.portfolio_mutations[0]
+    assert mutation.sleeve_id == "LEaps"
+    assert mutation.before_cash == 1_000_000
+    assert mutation.after_cash == 790_000
+    assert mutation.before_quantity == 0
+    assert mutation.after_quantity == 3
+    assert mutation.order_intent_id == result.final_tickets[0].order_intent_id
+    assert mutation.ticket_id == result.final_tickets[0].ticket_id
+    assert account_store.current_portfolio("LEaps").quantity(Symbol("005930", "KRX")) == 3
+
+    status = result.to_dict()
+    assert status["portfolio_mutation_count"] == 1
+    assert status["portfolio_mutations"][0]["after_quantity"] == 3

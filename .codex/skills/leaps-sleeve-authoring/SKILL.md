@@ -63,6 +63,21 @@ Changing files inside the workspace is not enough to update a running live
 process. Runtime reload happens at a controlled cycle boundary through runtime
 config/control, followed by preflight or a dry-run cycle.
 
+Do not assume runtime artifact paths from the workspace. Strategy files live in
+`sleeves/<sleeve_id>/`; live state lives under runtime/account/order stores
+chosen by the runtime config. Before inspecting logs, framework state, order
+stores, report files, or account stores, ask the engine for the current artifact
+map:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-artifact-status configs/runtime/live_multi_sleeve.json `
+  --sleeve-id <sleeve_id> `
+  --summary-only
+```
+
+This command is read-only and does not run models, call KIS, submit orders, or
+mutate virtual accounts.
+
 ## Workspace Layout
 
 Prefer this structure:
@@ -232,10 +247,31 @@ Execution models still do not submit broker orders. Broker adapters and order
 runtime own tickets, polling, fills, cancellation, replacement, and
 reconciliation.
 
+Order intents do not mutate holdings. Portfolio state moves only through
+`OrderEvent` fills applied by the virtual account. The order runtime exposes
+recent `portfolio_mutations`, so sleeve authors should debug actual ownership
+through lifecycle reports rather than assuming a target or intent was filled.
+
 ## State
 
 Use `context.model_state` and `StatePatch` for model-owned state. State is
 sleeve-namespaced by design.
+
+Prefer a bound scope for non-trivial state:
+
+```python
+trail = context.model_state.scope(
+    model_id="volatility_trailing_stop",
+    namespace="trailing_stop",
+).for_symbol(symbol_key)
+
+state = trail.object_get(default={"high_watermark_price": 0})
+patch = trail.object_merge({"high_watermark_price": next_high}, reason="mark")
+```
+
+Use `.for_position(position_id)` when the state should follow a position
+instance. The model still returns `StatePatch`; the runtime commits it after a
+successful cycle in backtest, research, paper, and live.
 
 Good model state examples:
 

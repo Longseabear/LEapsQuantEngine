@@ -39,6 +39,22 @@ def test_calendar_missing_holiday_file_is_degraded_but_weekend_only_usable(tmp_p
     assert report.session.session_phase == "regular_continuous"
 
 
+def test_default_holiday_files_close_krx_and_us_on_2026_may_25():
+    krx = session_report_for_market_scope(
+        "domestic",
+        now=datetime(2026, 5, 25, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+    us = session_report_for_market_scope(
+        "overseas",
+        now=datetime(2026, 5, 25, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
+
+    assert krx.holiday is True
+    assert krx.session.is_orderable is False
+    assert us.holiday is True
+    assert us.session.is_orderable is False
+
+
 def test_us_calendar_handles_pre_market_with_dst_timezone():
     report = session_report_for_market_scope(
         "overseas",

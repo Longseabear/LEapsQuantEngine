@@ -185,6 +185,7 @@ class CycleJournalEntry:
                 "coarse_universe_id": getattr(report, "coarse_universe_id", ""),
                 "active_universe_id": getattr(report, "active_universe_id", ""),
                 "lineage": lineage,
+                "stage_decisions": _json_safe(getattr(framework, "stage_decisions", {})) if framework is not None else {},
             },
         )
 
@@ -218,6 +219,7 @@ class CycleJournalEntry:
             metadata["lineage"] = build_cycle_lineage_summary(cycle).to_dict()
         else:
             metadata["lineage_omitted"] = "journal_mode_light"
+        metadata["stage_decisions"] = _json_safe(getattr(cycle, "stage_decisions", {}))
 
         return cls(
             runtime_id=runtime_id,
@@ -271,6 +273,19 @@ class FileCycleJournalStore:
         market_scope: str | None = None,
         limit: int | None = None,
     ) -> tuple[CycleJournalEntry, ...]:
+        if limit is not None and limit >= 0:
+            matches: list[CycleJournalEntry] = []
+            for entry in self._iter_entries_reverse():
+                if (
+                    (sleeve_id is None or entry.sleeve_id == sleeve_id)
+                    and (account_id is None or entry.account_id == account_id)
+                    and (market_scope is None or entry.market_scope == market_scope)
+                ):
+                    matches.append(entry)
+                    if len(matches) >= limit:
+                        break
+            matches.reverse()
+            return tuple(matches)
         matches = [
             entry
             for entry in self._iter_entries()
@@ -278,8 +293,6 @@ class FileCycleJournalStore:
             and (account_id is None or entry.account_id == account_id)
             and (market_scope is None or entry.market_scope == market_scope)
         ]
-        if limit is not None and limit >= 0:
-            matches = matches[-limit:]
         return tuple(matches)
 
     def latest(
@@ -289,10 +302,14 @@ class FileCycleJournalStore:
         account_id: str | None = None,
         market_scope: str | None = None,
     ) -> CycleJournalEntry | None:
-        matches = self.entries(sleeve_id=sleeve_id, account_id=account_id, market_scope=market_scope)
-        if not matches:
-            return None
-        return matches[-1]
+        for entry in self._iter_entries_reverse():
+            if (
+                (sleeve_id is None or entry.sleeve_id == sleeve_id)
+                and (account_id is None or entry.account_id == account_id)
+                and (market_scope is None or entry.market_scope == market_scope)
+            ):
+                return entry
+        return None
 
     def _iter_entries(self) -> tuple[CycleJournalEntry, ...]:
         if not self.path.exists():
@@ -308,6 +325,36 @@ class FileCycleJournalStore:
                     entries.append(CycleJournalEntry.from_dict(payload))
         return tuple(entries)
 
+    def _iter_entries_reverse(self) -> Iterable[CycleJournalEntry]:
+        if not self.path.exists():
+            return
+        for line in _iter_file_lines_reverse(self.path):
+            text = line.strip()
+            if not text:
+                continue
+            payload = json.loads(text)
+            if isinstance(payload, Mapping):
+                yield CycleJournalEntry.from_dict(payload)
+
+
+def _iter_file_lines_reverse(path: Path, *, chunk_size: int = 1024 * 1024) -> Iterable[str]:
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        position = handle.tell()
+        buffer = b""
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            parts = (chunk + buffer).split(b"\n")
+            buffer = parts[0]
+            for line in reversed(parts[1:]):
+                if line:
+                    yield line.decode("utf-8")
+        if buffer:
+            yield buffer.decode("utf-8")
+
 
 def _parse_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
@@ -321,6 +368,21 @@ def _parse_datetime(value: Any) -> datetime:
 def _optional_text(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, set)):
+        return [_json_safe(item) for item in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _json_safe(to_dict())
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _report_generated_at(report: Any, worker_cycle: Any | None, framework: Any | None) -> datetime:

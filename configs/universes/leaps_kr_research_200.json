@@ -2215,6 +2215,12 @@
   "metadata": {
     "source_universe": "configs/universes/benchmark_kor_200.json",
     "source_listing": "FinanceDataReader StockListing(KRX)",
+    "operator_excluded_name_rules": [
+      {
+        "all": ["삼성전자"],
+        "any": ["레버리지", "인버스", "2X"]
+      }
+    ],
     "notes": "Expanded LEaps KRW research universe. 60-day ROC remains optional so live warmup can still pass when KIS cache has shorter lookback."
   }
 }

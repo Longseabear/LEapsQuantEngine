@@ -63,6 +63,23 @@ def test_weekly_at_supports_explicit_weekday():
     ) is False
 
 
+def test_every_n_days_waits_for_date_interval():
+    cadence = "every_3_days"
+
+    assert normalize_cadence("3d") == cadence
+    assert cadence_due(cadence, datetime(2026, 5, 18, 9, 0), None) is True
+    assert cadence_due(
+        cadence,
+        datetime(2026, 5, 20, 9, 0),
+        datetime(2026, 5, 18, 9, 0),
+    ) is False
+    assert cadence_due(
+        cadence,
+        datetime(2026, 5, 21, 9, 0),
+        datetime(2026, 5, 18, 9, 0),
+    ) is True
+
+
 def test_time_window_includes_bounds_and_supports_timezone_suffix():
     assert within_time_window(datetime(2026, 5, 18, 9, 5), "09:05-14:50 Asia/Seoul") is True
     assert within_time_window(datetime(2026, 5, 18, 14, 50), "09:05-14:50 Asia/Seoul") is True

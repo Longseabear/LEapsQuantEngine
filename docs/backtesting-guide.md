@@ -77,6 +77,12 @@ Use `--source kis-cache` for short integration smokes against already-cached KIS
 history. Do not assume KIS cache has a complete multi-year history unless it was
 explicitly populated.
 
+Use `--source parquet-daily` for fixed local monthly research bars under
+`data/research/market_data/daily_bars/<market>_YYYY_MM.parquet`. The Parquet
+store is the preferred reproducible source for the current April/May 2026 KRX
+and US stock/ETF coverage. See `docs/market-data-manager-runbook.md` for the
+storage contract, coverage universe files, and inspection commands.
+
 KIS and broker payloads must stay behind adapters. Backtest models should not
 call KIS, broker-engine, market-data-engine, or FinanceDataReader directly.
 
@@ -278,6 +284,33 @@ total_ms
 cycle timings. The wall-clock replay timings also include indicator updates,
 snapshot creation, selection, fills, portfolio tracker bookkeeping, and object
 conversion, so they are usually larger.
+
+Runtime and framework backtest reports include `turnover_breakdown` so target
+changes, execution churn, and symbol replacement can be read separately:
+
+- `retargeting_turnover`: fresh portfolio target changes only. This measures
+  how much the desired target weights changed when portfolio construction
+  actually produced a new target batch. It excludes reused-target tracking
+  cycles, so it is the field to read when asking "how often did the model
+  retarget?" Use `retargeting_rate`,
+  `total_abs_retarget_delta_ex_initial`, and
+  `one_way_retarget_turnover_ex_initial`.
+- `alpha_turnover`: compatibility alias for `retargeting_turnover`.
+- `execution_turnover`: actual simulated fill turnover. This uses filled
+  buy/sell notional divided by average equity and matches `metrics.turnover`.
+  It includes rebalance, drift correction, partial fills, slippage handling,
+  and any execution-layer behavior that produced fills.
+- `replacement_rate`: actual membership changes from fills. It reports
+  `new_entry_count`, `full_exit_count`, and rates per framework cycle so a
+  strategy can distinguish weight reshuffling from true symbol replacement.
+
+Terminology:
+
+- Retargeting: portfolio construction changes desired weights.
+- Rebalancing / target tracking: the engine keeps an existing target and trades
+  toward it as price, cash, holdings, or partial fills change.
+- Execution turnover: what actually filled after sizing, risk, guard, and
+  execution.
 
 FinanceDataReader daily history is cache-first by default at:
 

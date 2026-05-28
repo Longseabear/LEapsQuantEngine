@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from leaps_quant_engine.execution import StandardExecutionModel
-from leaps_quant_engine.models import DataSlice, OrderIntent, PortfolioTarget
+from leaps_quant_engine.models import DataSlice, OrderIntent, OrderSide, PortfolioTarget
 from leaps_quant_engine.portfolio import Portfolio
 
 
@@ -20,7 +20,12 @@ class SemiconductKorExecutionModel:
         price_drift_bps: float | None = 80.0,
         min_replace_interval_seconds: float | None = 180.0,
         max_replacements: int | None = 2,
+        allow_sells: bool = False,
+        buy_window: str = "",
+        sell_window: str = "",
+        window_timezone: str = "Asia/Seoul",
     ) -> None:
+        self.allow_sells = bool(allow_sells)
         self.base_model = StandardExecutionModel(
             order_type=order_type,
             time_in_force=time_in_force,
@@ -34,6 +39,9 @@ class SemiconductKorExecutionModel:
             price_drift_bps=price_drift_bps,
             min_replace_interval_seconds=min_replace_interval_seconds,
             max_replacements=max_replacements,
+            buy_window=buy_window,
+            sell_window=sell_window,
+            window_timezone=window_timezone,
         )
 
     def create_orders(
@@ -44,7 +52,10 @@ class SemiconductKorExecutionModel:
         targets: list[PortfolioTarget],
         **kwargs,
     ) -> list[OrderIntent]:
-        return self.base_model.create_orders(sleeve_id, portfolio, data, targets, **kwargs)
+        orders = self.base_model.create_orders(sleeve_id, portfolio, data, targets, **kwargs)
+        if self.allow_sells:
+            return orders
+        return [order for order in orders if order.side is not OrderSide.SELL]
 
 
 def create_execution_model(params):
@@ -61,6 +72,10 @@ def create_execution_model(params):
         price_drift_bps=_optional_float(params.get("price_drift_bps"), default=80.0),
         min_replace_interval_seconds=_optional_float(params.get("min_replace_interval_seconds"), default=180.0),
         max_replacements=_optional_int(params.get("max_replacements"), default=2),
+        allow_sells=_optional_bool(params.get("allow_sells"), default=False),
+        buy_window=str(params.get("buy_window", "")),
+        sell_window=str(params.get("sell_window", "")),
+        window_timezone=str(params.get("window_timezone", "Asia/Seoul")),
     )
 
 
@@ -74,3 +89,11 @@ def _optional_float(value, *, default=None):
     if value is None or str(value).strip() == "":
         return default
     return float(value)
+
+
+def _optional_bool(value, *, default=False):
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}

@@ -114,5 +114,13 @@
     {"name": "rolling_dollar_volume_60", "type": "rolling_dollar_volume", "period": 60},
     {"name": "volume_momentum_20", "type": "volume_momentum", "period": 20},
     {"name": "volume_ratio_20", "type": "volume_ratio", "period": 20}
-  ]
+  ],
+  "metadata": {
+    "operator_excluded_name_rules": [
+      {
+        "all": ["삼성전자"],
+        "any": ["레버리지", "인버스", "2X"]
+      }
+    ]
+  }
 }

@@ -10,14 +10,14 @@ from leaps_quant_engine.universe.selection import (
 
 SELECTION_ID = "kr-lowvol-defensive-core"
 MIN_PRICE = 2_000.0
-MIN_LIQUIDITY = 800_000_000.0
-MAX_NORMALIZED_VOLATILITY = 0.12
-HARD_MAX_NORMALIZED_VOLATILITY = 0.155
-MAX_DRAWDOWN_60 = 0.22
-MIN_MOMENTUM_60 = -0.10
-HARD_VOLUME_RATIO = 4.50
-HARD_INTRADAY_RANGE = 0.12
-HARD_UPSIDE_SPIKE = 0.095
+MIN_LIQUIDITY = 600_000_000.0
+MAX_NORMALIZED_VOLATILITY = 0.13
+HARD_MAX_NORMALIZED_VOLATILITY = 0.170
+MAX_DRAWDOWN_60 = 0.26
+MIN_MOMENTUM_60 = -0.12
+HARD_VOLUME_RATIO = 4.20
+HARD_INTRADAY_RANGE = 0.115
+HARD_UPSIDE_SPIKE = 0.090
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,11 +151,11 @@ def _reject_reason(item: dict[str, float]) -> str:
     volatility = item["normalized_volatility"]
     if volatility >= HARD_MAX_NORMALIZED_VOLATILITY:
         return "extreme_volatility"
-    if volatility > MAX_NORMALIZED_VOLATILITY and item["momentum_60"] < 0.12:
+    if volatility > MAX_NORMALIZED_VOLATILITY and item["momentum_60"] < 0.08:
         return "high_vol_without_momentum"
     if item["momentum_60"] < MIN_MOMENTUM_60:
         return "weak_medium_momentum"
-    if abs(item["drawdown_60"]) > MAX_DRAWDOWN_60 and item["momentum_20"] < 0:
+    if abs(item["drawdown_60"]) > MAX_DRAWDOWN_60 and item["momentum_20"] < -0.02:
         return "falling_knife"
     if item["gap"] > 0.09:
         return "large_gap"
@@ -165,9 +165,9 @@ def _reject_reason(item: dict[str, float]) -> str:
         return "crowded_turnover_spike"
     if item["bar_return"] > HARD_UPSIDE_SPIKE and item["volume_ratio_20"] > 2.0:
         return "lottery_like_spike"
-    if item["lottery_penalty"] >= 0.78:
+    if item["lottery_penalty"] >= 0.82:
         return "lottery_like_spike"
-    if item["crowding_penalty"] >= 0.85:
+    if item["crowding_penalty"] >= 0.88:
         return "crowded_turnover_spike"
     return ""
 

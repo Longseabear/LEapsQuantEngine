@@ -305,7 +305,11 @@ time_in_force              = day
 buy_limit_offset_bps       = 8
 sell_limit_offset_bps      = 15
 stop_sell_limit_offset_bps = 35
-max_slice_notional         = 2,000,000 KRW
+max_slice_notional         = 2,000,000 KRW fallback
+dynamic_slice_notional     = enabled
+dynamic_slice_equity_pct   = 20%
+dynamic_slice_bounds       = 1,000,000-5,000,000 KRW
+dynamic_slice_liquidity    = 0.08% of rolling 20D traded value when available
 max_slices                 = 3
 max_daily_volume_participation_bps = 50
 chase_guard_intraday_return_bps    = 500
@@ -322,7 +326,7 @@ Session policy:
 - KRX limit prices are rounded to the side-safe tick grid.
 
 Slicing means the execution model may split a large target delta into up to
-three order intents, each bounded by the configured notional cap. Any remaining
+three order intents, each bounded by the dynamic notional cap. Any remaining
 quantity is deferred to a later cycle; it is not hidden state inside the model.
 
 ## Layer Boundaries

@@ -12,6 +12,7 @@ param(
     [ValidateSet("latest-target", "fast-current", "recompute")]
     [string]$ReportMode = "latest-target",
     [string]$StatePath = "",
+    [string]$HeartbeatPath = "",
     [int]$FailureRetrySeconds = 300,
     [int]$IdleLogEverySeconds = 1800
 )
@@ -48,11 +49,58 @@ if ([string]::IsNullOrWhiteSpace($StatePath)) {
 
 $stateFullPath = Resolve-LoopPath $StatePath
 New-Item -ItemType Directory -Force -Path (Split-Path $stateFullPath -Parent) | Out-Null
+if ([string]::IsNullOrWhiteSpace($HeartbeatPath)) {
+    $stateBaseName = [System.IO.Path]::GetFileNameWithoutExtension($StatePath)
+    $stateParent = Split-Path $StatePath -Parent
+    if ([string]::IsNullOrWhiteSpace($stateParent)) {
+        $HeartbeatPath = "$stateBaseName.heartbeat.json"
+    } else {
+        $HeartbeatPath = Join-Path $stateParent "$stateBaseName.heartbeat.json"
+    }
+}
+$heartbeatFullPath = Resolve-LoopPath $HeartbeatPath
+New-Item -ItemType Directory -Force -Path (Split-Path $heartbeatFullPath -Parent) | Out-Null
 
 function Write-LoopLog {
     param([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $logFullPath -Value "[$timestamp] $Message" -Encoding UTF8
+}
+
+function Write-Heartbeat {
+    param(
+        [string]$Status,
+        [string]$Phase,
+        [hashtable]$Metadata = @{}
+    )
+    $payload = [ordered]@{
+        schema_version = "runtime_heartbeat.v1"
+        runtime_id = "live_multi_sleeve"
+        component = "portfolio_report_loop"
+        status = $Status
+        updated_at = (Get-Date).ToString("o")
+        config_path = $Config
+        config_version = ""
+        sleeve_ids = @($SleeveId)
+        cycle_index = $null
+        process_id = $PID
+        metadata = [ordered]@{
+            phase = $Phase
+            market_scope = $resolvedMarketScope
+            report_mode = $ReportMode
+            process_id_liveness_checked = $false
+        }
+    }
+    foreach ($key in $Metadata.Keys) {
+        $payload.metadata[$key] = $Metadata[$key]
+    }
+    try {
+        $tmp = "$heartbeatFullPath.tmp"
+        $payload | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $heartbeatFullPath -Force
+    } catch {
+        Write-LoopLog "heartbeat write failed path=$heartbeatFullPath error=$($_.Exception.Message)"
+    }
 }
 
 function Resolve-MarketScope {
@@ -195,12 +243,14 @@ $marketTimeZone = Get-MarketTimeZone -Scope $resolvedMarketScope
 $phases = Get-ReportPhases -Scope $resolvedMarketScope
 $phaseDescription = ($phases | ForEach-Object { "$($_.name)=$($_.start)-$($_.end)" }) -join ","
 
-Write-LoopLog "portfolio report loop started config=$Config sleeve=$SleeveId mode=$ReportMode schedule_mode=$ScheduleMode interval=${IntervalSeconds}s market_scope=$resolvedMarketScope timezone=$($marketTimeZone.Id) state=$StatePath phases=$phaseDescription"
+Write-LoopLog "portfolio report loop started config=$Config sleeve=$SleeveId mode=$ReportMode schedule_mode=$ScheduleMode interval=${IntervalSeconds}s market_scope=$resolvedMarketScope timezone=$($marketTimeZone.Id) state=$StatePath heartbeat=$HeartbeatPath phases=$phaseDescription"
+Write-Heartbeat -Status "running" -Phase "started"
 
 $lastIdleLogAt = [datetime]::MinValue
 $lastLoggedSentKey = ""
 
 while ($true) {
+    Write-Heartbeat -Status "running" -Phase "loop_tick"
     if ($ScheduleMode -eq "interval") {
         $ok = Invoke-PortfolioReport -PhaseName "interval" -PhaseLabel "interval"
         if ($ok) {
@@ -215,6 +265,7 @@ while ($true) {
     $phase = Get-CurrentReportPhase -MarketNow $marketNow -Phases $phases
     if (-not $phase) {
         $now = Get-Date
+        Write-Heartbeat -Status "idle" -Phase "outside_report_phase" -Metadata @{ market_time = $marketNow.ToString("yyyy-MM-dd HH:mm:ss") }
         if (($now - $lastIdleLogAt).TotalSeconds -ge $IdleLogEverySeconds) {
             Write-LoopLog "outside report phase market_time=$($marketNow.ToString('yyyy-MM-dd HH:mm:ss'))"
             $lastIdleLogAt = $now
@@ -232,6 +283,7 @@ while ($true) {
             Write-LoopLog "report already sent phase_key=$phaseKey market_time=$($marketNow.ToString('yyyy-MM-dd HH:mm:ss'))"
             $lastLoggedSentKey = $phaseKey
         }
+        Write-Heartbeat -Status "idle" -Phase "phase_already_sent" -Metadata @{ phase_key = $phaseKey }
         Start-Sleep -Seconds $IntervalSeconds
         continue
     }
@@ -241,8 +293,10 @@ while ($true) {
         $sentKeys = @($sentKeys + $phaseKey | Select-Object -Unique)
         Save-ReportState -SentPhaseKeys $sentKeys -Scope $resolvedMarketScope
         $lastLoggedSentKey = $phaseKey
+        Write-Heartbeat -Status "running" -Phase "report_sent" -Metadata @{ phase_key = $phaseKey }
         Start-Sleep -Seconds $IntervalSeconds
     } else {
+        Write-Heartbeat -Status "error" -Phase "report_failed" -Metadata @{ phase_key = $phaseKey }
         Start-Sleep -Seconds $FailureRetrySeconds
     }
 }

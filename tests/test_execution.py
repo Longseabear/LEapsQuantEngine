@@ -6,10 +6,12 @@ from leaps_quant_engine.execution import (
     ImmediateExecutionModel,
     LimitExecutionModel,
     MarketExecutionModel,
+    PendingOrderState,
     SlicedExecutionModel,
 )
 from leaps_quant_engine.market_rules import MarketSession
 from leaps_quant_engine.models import Bar, DataSlice, OrderIntent, OrderSide, OrderType, PortfolioTarget, Symbol, TimeInForce
+from leaps_quant_engine.orders import OrderTicket, OrderTicketStatus
 from leaps_quant_engine.portfolio import Holding, Portfolio
 
 
@@ -63,6 +65,201 @@ def test_execution_engine_creates_sell_for_reduced_target():
     assert batch.order_intents[0].side is OrderSide.SELL
     assert batch.order_intents[0].quantity == 3
     assert batch.to_dict()["orders"][0]["notional"] == 300.0
+
+
+def test_execution_subtracts_equivalent_open_buy_from_unordered_quantity():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+    portfolio = Portfolio(cash=10_000, holdings={symbol.key: Holding(symbol, quantity=70, average_price=90.0)})
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _ticket(
+                symbol,
+                side=OrderSide.BUY,
+                quantity=30,
+                sleeve_id="test-sleeve",
+                created_at=data.time,
+            ),
+        ),
+        sleeve_id="test-sleeve",
+        as_of=data.time,
+    )
+
+    batch = ExecutionEngine().execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, "entry"),),
+            pending_orders=pending,
+            target_batch_id="target-batch-1",
+        )
+    )
+
+    assert batch.order_intents == ()
+    assert batch.metadata["pending_orders"]["open_buy_quantities"] == {"US:AAA": 30}
+    assert batch.metadata["target_batch_id"] == "target-batch-1"
+
+
+def test_execution_orders_only_unordered_remaining_buy_quantity():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+    portfolio = Portfolio(cash=10_000, holdings={symbol.key: Holding(symbol, quantity=70, average_price=90.0)})
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _ticket(
+                symbol,
+                side=OrderSide.BUY,
+                quantity=10,
+                sleeve_id="test-sleeve",
+                created_at=data.time,
+            ),
+        ),
+        sleeve_id="test-sleeve",
+        as_of=data.time,
+    )
+
+    batch = ExecutionEngine().execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, "entry"),),
+            pending_orders=pending,
+            target_batch_id="target-batch-1",
+            source_target_batch_id="portfolio-batch-1",
+        )
+    )
+
+    order = batch.order_intents[0]
+    assert order.side is OrderSide.BUY
+    assert order.quantity == 20
+    assert order.metadata["delta_quantity"] == 30
+    assert order.metadata["unordered_delta_quantity"] == 20
+    assert order.metadata["pending_buy_quantity"] == 10
+    assert order.metadata["projected_quantity"] == 80
+    assert order.metadata["target_batch_id"] == "target-batch-1"
+    assert order.metadata["source_target_batch_id"] == "portfolio-batch-1"
+
+
+def test_execution_uses_remaining_quantity_for_partially_filled_open_ticket():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+    portfolio = Portfolio(cash=10_000, holdings={symbol.key: Holding(symbol, quantity=90, average_price=90.0)})
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _ticket(
+                symbol,
+                side=OrderSide.BUY,
+                quantity=30,
+                filled_quantity=20,
+                status=OrderTicketStatus.PARTIALLY_FILLED,
+                sleeve_id="test-sleeve",
+                created_at=data.time,
+            ),
+        ),
+        sleeve_id="test-sleeve",
+        as_of=data.time,
+    )
+
+    batch = ExecutionEngine().execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, "entry"),),
+            pending_orders=pending,
+        )
+    )
+
+    assert pending.open_buy_quantity(symbol) == 10
+    assert batch.order_intents == ()
+    assert batch.metadata["pending_orders"]["latest_status_by_symbol"] == {"US:AAA": "partially_filled"}
+
+
+def test_execution_reused_target_does_not_duplicate_when_open_order_covers_target():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+    portfolio = Portfolio(cash=10_000, holdings={symbol.key: Holding(symbol, quantity=70, average_price=90.0)})
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _ticket(
+                symbol,
+                side=OrderSide.BUY,
+                quantity=30,
+                sleeve_id="test-sleeve",
+                created_at=data.time,
+            ),
+        ),
+        sleeve_id="test-sleeve",
+        as_of=data.time,
+    )
+
+    first = ExecutionEngine().execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, "entry"),),
+            pending_orders=pending,
+            target_batch_id="order-sizing-1",
+            source_target_batch_id="portfolio-target-1",
+        )
+    )
+    second = ExecutionEngine().execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 100, "entry"),),
+            pending_orders=pending,
+            target_batch_id="order-sizing-1",
+            source_target_batch_id="portfolio-target-1",
+        )
+    )
+
+    assert first.order_intents == ()
+    assert second.order_intents == ()
+
+
+def test_execution_hard_exit_can_bypass_normal_unordered_suppression():
+    symbol = Symbol("AAA", "US")
+    data = _slice(symbol, 100.0)
+    portfolio = Portfolio(cash=0, holdings={symbol.key: Holding(symbol, quantity=100, average_price=90.0)})
+    pending = PendingOrderState.from_order_tickets(
+        (
+            _ticket(
+                symbol,
+                side=OrderSide.SELL,
+                quantity=100,
+                sleeve_id="test-sleeve",
+                created_at=data.time,
+            ),
+        ),
+        sleeve_id="test-sleeve",
+        as_of=data.time,
+    )
+
+    batch = ExecutionEngine().execute(
+        ExecutionContext(
+            sleeve_id="test-sleeve",
+            generated_at=data.time,
+            portfolio=portfolio,
+            data=data,
+            approved_targets=(PortfolioTarget(symbol, 0, "hard_exit:trailing_stop"),),
+            pending_orders=pending,
+        )
+    )
+
+    assert batch.order_intents[0].side is OrderSide.SELL
+    assert batch.order_intents[0].quantity == 100
+    assert batch.order_intents[0].metadata["unordered_quantity_bypassed"] is True
+    assert batch.order_intents[0].metadata["pending_sell_quantity"] == 100
 
 
 def test_limit_execution_model_applies_side_aware_limit_offset():
@@ -291,3 +488,28 @@ def test_execution_engine_supports_market_session_keyword_for_new_models():
 
     assert batch.order_intents[0].metadata["model_seen_primary_session"] == "after_hours_close"
     assert batch.order_intents[0].metadata["order_session"] == "after_hours_close"
+
+
+def _ticket(
+    symbol: Symbol,
+    *,
+    side: OrderSide,
+    quantity: int,
+    sleeve_id: str,
+    created_at: datetime,
+    status: OrderTicketStatus = OrderTicketStatus.SUBMITTED,
+    filled_quantity: int = 0,
+) -> OrderTicket:
+    return OrderTicket(
+        ticket_id=f"ticket-{side.value}-{symbol.ticker}",
+        order_intent_id=f"intent-{side.value}-{symbol.ticker}",
+        batch_id="batch-1",
+        sleeve_id=sleeve_id,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        reference_price=100.0,
+        status=status,
+        filled_quantity=filled_quantity,
+        created_at=created_at,
+    )

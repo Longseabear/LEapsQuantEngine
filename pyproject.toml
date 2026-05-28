@@ -24,7 +24,7 @@ rl = [
   "gymnasium>=0.29",
   "stable-baselines3>=2.5",
 ]
-market-data = ["yfinance>=0.2"]
+market-data = ["yfinance>=0.2", "pandas>=2.0", "pyarrow>=14"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

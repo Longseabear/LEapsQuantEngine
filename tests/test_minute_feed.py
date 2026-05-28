@@ -90,6 +90,28 @@ def test_yfinance_minute_provider_retries_empty_chunks_by_day(monkeypatch):
     assert [bar.time for bar in bars] == [datetime(2026, 5, 2, 9, 30)]
 
 
+def test_yfinance_hourly_provider_skips_daily_retry_for_empty_chunks(monkeypatch):
+    pd = pytest.importorskip("pandas")
+    calls: list[tuple[str, str]] = []
+
+    def fake_download(ticker, *, start, end, interval, auto_adjust, prepost, progress, threads):
+        calls.append((start, end))
+        return pd.DataFrame()
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=fake_download))
+
+    provider = YFinanceMinuteBarProvider(max_request_days=3)
+    bars = provider.download(
+        Symbol("SPY", "US"),
+        start=datetime(2026, 5, 1),
+        end=datetime(2026, 5, 3, 23, 59, 59),
+        interval="60m",
+    )
+
+    assert calls == [("2026-05-01", "2026-05-04")]
+    assert bars == []
+
+
 def test_download_us_minute_feed_marks_partial_when_symbol_is_empty(tmp_path):
     universe = UniverseDefinition(
         id="us-test",

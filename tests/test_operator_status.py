@@ -25,6 +25,7 @@ def test_cash_availability_reports_residual_cash_by_route(tmp_path):
     report = build_cash_availability_report(
         runtime_id="test",
         sleeve_ids=("LEaps",),
+        generated_at=datetime(2026, 5, 14, 9, 1),
         routes=(
             CashAvailabilityRouteInput(
                 account_id="kis-domestic",
@@ -38,8 +39,120 @@ def test_cash_availability_reports_residual_cash_by_route(tmp_path):
 
     assert report["available_cash_by_currency"] == {"KRW": 800_000}
     assert report["routes"][0]["available_cash"] == 800_000
+    assert report["routes"][0]["available_cash_source"] == "stored_residual_sleeve"
+    assert report["routes"][0]["stored_residual_cash"] == 800_000
+    assert report["routes"][0]["broker_residual_cash"] == 800_000
     assert report["routes"][0]["sleeve_cash"] == {"LEaps": 200_000}
     assert report["needs_attention"] is False
+
+
+def test_cash_availability_keeps_stale_broker_residual_out_of_available_cash(tmp_path):
+    account_store_path = tmp_path / "accounts.json"
+    store = VirtualSleeveAccountStore(account_store_path, default_cash_by_sleeve={"LEaps": 200_000})
+    store.current_portfolio("LEaps")
+    store.sync_account_cash(
+        {"cash_balance": 1_000_000, "currency": "KRW"},
+        account_id="kis-domestic",
+        currency="KRW",
+        synced_at=datetime(2026, 5, 14, 9, 0),
+    )
+
+    report = build_cash_availability_report(
+        runtime_id="test",
+        sleeve_ids=("LEaps",),
+        generated_at=datetime(2026, 5, 14, 10, 0),
+        max_cash_snapshot_age_seconds=60,
+        routes=(
+            CashAvailabilityRouteInput(
+                account_id="kis-domestic",
+                market_scope="domestic",
+                currency="KRW",
+                account_store_path=account_store_path,
+                default_cash_by_sleeve={"LEaps": 200_000},
+            ),
+        ),
+    )
+
+    route = report["routes"][0]
+    assert route["cash_snapshot_status"] == "stale"
+    assert route["available_cash"] == 800_000
+    assert route["stored_residual_cash"] == 800_000
+    assert route["broker_residual_cash"] == 800_000
+    assert report["needs_attention"] is True
+    assert report["sync_recommended"] is True
+    assert any(item.startswith("stale_cash_snapshot:kis-domestic:KRW:") for item in report["warnings"])
+
+
+def test_cash_availability_surfaces_unsynced_broker_residual_without_mutating_store(tmp_path):
+    account_store_path = tmp_path / "accounts.json"
+    store = VirtualSleeveAccountStore(account_store_path, default_cash_by_sleeve={"LEaps": 200_000})
+    store.current_portfolio("LEaps")
+    store.sync_account_cash(
+        {"cash_balance": 1_000_000, "currency": "KRW"},
+        account_id="kis-domestic",
+        currency="KRW",
+        synced_at=datetime(2026, 5, 14, 9, 0),
+    )
+    payload = json.loads(account_store_path.read_text(encoding="utf-8"))
+    payload["sleeves"]["default sleeve"]["cash"] = 0
+    payload["sleeves"]["default sleeve"]["cash_by_currency"]["KRW"] = 0
+    account_store_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = build_cash_availability_report(
+        runtime_id="test",
+        sleeve_ids=("LEaps",),
+        generated_at=datetime(2026, 5, 14, 9, 1),
+        routes=(
+            CashAvailabilityRouteInput(
+                account_id="kis-domestic",
+                market_scope="domestic",
+                currency="KRW",
+                account_store_path=account_store_path,
+                default_cash_by_sleeve={"LEaps": 200_000},
+            ),
+        ),
+    )
+
+    route = report["routes"][0]
+    assert route["stored_residual_cash"] == 0
+    assert route["broker_residual_cash"] == 800_000
+    assert route["unsynced_residual_cash"] == 800_000
+    assert route["available_cash"] == 800_000
+    assert route["available_cash_source"] == "broker_snapshot_residual"
+    assert report["sync_recommended"] is True
+    assert json.loads(account_store_path.read_text(encoding="utf-8"))["sleeves"]["default sleeve"]["cash"] == 0
+
+
+def test_cash_availability_marks_virtual_cash_above_broker_snapshot_as_attention(tmp_path):
+    account_store_path = tmp_path / "accounts.json"
+    store = VirtualSleeveAccountStore(account_store_path, default_cash_by_sleeve={"LEaps": 1_200_000})
+    store.current_portfolio("LEaps")
+    store.sync_account_cash(
+        {"cash_balance": 1_000_000, "currency": "KRW"},
+        account_id="kis-domestic",
+        currency="KRW",
+        synced_at=datetime(2026, 5, 14, 9, 0),
+    )
+
+    report = build_cash_availability_report(
+        runtime_id="test",
+        sleeve_ids=("LEaps",),
+        generated_at=datetime(2026, 5, 14, 9, 1),
+        routes=(
+            CashAvailabilityRouteInput(
+                account_id="kis-domestic",
+                market_scope="domestic",
+                currency="KRW",
+                account_store_path=account_store_path,
+                default_cash_by_sleeve={"LEaps": 1_200_000},
+            ),
+        ),
+    )
+
+    route = report["routes"][0]
+    assert route["overallocated_cash"] == 200_000
+    assert report["needs_attention"] is True
+    assert "virtual_cash_exceeds_broker_snapshot:kis-domestic:KRW:200000.0" in report["warnings"]
 
 
 def test_eod_snapshot_status_reports_today_marker_and_scheduled_future(tmp_path):
@@ -119,6 +232,7 @@ def test_cli_sleeve_cash_availability_outputs_report(tmp_path, capsys):
         {"cash_balance": 1_000_000, "currency": "KRW"},
         account_id="kis-domestic",
         currency="KRW",
+        synced_at=datetime.now(),
     )
 
     exit_code = main(

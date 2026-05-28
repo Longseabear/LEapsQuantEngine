@@ -8,17 +8,26 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Mapping
 
-from leaps_quant_engine.adapters.kis_direct import KISDirectClient
+from leaps_quant_engine.kis_gateway_client import DEFAULT_KIS_GATEWAY_BASE_URL, KISGatewayClient
 from leaps_quant_engine.settings import load_kis_settings
 
 
 JSON_RPC_VERSION = "2.0"
 SERVER_INFO = {"name": "leaps-quant-market-data", "version": "0.1.0"}
 DEFAULT_TRACE_LOG_PATH = Path("logs") / "market_data_mcp_stdio.jsonl"
+DEFAULT_BACKEND = "gateway"
+KISDirectClient: Any | None = None
 
 
 class UnknownToolError(KeyError):
     """Raised when an MCP tool name is not registered."""
+
+
+def _mcp_backend_from_env() -> str:
+    backend = str(os.getenv("LEAPS_MARKET_DATA_MCP_BACKEND") or DEFAULT_BACKEND).strip().lower()
+    if backend not in {"gateway", "direct"}:
+        return DEFAULT_BACKEND
+    return backend
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +48,7 @@ class ToolDefinition:
 class LeapsMarketDataToolRegistry:
     """Small stdio MCP tool registry backed by the local LEaps KIS boundary."""
 
-    def __init__(self, client: KISDirectClient | Any):
+    def __init__(self, client: Any):
         self.client = client
         self._tools = {
             tool.name: tool
@@ -193,11 +202,23 @@ class LeapsMarketDataToolRegistry:
     def with_default_client(cls) -> "LeapsMarketDataToolRegistry":
         settings = load_kis_settings()
         cache_dir = Path(os.getenv("LEAPS_KIS_CACHE_DIR", "data/kis-cache")).resolve()
+        backend = _mcp_backend_from_env()
+        if backend == "gateway":
+            return cls(
+                KISGatewayClient(
+                    base_url=os.getenv("LEAPS_KIS_GATEWAY_BASE_URL", DEFAULT_KIS_GATEWAY_BASE_URL),
+                    rate_limit_per_second=min(max(settings.rate_limit_per_second, 1), 18),
+                    cache_dir=cache_dir,
+                )
+            )
+        direct_client_cls = KISDirectClient
+        if direct_client_cls is None:
+            from leaps_quant_engine.adapters.kis_direct import KISDirectClient as direct_client_cls
         return cls(
-            KISDirectClient(
+            direct_client_cls(
                 settings=settings,
                 cache_dir=cache_dir,
-                rate_limit_per_second=min(max(settings.rate_limit_per_second, 1), 20),
+                rate_limit_per_second=min(max(settings.rate_limit_per_second, 1), 18),
             )
         )
 
@@ -218,6 +239,7 @@ class LeapsMarketDataToolRegistry:
             "status": "ok",
             "server": SERVER_INFO["name"],
             "transport": "stdio",
+            "backend": _mcp_backend_from_env(),
             "kis": payload,
         }
 
@@ -253,7 +275,7 @@ class LeapsMarketDataToolRegistry:
                     "quote": quote,
                     "last_price": quote.get("last_price"),
                     "volume": quote.get("volume"),
-                    "source": "leaps_kis_direct",
+                    "source": f"leaps_market_data_mcp_{_mcp_backend_from_env()}",
                 }
             )
         return {

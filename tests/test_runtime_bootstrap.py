@@ -12,7 +12,8 @@ from leaps_quant_engine.portfolio import Holding, Portfolio, StaticPortfolioProv
 from leaps_quant_engine.runtime_bootstrap import RuntimeBootstrapDependencies, bootstrap_sleeve_runtime
 from leaps_quant_engine.runtime_bootstrap import _FallbackHistoryProvider
 from leaps_quant_engine.runtime_bootstrap import _confirmed_daily_warmup_end
-from leaps_quant_engine.runtime_config import load_runtime_config_snapshot
+from leaps_quant_engine.runtime_bootstrap import _build_selection_model
+from leaps_quant_engine.runtime_config import ModuleReference, load_runtime_config_snapshot
 from leaps_quant_engine.runtime_state import InMemoryRuntimeStateStore
 from leaps_quant_engine.virtual_account import VirtualFillEvent, VirtualSleeveAccountStore
 
@@ -367,6 +368,64 @@ def test_bootstrap_sleeve_runtime_builds_active_worker_from_config(tmp_path):
         (str(tmp_path / "risk.py"), {"long_only": True, "max_position_pct": 0.4, "cash_buffer_pct": 0.05})
     ]
     assert execution_model_loader.calls == [(str(tmp_path / "execution.py"), {})]
+
+
+def test_selection_model_receives_agent_target_parameters_from_portfolio_config(tmp_path):
+    universe_path = tmp_path / "universe.json"
+    config_path = tmp_path / "runtime.json"
+    selector_path = tmp_path / "selector.py"
+    _write_universe(universe_path)
+    _write_runtime_config(config_path, universe_path)
+    selector_path.write_text(
+        "\n".join(
+            [
+                "class TargetPathSelectionModel:",
+                "    selection_id = 'target-path-selection'",
+                "    def __init__(",
+                "        self,",
+                "        *,",
+                "        max_active_symbols=60,",
+                "        target_path='default.json',",
+                "        max_age_hours=36.0,",
+                "        allowed_markets=('US',),",
+                "        require_sleeve_id=True,",
+                "    ):",
+                "        self.max_active_symbols = max_active_symbols",
+                "        self.target_path = target_path",
+                "        self.max_age_hours = max_age_hours",
+                "        self.allowed_markets = allowed_markets",
+                "        self.require_sleeve_id = require_sleeve_id",
+                "    def select(self, context):",
+                "        raise AssertionError('not used')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["sleeves"][0]["universe"]["active"]["selection_models"] = [
+        f"{selector_path}:TargetPathSelectionModel"
+    ]
+    payload["sleeves"][0]["portfolio"]["parameters"] = {
+        "target_path": "data/research/leaps-agent/targets/{date}.json",
+        "max_target_age_hours": 48,
+        "allowed_markets": ["KRX"],
+        "require_sleeve_id": False,
+    }
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    snapshot = load_runtime_config_snapshot(config_path)
+    sleeve_config = snapshot.config.sleeve("us-live")
+
+    model = _build_selection_model(
+        ModuleReference(f"{selector_path}:TargetPathSelectionModel"),
+        sleeve_config,
+        snapshot,
+    )
+
+    assert model.max_active_symbols == 1
+    assert model.target_path == "data/research/leaps-agent/targets/{date}.json"
+    assert model.max_age_hours == 48
+    assert model.allowed_markets == ["KRX"]
+    assert model.require_sleeve_id is False
 
 
 def test_runtime_active_universe_startup_only_persists_without_refresh(tmp_path):

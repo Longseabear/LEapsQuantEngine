@@ -59,10 +59,43 @@ cd $RepoRoot
 $env:PYTHONPATH='src'
 ```
 
+Preferred safe start:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File tools\leaps_safe_start_live_stack.ps1
+```
+
+This is the default recovery command after a reboot. It is idempotent: it
+checks KIS Gateway, broker-engine, runtime preflight, the active sleeve file,
+the multi-sleeve live loop, phase report loops, and the EOD snapshot scheduler,
+then starts only missing components. It writes the machine-readable result to:
+
+```text
+data/runtime/startup/leaps_safe_start_live_stack_status.json
+```
+
+The script uses `data/runtime/live-order-loop/multi_sleeve_active_sleeves.json`
+as the source of truth for active sleeves. A suspended sleeve such as `LEaps`
+stays out of the live loop unless the operator explicitly resumes it through
+runtime control. The script never submits manual/ad-hoc orders; order submits
+still happen only inside `tools/leaps_multi_sleeve_live_order_loop.ps1`.
+
+For diagnostics without starting anything:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File tools\leaps_safe_start_live_stack.ps1 `
+  -DryRun true `
+  -VerifySeconds 0
+```
+
 1. Start or repair local services.
 
-The current LEaps domestic live route uses local StockProgram-style service
-boundaries. Check and start them from the StockProgram workspace:
+Manual service recovery is now a fallback. The safe-start script starts the
+engine-owned KIS Gateway and the local broker-engine boundary when they are
+missing, then verifies health before touching the live loop. If doing the old
+manual path, check and start services from the StockProgram workspace:
 
 ```powershell
 $StockProgramRoot = Resolve-Path ..\StockProgram
@@ -134,9 +167,11 @@ Required readout:
   `position_states`
 - `event_count` equals `seeded_count`
 
-`tools/leaps_start_live_stack.ps1` runs this seed step automatically by default
-before starting the multi-sleeve live loop. Pass `-SeedRuntimeState false` only
-for diagnostics where runtime state must remain untouched.
+`tools/leaps_safe_start_live_stack.ps1` is the preferred wrapper for service
+health, preflight, loop startup, reports, and EOD snapshots. The older
+`tools/leaps_start_live_stack.ps1` is a lower-level helper and should not be
+used as the morning default because it does not preserve the active sleeve file
+as carefully.
 
 For 장중 engine experiments, do not point test cycles at the live runtime state
 with write access. Fork the live DB first and run the probe against the fork:
@@ -169,7 +204,7 @@ $args = @(
   '-File', 'tools\leaps_multi_sleeve_live_order_loop.ps1',
   '-Config', 'configs/runtime/live_multi_sleeve.json',
   '-SleeveIds', 'LEaps', 'us_etf_rotation',
-  '-IntervalSeconds', '60',
+  '-IntervalSeconds', '10',
   '-OrderBatchOutput', 'data/runtime/live-order-loop/multi_sleeve_candidate_orders.json',
   '-Journal', 'data/cycle-journal/live_multi_sleeve.jsonl',
   '-LogPath', 'data/runtime/live-order-loop/multi_sleeve.log',
@@ -192,16 +227,27 @@ blast-radius guard, pass `DomesticMaxSubmitNotional` or
 notionals are not comparable.
 
 The loop drains `data/runtime/control/live.jsonl` at cycle boundaries. Use
-`runtime-control-submit --command reload-sleeve`, `activate-sleeve`, or
-`deactivate-sleeve` to change the active sleeve set without restarting the
-process. Deactivation is rejected while the sleeve still has holdings or open
-tickets.
+`runtime-control-submit --command reload-sleeve`, `activate-sleeve`,
+`suspend-sleeve`, `resume-sleeve`, or `deactivate-sleeve` to change the active
+sleeve set without restarting the process. Use `suspend-sleeve` for a temporary
+pause when the sleeve still owns holdings. Deactivation is rejected while the
+sleeve still has holdings or open tickets.
 
 The active sleeve set is additionally filtered by a live schedule before the
 framework run. Defaults:
 
 - `LEaps`: KRX 08:30-18:30 KST
+- `kr-lowvol-defensive`: KRX 08:50-15:30 KST
 - `us_etf_rotation`: US regular market, 09:30-16:00 Eastern Time
+
+The live loop also blocks scheduled sleeves on weekends and configured market
+holidays before calling `runtime-run-multi-once`. Default holiday files live at
+`configs/market-calendars/krx_holidays.json` and
+`configs/market-calendars/us_holidays.json`. Keep these files current before a
+market-open safe-start. `runtime-preflight --strict-live` reports a closed
+market session as a warning, not a process-start blocker; the live loop may stay
+up on weekends/holidays so it can heartbeat and supervise order state, but it
+must not run models or submit orders for closed markets.
 
 The skipped sleeve is not passed to `runtime-run-multi-once`, so its market data
 is not collected and its alpha/portfolio/risk/execution stack is not called
@@ -367,19 +413,27 @@ No-go:
 
 ## Emergency Stop
 
-Find the loop:
+First request a clean cycle-boundary shutdown through the control queue:
 
 ```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like '*leaps_multi_sleeve_live_order_loop.ps1*' } |
-  Select-Object ProcessId,CommandLine
+py -3 -m leaps_quant_engine.cli runtime-control-submit `
+  --queue data/runtime/control/live.jsonl `
+  --command shutdown `
+  --reason "operator emergency stop"
 ```
 
-Stop only the multi-sleeve live loop:
+Then verify the heartbeat stopped updating:
 
 ```powershell
-Stop-Process -Id <PID>
+py -3 -m leaps_quant_engine.cli runtime-health configs/runtime/live_multi_sleeve.json `
+  --heartbeat data/runtime/live-order-loop/multi_sleeve_heartbeat.json `
+  --heartbeat-component multi_sleeve_live_order_loop `
+  --summary-only
 ```
+
+If the worker is genuinely stuck and does not respond, use the `process_id`
+inside the heartbeat only as operator context for a manual stop. Do not make PID
+scanning the normal liveness check.
 
 Then supervise and inspect:
 

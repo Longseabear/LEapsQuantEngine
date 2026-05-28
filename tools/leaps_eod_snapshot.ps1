@@ -1,6 +1,7 @@
 param(
     [string[]]$Targets = @(
         "configs/runtime/live_multi_sleeve.json|LEaps|domestic",
+        "configs/runtime/live_multi_sleeve.json|kr-lowvol-defensive|domestic",
         "configs/runtime/live_multi_sleeve.json|us_etf_rotation|overseas"
     ),
     [string]$SnapshotRoot = "data/eod-snapshots",
@@ -214,8 +215,10 @@ $copiesDir = Join-Path $runDir "stores"
 New-Item -ItemType Directory -Force -Path $copiesDir | Out-Null
 foreach ($source in @(
     "data/virtual-accounts/kis_domestic.json",
+    "data/virtual-accounts/kis_domestic_4401.json",
     "data/virtual-accounts/kis_overseas.json",
     "data/order-runtime/kis_domestic.jsonl",
+    "data/order-runtime/kis_domestic_4401.jsonl",
     "data/order-runtime/kis_overseas.jsonl"
 )) {
     $sourceFull = Resolve-RepoPath $source

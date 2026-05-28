@@ -386,6 +386,17 @@ The running process should use its in-memory `RuntimeConfigSnapshot` during norm
 
 `RuntimeConfigSnapshot` should be converted to executable objects through bootstrap wiring, not by scattering config reads across modules. The bootstrap layer owns provider adapter construction, universe loading, selection model loading, alpha loading, and worker construction.
 
+Agents must not guess live artifact paths from sleeve workspace paths or old
+operator notes. Use the read-only runtime artifact index before inspecting live
+stores or logs:
+
+```powershell
+py -3 -m leaps_quant_engine.cli runtime-artifact-status configs/runtime/live_multi_sleeve.json --active-only --summary-only
+```
+
+This command may read config and local artifact metadata only. It must not sync
+KIS, run models, submit orders, or mutate virtual accounts.
+
 ## Alpha Model Direction
 
 Alpha models are Python model modules in v0.
@@ -486,6 +497,18 @@ Cancellation and replacement must stay LEAN-style.
 - Execution models decide the policy: order type, limit offset, urgency, max
   order age, price-drift threshold, minimum replace interval, and replacement
   count limits.
+- Execution models receive an immutable pending-order view through
+  `ExecutionContext.pending_orders`. Normal order generation should use
+  LEAN-style unordered quantity:
+
+```text
+unordered_quantity = target_quantity - current_holding_quantity - pending_open_order_quantity
+```
+
+  A reused target must not emit another normal buy/add order while an
+  equivalent open ticket is already working. Urgent stop/risk exits may be
+  expressed with urgency/tag metadata, but the order runtime and guard still
+  own final broker lifecycle safety.
 - Order runtime owns the lifecycle: `cancel_requested`, `cancelled`,
   `replace_requested`, `replacement_submitted`, `partially_filled`, `filled`,
   `expired`, and `reconciled`.

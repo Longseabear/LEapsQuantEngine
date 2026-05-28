@@ -87,6 +87,64 @@ def test_runtime_preflight_checks_kis_gateway_liveness(tmp_path, monkeypatch):
     assert checks["kis_gateway_liveness"].metadata["base_url"] == "http://127.0.0.1:8766"
 
 
+def test_runtime_preflight_blocks_strict_live_without_kis_gateway(tmp_path):
+    config_path = _write_preflight_runtime(tmp_path, provider="market-data-engine")
+    snapshot = load_runtime_config_snapshot(config_path)
+
+    report = build_runtime_preflight_report(
+        snapshot=snapshot,
+        sleeve_ids=("LEaps",),
+        check_bootstrap=False,
+        strict_live=True,
+        generated_at=datetime(2026, 5, 15, 9, 30),
+    )
+
+    checks = {check.name: check for check in report.checks}
+    assert report.status == "blocked"
+    assert checks["market_data_gateway_policy"].status == "critical"
+    assert "route_live_market_data_through_kis_gateway" in report.recommended_next_actions
+
+
+def test_runtime_preflight_reports_market_session_gate(tmp_path):
+    config_path = _write_preflight_runtime(tmp_path, provider="market-data-engine")
+    snapshot = load_runtime_config_snapshot(config_path)
+
+    report = build_runtime_preflight_report(
+        snapshot=snapshot,
+        sleeve_ids=("LEaps",),
+        check_bootstrap=False,
+        generated_at=datetime(2026, 5, 16, 10, 0),
+    )
+
+    gate_checks = [check for check in report.checks if check.name == "market_session_gate"]
+    assert gate_checks
+    assert gate_checks[0].status == "warning"
+    assert gate_checks[0].reason == "non_trading_day"
+    assert "respect_market_schedule_gate" in report.recommended_next_actions
+
+
+def test_runtime_preflight_warns_strict_live_on_market_holiday(tmp_path, monkeypatch):
+    config_path = _write_preflight_runtime(tmp_path, provider="kis-gateway")
+    snapshot = load_runtime_config_snapshot(config_path)
+    monkeypatch.setattr(
+        "leaps_quant_engine.runtime_preflight.fetch_kis_gateway_health",
+        lambda base_url, timeout_seconds: {"status": "ok", "server": "leaps-kis-gateway", "lane": {"mock": False}},
+    )
+
+    report = build_runtime_preflight_report(
+        snapshot=snapshot,
+        sleeve_ids=("LEaps",),
+        check_bootstrap=False,
+        strict_live=True,
+        generated_at=datetime(2026, 5, 25, 10, 0),
+    )
+
+    gate_checks = [check for check in report.checks if check.name == "market_session_gate"]
+    assert report.status == "needs_attention"
+    assert gate_checks[0].status == "warning"
+    assert gate_checks[0].reason == "non_trading_day"
+
+
 def _write_preflight_runtime(tmp_path, *, provider="market-data-engine"):
     workspace = tmp_path / "sleeves" / "LEaps"
     (workspace / "alphas").mkdir(parents=True)

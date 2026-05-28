@@ -150,6 +150,41 @@ def test_cli_sleeve_daily_performance_outputs_report(tmp_path, capsys):
     assert payload["summaries"][0]["latest_held_symbols"] == ["KRX:005930"]
 
 
+def test_daily_performance_reads_fast_report_shape_without_current_sleeve_id(tmp_path):
+    root = tmp_path / "eod-snapshots"
+    report_dir = root / "2026-05-22" / "us-after-hours" / "overseas_us_etf_rotation" / "portfolio-report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "us_etf_rotation_runtime_20260522_061026.json").write_text(
+        json.dumps(
+            {
+                "report_source": {"generated_at": "2026-05-22T06:10:26"},
+                "portfolio_state": {
+                    "current": {
+                        "currency": "USD",
+                        "cash": 100.0,
+                        "cash_by_currency": {"USD": 100.0},
+                        "equity": 1010.0,
+                        "equity_by_currency": {"USD": 1010.0},
+                        "gross_exposure": 910.0,
+                        "holdings": [{"symbol": "US:QQQ", "quantity": 1, "market_value": 910.0}],
+                    }
+                },
+                "framework": {"portfolio_target_batch": {"sleeve_id": "us_etf_rotation"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_sleeve_daily_performance_report(root, sleeve_ids=("us_etf_rotation",))
+
+    payload = report.to_dict()
+    assert payload["warnings"] == []
+    assert payload["row_count"] == 1
+    assert payload["summaries"][0]["sleeve_id"] == "us_etf_rotation"
+    assert payload["summaries"][0]["end_date"] == "2026-05-22"
+    assert payload["summaries"][0]["latest_held_symbols"] == ["US:QQQ"]
+
+
 def _write_snapshot(
     root,
     *,

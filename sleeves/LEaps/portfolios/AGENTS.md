@@ -36,6 +36,10 @@ Portfolio models consume active insights and produce target allocations.
   runtime config may opt into `portfolio.rebalance.reused_target_churn_guard`
   so `OrderSizingEngine` suppresses tiny adjacent-lot non-exit churn while
   still allowing fresh target batches and explicit exits.
+- `agent_daily_target.py` is the live alpha-less operator/agent target reader.
+  It may read the configured JSON target artifact, but it must only emit target
+  percentages and compact `StatePatch` diagnostics. It must not write the
+  artifact, call data providers, call KIS, or infer orders.
 
 ## Tests
 

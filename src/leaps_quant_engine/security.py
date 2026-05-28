@@ -96,7 +96,7 @@ def symbol_properties_from_metadata(symbol: Symbol | str, metadata: Mapping[str,
     )
     default_exchange_scope = str(meta.get("default_exchange_scope") or meta.get("exchange_scope") or "").strip().upper()
     if not default_exchange_scope:
-        default_exchange_scope = "SOR" if market_scope == "domestic" else ""
+        default_exchange_scope = _default_exchange_scope_for_metadata(market_scope, meta)
     return SymbolProperties(
         symbol=symbol,
         market_scope=market_scope,
@@ -115,6 +115,21 @@ def _default_sessions_for_scope(market_scope: str) -> tuple[str, ...]:
     if market_scope == "overseas":
         return OVERSEAS_BROKER_ENGINE_SUPPORTED_PHASES
     return DOMESTIC_BROKER_ENGINE_SUPPORTED_PHASES
+
+
+def _default_exchange_scope_for_metadata(market_scope: str, metadata: Mapping[str, Any]) -> str:
+    if market_scope != "domestic":
+        return ""
+    if _is_domestic_krx_only_asset(metadata):
+        return "KRX"
+    return "SOR"
+
+
+def _is_domestic_krx_only_asset(metadata: Mapping[str, Any]) -> bool:
+    asset_type = str(metadata.get("asset_type") or metadata.get("security_type") or "").strip().lower()
+    if asset_type in {"etf", "etn", "elw"}:
+        return True
+    return bool(metadata.get("is_etf") or metadata.get("is_etn") or metadata.get("is_elw"))
 
 
 def _coerce_symbol(symbol: Symbol | str) -> Symbol:

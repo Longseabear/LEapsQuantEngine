@@ -85,6 +85,46 @@ Blend state is stored through `RuntimeStateStore` under
 is not due, so a five-minute portfolio model can still produce minute-by-minute
 transition progress without re-calling the model.
 
+## Deferred Target Execution
+
+Portfolio targets stay alive until the next portfolio retarget or the relevant
+session/order expiry. This lets execution finish a rebalance without forcing the
+portfolio model to run again.
+
+Example:
+
+```text
+A: target 40% -> 10%
+B: target 0%  -> 30%
+```
+
+If there is not enough cash to buy `B` before `A` sells, risk may reject or
+clamp the `B` buy as `insufficient_cash`. The target is still retained in the
+last `PortfolioTargetBatch`. After the `A` sell fill mutates the virtual
+account, the next execution pass recomputes quantity from the current portfolio
+and may create the `B` buy from the same target batch.
+
+The engine records this in `stage_decisions["target_lifecycle"]`:
+
+- `deferred_buy_count`
+- `deferred_buys`
+- `blocked_count`
+- `blocked_targets`
+- `wake_conditions`
+- `target_validity`
+
+Only cash-limited buys are reported as `deferred_waiting_for_cash`. Risk
+rejects such as stale data, missing price, short target rejection, route/session
+guard failures, or operator-disabled conditions must be treated as blocked
+targets, not as automatic retry candidates. Closed or unsupported sessions are
+reported as `blocked_by_session`; they may become retriable only when the
+market/session gate opens again and the target is still current.
+
+This is intentionally execution lifecycle behavior, not portfolio strategy
+logic. Portfolio models describe desired holdings. Execution, pending-order
+state, risk, and fills decide when remaining unordered quantity can actually be
+submitted.
+
 ## Model State
 
 Stateful models may read `context.model_state` and return `StatePatch` records

@@ -7,8 +7,11 @@ from leaps_quant_engine.framework.portfolio_construction import (
 )
 
 
-SAMSUNG_SYMBOL_KEY = "KRX:005930"
+MEMORY_LEADER_SYMBOL_KEYS = ("KRX:005930", "KRX:000660")
 STRIKE_REENTRY_ALPHA_ID = "semiconduct-kor-samsung-strike-reentry"
+LOW_FREQUENCY_REENTRY_ALPHA_ID = "semiconduct-kor-samsung-low-frequency-reentry"
+MINUTE_DIP_ALPHA_ID = "semiconduct-kor-minute-dip-accumulator"
+BUY_ONLY_ALPHA_IDS = {STRIKE_REENTRY_ALPHA_ID, LOW_FREQUENCY_REENTRY_ALPHA_ID, MINUTE_DIP_ALPHA_ID}
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,37 +27,42 @@ class SamsungBuyOnlyPortfolioConstructionModel:
             raise ValueError("min_cash_to_add_pct must be between 0 and 1.")
 
     def create_targets(self, context: PortfolioConstructionContext) -> tuple[PortfolioAllocationTarget, ...]:
-        samsung = _samsung_symbol(context)
-        if samsung is None:
-            return ()
-        insight = _latest_buy_only_insight(context.active_insights)
-        current_percent = _current_percent(context, samsung.key)
-        if insight is None:
-            if self.fallback_hold_existing and current_percent > 0:
-                return (
-                    PortfolioAllocationTarget(
-                        symbol=samsung,
-                        target_percent=current_percent,
-                        tag="samsung_buy_only:fallback_hold_existing",
-                    ),
-                )
-            return ()
+        symbols = _memory_leader_symbols(context)
+        insights = _latest_buy_only_insights(context.active_insights)
+        targets: list[PortfolioAllocationTarget] = []
+        for symbol_key in MEMORY_LEADER_SYMBOL_KEYS:
+            symbol = symbols.get(symbol_key)
+            if symbol is None:
+                continue
+            insight = insights.get(symbol_key)
+            current_percent = _current_percent(context, symbol.key)
+            if insight is None:
+                if self.fallback_hold_existing and current_percent > 0:
+                    targets.append(
+                        PortfolioAllocationTarget(
+                            symbol=symbol,
+                            target_percent=current_percent,
+                            tag="memory_leaders_buy_only:fallback_hold_existing",
+                        )
+                    )
+                continue
 
-        target_percent = _buy_only_target_percent(
-            context,
-            samsung,
-            insight,
-            current_percent=current_percent,
-            max_target_percent=self.max_target_percent,
-            min_cash_to_add_pct=self.min_cash_to_add_pct,
-        )
-        return (
-            PortfolioAllocationTarget(
-                symbol=samsung,
-                target_percent=target_percent,
-                tag=f"samsung_buy_only:{insight.alpha_id}:{_action(insight)}:{insight.direction.value}",
-            ),
-        )
+            target_percent = _buy_only_target_percent(
+                context,
+                symbol,
+                insight,
+                current_percent=current_percent,
+                max_target_percent=self.max_target_percent,
+                min_cash_to_add_pct=self.min_cash_to_add_pct,
+            )
+            targets.append(
+                PortfolioAllocationTarget(
+                    symbol=symbol,
+                    target_percent=target_percent,
+                    tag=f"memory_leaders_buy_only:{insight.alpha_id}:{_action(insight)}:{insight.direction.value}",
+                )
+            )
+        return tuple(targets)
 
 
 def create_portfolio_model(params):
@@ -65,31 +73,33 @@ def create_portfolio_model(params):
     )
 
 
-def _samsung_symbol(context: PortfolioConstructionContext):
+def _memory_leader_symbols(context: PortfolioConstructionContext):
+    symbols = {}
     for symbol in (*context.managed_symbols, *context.held_symbols):
-        if symbol.key == SAMSUNG_SYMBOL_KEY:
-            return symbol
+        if symbol.key in MEMORY_LEADER_SYMBOL_KEYS:
+            symbols[symbol.key] = symbol
     for insight in context.active_insights:
-        if insight.symbol_key == SAMSUNG_SYMBOL_KEY:
-            return insight.symbol
-    return None
+        if insight.symbol_key in MEMORY_LEADER_SYMBOL_KEYS:
+            symbols[insight.symbol_key] = insight.symbol
+    return symbols
 
 
-def _latest_buy_only_insight(insights: tuple[Insight, ...]) -> Insight | None:
-    latest: Insight | None = None
+def _latest_buy_only_insights(insights: tuple[Insight, ...]) -> dict[str, Insight]:
+    latest: dict[str, Insight] = {}
     for insight in insights:
-        if insight.symbol_key != SAMSUNG_SYMBOL_KEY or insight.alpha_id != STRIKE_REENTRY_ALPHA_ID:
+        if insight.symbol_key not in MEMORY_LEADER_SYMBOL_KEYS or insight.alpha_id not in BUY_ONLY_ALPHA_IDS:
             continue
         if insight.direction is not InsightDirection.UP:
             continue
-        if latest is None or insight.generated_at > latest.generated_at:
-            latest = insight
+        current = latest.get(insight.symbol_key)
+        if current is None or insight.generated_at > current.generated_at:
+            latest[insight.symbol_key] = insight
     return latest
 
 
 def _buy_only_target_percent(
     context: PortfolioConstructionContext,
-    samsung,
+    symbol,
     insight: Insight,
     *,
     current_percent: float,
@@ -104,7 +114,7 @@ def _buy_only_target_percent(
         return current_percent
     return _cap_add_by_cash(
         context,
-        samsung,
+        symbol,
         current_percent=current_percent,
         desired_percent=desired,
         min_cash_to_add_pct=min_cash_to_add_pct,
@@ -113,16 +123,16 @@ def _buy_only_target_percent(
 
 def _cap_add_by_cash(
     context: PortfolioConstructionContext,
-    samsung,
+    symbol,
     *,
     current_percent: float,
     desired_percent: float,
     min_cash_to_add_pct: float,
 ) -> float:
-    target_value = context.target_value_for_symbol(samsung)
+    target_value = context.target_value_for_symbol(symbol)
     if target_value <= 0:
         return current_percent
-    available_cash_pct = max(context.portfolio.cash_for_symbol(samsung), 0.0) / target_value
+    available_cash_pct = max(context.portfolio.cash_for_symbol(symbol), 0.0) / target_value
     if available_cash_pct < min_cash_to_add_pct:
         return current_percent
     return _clamp(min(desired_percent, current_percent + available_cash_pct), current_percent, 1.0)

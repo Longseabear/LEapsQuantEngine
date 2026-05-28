@@ -10,6 +10,12 @@ from zoneinfo import ZoneInfo
 from leaps_quant_engine.market_rules import MarketSession, synthetic_domestic_market_session, synthetic_us_market_session
 
 
+_DEFAULT_HOLIDAY_FILES = {
+    "domestic": Path("configs/market-calendars/krx_holidays.json"),
+    "overseas": Path("configs/market-calendars/us_holidays.json"),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class MarketCalendarQuality:
     status: str = "ok"
@@ -127,6 +133,8 @@ def calendar_for_market_scope(
     scope = str(market_scope or "domestic").strip().lower()
     market = "US" if scope == "overseas" else "KRX"
     timezone = "America/New_York" if scope == "overseas" else "Asia/Seoul"
+    if holiday_file is None:
+        holiday_file = _DEFAULT_HOLIDAY_FILES.get(scope)
     holidays, quality = _load_holidays(holiday_file)
     return ExchangeCalendar(
         market_scope=scope,

@@ -36,64 +36,73 @@
         "KRW": 0
       },
       "universe": {
-        "coarse_path": "configs/universes/semiconduct_kor_core.json",
+        "coarse_path": "configs/universes/semiconduct_kor_narrative_core.json",
         "fine": {
           "enabled": false,
           "refresh_seconds": 300,
           "max_age_seconds": 300
         },
         "active": {
-          "max_symbols": 12,
+          "max_symbols": 16,
+          "cadence": "daily_at 08:00 Asia/Seoul",
           "selection_model": "leaps_quant_engine.universe.selection:StaticUniverseSelectionModel",
           "selection_models": [
-            "selections/samsung_core.py:SamsungCoreSelectionModel",
-            "selections/semiconductor_momentum.py:SemiconductorMomentumSelectionModel",
+            "selections/agent_narrative_target.py:AgentNarrativeTargetSelectionModel",
             "selections/operational_symbols.py:OperationalSymbolsSelectionModel"
           ]
         }
       },
       "indicators": {
         "warmup_enabled": true,
-        "extra_bars": 100,
+        "extra_bars": 30,
         "min_ready_ratio": 1.0,
         "refresh_history": false
       },
       "alpha": {
-        "modules": [
-          {
-            "ref": "alphas/samsung_strike_risk_reentry.py",
-            "enabled": true
-          }
-        ],
-        "input_selections": {
-          "semiconduct-kor-samsung-strike-reentry": "semiconduct-kor-samsung-core"
-        }
+        "modules": [],
+        "input_selections": {}
       },
       "portfolio": {
-        "model": "portfolios/samsung_buy_only.py",
+        "model": "portfolios/agent_narrative_target.py",
         "parameters": {
-          "max_target_percent": 1.0,
-          "fallback_hold_existing": true,
-          "min_cash_to_add_pct": 0.01
+          "model_name": "agent_narrative_target",
+          "model_id": "semiconduct-kor-agent-narrative-portfolio",
+          "state_namespace": "target_artifact",
+          "target_path": "data/operator-targets/semiconduct-kor/latest_target.json",
+          "default_market": "KRX",
+          "allowed_markets": [
+            "KRX"
+          ],
+          "max_gross_exposure": 0.95,
+          "max_position_pct": 0.3,
+          "max_target_age_hours": 36.0,
+          "require_sleeve_id": true,
+          "scale_to_max_gross": true,
+          "allow_short": false,
+          "flatten_flag": "flatten",
+          "emit_zero_for_missing_held_targets": true,
+          "fail_closed": true
         },
         "rebalance": {
           "cash_reserve_pct": 0.0,
           "min_order_notional": 100000.0,
           "min_quantity_delta": 1,
           "allow_exit_below_min_notional": true,
-          "cadence": "every_5_minutes",
+          "cadence": "daily_at 09:05 Asia/Seoul",
+          "whole_share_rounding_churn_guard": true,
+          "whole_share_rounding_churn_min_fraction": 0.25,
           "reused_target_churn_guard": true,
           "reused_target_churn_max_quantity_delta": 1,
-          "reused_target_churn_lot_fraction": 0.5,
+          "reused_target_churn_lot_fraction": 0.25,
           "reused_target_churn_equity_bps": 5.0
         },
         "target_resolution": {
-          "mode": "patch"
+          "mode": "complete"
         },
         "blend": {
-          "enabled": true,
-          "duration_minutes": 180,
-          "target_drift_threshold_pct": 0.06,
+          "enabled": false,
+          "duration_minutes": 0,
+          "target_drift_threshold_pct": 0.0,
           "clock": "orderable_session"
         }
       },
@@ -101,9 +110,9 @@
         "model": "risks/basic.py",
         "parameters": {
           "long_only": true,
-          "max_position_pct": 1.0,
-          "max_total_exposure_pct": 1.0,
-          "cash_buffer_pct": 0.0,
+          "max_position_pct": 0.32,
+          "max_total_exposure_pct": 0.95,
+          "cash_buffer_pct": 0.05,
           "require_fresh_for_entries": true,
           "reject_invalid_snapshot": true
         }
@@ -114,14 +123,18 @@
           "tag_prefix": "semiconduct-kor",
           "order_type": "limit",
           "time_in_force": "day",
-          "limit_offset_bps": 8.0,
-          "max_slice_notional": 1500000,
-          "max_slices": 3,
+          "limit_offset_bps": 10.0,
+          "max_slice_notional": 2500000,
+          "max_slices": 4,
           "urgency": "normal",
           "max_order_age_seconds": 900,
           "price_drift_bps": 80,
           "min_replace_interval_seconds": 180,
-          "max_replacements": 2
+          "max_replacements": 2,
+          "allow_sells": true,
+          "buy_window": "09:05-14:50 Asia/Seoul",
+          "sell_window": "09:05-14:50 Asia/Seoul",
+          "window_timezone": "Asia/Seoul"
         }
       },
       "worker": {
@@ -131,6 +144,6 @@
     }
   ],
   "metadata": {
-    "description": "Paper runtime for a KRW-only Korean semiconductor sleeve. It keeps semiconductor universe, alpha, portfolio, risk, and execution logic inside sleeves/semiconduct-kor and does not opt into the live multi-sleeve loop."
+    "description": "Paper runtime for the semiconduct-kor KR Rally Relay agent-target sleeve. It uses the same live target artifact contract as the live profile but routes through a paper domestic broker account."
   }
 }

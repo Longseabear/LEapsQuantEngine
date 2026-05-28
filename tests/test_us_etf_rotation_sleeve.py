@@ -300,6 +300,12 @@ def test_us_etf_rotation_live_cadences_match_etf_horizon():
         assert sleeve.universe.active.cadence == "once_per_day"
         assert sleeve.worker.cycle_interval_seconds == 300
         assert sleeve.portfolio.rebalance.cadence == "every_5_minutes"
+        assert sleeve.portfolio.rebalance.min_order_notional == 0.0
+        assert sleeve.portfolio.rebalance.min_quantity_delta == 0
+        assert sleeve.portfolio.rebalance.target_churn_guard is True
+        assert sleeve.portfolio.rebalance.target_churn_equity_bps == 25.0
+        assert sleeve.portfolio.rebalance.reused_target_churn_guard is True
+        assert sleeve.portfolio.rebalance.reused_target_churn_equity_bps == 25.0
 
     pullback = _load("sleeves/us_etf_rotation/alphas/daa_pullback.py")
     trailing_stop = _load("sleeves/us_etf_rotation/alphas/volatility_trailing_stop.py")

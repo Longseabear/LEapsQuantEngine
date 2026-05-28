@@ -54,6 +54,30 @@ def test_cycle_journal_jsonl_filters_latest_by_sleeve_and_route(tmp_path):
     assert FileCycleJournalStore(path).latest(sleeve_id="LEaps").warnings == ("stale_snapshot",)
 
 
+def test_cycle_journal_limited_entries_return_latest_matches_in_chronological_order(tmp_path):
+    path = tmp_path / "cycle-journal.jsonl"
+    store = FileCycleJournalStore(path)
+    entries = [
+        CycleJournalEntry(
+            runtime_id="runtime",
+            config_version="sha256:1",
+            sleeve_id="LEaps" if index % 2 == 0 else "other",
+            generated_at=datetime(2026, 5, 10, 9, index),
+            recorded_at=datetime(2026, 5, 10, 9, index),
+            source="runtime-run-once",
+            status="ok",
+            counts={"index": index},
+        )
+        for index in range(6)
+    ]
+    store.append_many(entries)
+
+    latest_two = store.entries(sleeve_id="LEaps", limit=2)
+
+    assert latest_two == (entries[2], entries[4])
+    assert store.latest(sleeve_id="LEaps") == entries[4]
+
+
 def test_recovery_and_health_reports_combine_journal_order_store_and_virtual_account(tmp_path):
     journal_store = FileCycleJournalStore(tmp_path / "journal.jsonl")
     journal_store.append(

@@ -135,6 +135,7 @@ class OrderSizingEngine:
             _sizing_plan(
                 context,
                 target,
+                rebalance_policy=self.rebalance_policy,
                 source_plan=source_plans.get(target.symbol.key),
                 target_value_by_currency=target_value_by_currency,
             )
@@ -162,6 +163,7 @@ class OrderSizingEngine:
                 "filtered_plan_count": len(plans),
                 "cash_reserve_pct": self.rebalance_policy.cash_reserve_pct,
                 "min_order_notional": self.rebalance_policy.min_order_notional,
+                "min_order_notional_equity_bps": self.rebalance_policy.min_order_notional_equity_bps,
                 "min_quantity_delta": self.rebalance_policy.min_quantity_delta,
                 "rounding_loss": sum(abs(plan.rounding_loss) for plan in sized_plans),
                 "raw_rounding_loss": sum(abs(plan.rounding_loss) for plan in raw_plans),
@@ -181,13 +183,33 @@ class OrderSizingEngine:
         target_value_by_currency: Mapping[str, float],
     ) -> tuple[tuple[OrderSizingPlan, ...], dict[str, Any]]:
         filtered: list[OrderSizingPlan] = []
+        zero_delta: list[OrderSizingPlan] = []
+        suppressed_min_quantity: list[OrderSizingPlan] = []
+        below_min_notional: list[OrderSizingPlan] = []
+        suppressed_rounding_churn: list[OrderSizingPlan] = []
+        suppressed_target_churn: list[OrderSizingPlan] = []
         suppressed_churn: list[OrderSizingPlan] = []
         for plan in plans:
             if plan.delta_quantity == 0:
+                zero_delta.append(plan)
                 continue
-            if abs(plan.delta_quantity) < self.rebalance_policy.min_quantity_delta:
+            if (
+                abs(plan.delta_quantity) < self.rebalance_policy.min_quantity_delta
+                and not self._whole_share_floor_entry(plan)
+            ):
+                suppressed_min_quantity.append(plan)
                 continue
-            if self._below_min_notional(plan):
+            if self._below_min_notional(plan, target_value_by_currency=target_value_by_currency):
+                below_min_notional.append(plan)
+                continue
+            if self._whole_share_rounding_churn_noise(plan):
+                suppressed_rounding_churn.append(plan)
+                continue
+            if self._target_churn_noise(
+                plan,
+                target_value_by_currency=target_value_by_currency,
+            ):
+                suppressed_target_churn.append(plan)
                 continue
             if self._reused_target_churn_noise(
                 plan,
@@ -198,15 +220,77 @@ class OrderSizingEngine:
                 continue
             filtered.append(plan)
         return tuple(filtered), {
+            "zero_delta_count": len(zero_delta),
+            "zero_delta_symbols": [
+                plan.allocation.symbol.key for plan in zero_delta
+            ],
+            "below_min_notional_count": len(below_min_notional),
+            "below_min_notional_symbols": [
+                plan.allocation.symbol.key for plan in below_min_notional
+            ],
+            "below_min_notional_suppressed_count": len(below_min_notional),
+            "below_min_notional_suppressed_symbols": [
+                plan.allocation.symbol.key for plan in below_min_notional
+            ],
+            "below_min_notional_details": [
+                _min_notional_detail(
+                    plan,
+                    threshold=self._min_notional_threshold(
+                        currency_for_symbol(plan.allocation.symbol),
+                        target_value_by_currency=target_value_by_currency,
+                    ),
+                )
+                for plan in below_min_notional
+            ],
+            "min_quantity_delta_suppressed_count": len(suppressed_min_quantity),
+            "min_quantity_delta_suppressed_symbols": [
+                plan.allocation.symbol.key for plan in suppressed_min_quantity
+            ],
+            "min_quantity_delta_suppressed_details": [
+                _plan_noise_detail(
+                    plan,
+                    threshold=float(self.rebalance_policy.min_quantity_delta),
+                )
+                for plan in suppressed_min_quantity
+            ],
+            "target_churn_guard_enabled": self.rebalance_policy.target_churn_guard,
+            "target_churn_suppressed_count": len(suppressed_target_churn),
+            "target_churn_suppressed_symbols": [
+                plan.allocation.symbol.key for plan in suppressed_target_churn
+            ],
             "reused_target_churn_guard_enabled": self.rebalance_policy.reused_target_churn_guard,
             "reused_target_churn_suppressed_count": len(suppressed_churn),
             "reused_target_churn_suppressed_symbols": [
                 plan.allocation.symbol.key for plan in suppressed_churn
             ],
+            "reused_target_churn_suppressed_details": [
+                _plan_noise_detail(
+                    plan,
+                    threshold=self._reused_target_churn_threshold(
+                        plan,
+                        target_value_by_currency=target_value_by_currency,
+                    ),
+                )
+                for plan in suppressed_churn
+            ],
+            "whole_share_rounding_churn_guard_enabled": self.rebalance_policy.whole_share_rounding_churn_guard,
+            "whole_share_rounding_churn_suppressed_count": len(suppressed_rounding_churn),
+            "whole_share_rounding_churn_suppressed_symbols": [
+                plan.allocation.symbol.key for plan in suppressed_rounding_churn
+            ],
         }
 
-    def _below_min_notional(self, plan: OrderSizingPlan) -> bool:
-        min_notional = self.rebalance_policy.min_order_notional
+    def _below_min_notional(
+        self,
+        plan: OrderSizingPlan,
+        *,
+        target_value_by_currency: Mapping[str, float],
+    ) -> bool:
+        currency = currency_for_symbol(plan.allocation.symbol)
+        min_notional = self._min_notional_threshold(
+            currency,
+            target_value_by_currency=target_value_by_currency,
+        )
         if min_notional <= 0:
             return False
         if (
@@ -218,6 +302,73 @@ class OrderSizingEngine:
         if plan.current_price is None:
             return True
         return abs(plan.delta_quantity) * plan.current_price < min_notional
+
+    def _min_notional_threshold(
+        self,
+        currency: str,
+        *,
+        target_value_by_currency: Mapping[str, float],
+    ) -> float:
+        return max(
+            self.rebalance_policy.min_order_notional,
+            target_value_by_currency.get(currency, 0.0)
+            * self.rebalance_policy.min_order_notional_equity_bps
+            / 10_000.0,
+        )
+
+    def _whole_share_floor_entry(self, plan: OrderSizingPlan) -> bool:
+        policy = self.rebalance_policy
+        if policy.whole_share_entry_floor_min_fraction >= 1.0:
+            return False
+        if plan.current_quantity != 0 or plan.target_quantity != 1:
+            return False
+        if plan.current_price is None or plan.current_price <= 0:
+            return False
+        return _desired_lot_fraction(plan.desired_value, plan.current_price) >= policy.whole_share_entry_floor_min_fraction
+
+    def _whole_share_rounding_churn_noise(self, plan: OrderSizingPlan) -> bool:
+        policy = self.rebalance_policy
+        if not policy.whole_share_rounding_churn_guard:
+            return False
+        if plan.current_quantity != 1 or plan.target_quantity != 0:
+            return False
+        if plan.target_percent <= 0 or str(plan.reason or "").strip().lower() == "exit":
+            return False
+        if _is_urgent_or_forced_tag(plan.allocation.tag):
+            return False
+        if plan.current_price is None or plan.current_price <= 0:
+            return False
+        return (
+            _desired_lot_fraction(plan.desired_value, plan.current_price)
+            >= policy.whole_share_rounding_churn_min_fraction
+        )
+
+    def _target_churn_noise(
+        self,
+        plan: OrderSizingPlan,
+        *,
+        target_value_by_currency: Mapping[str, float],
+    ) -> bool:
+        policy = self.rebalance_policy
+        if not policy.target_churn_guard:
+            return False
+        if plan.current_quantity == 0 or plan.target_quantity == 0:
+            return False
+        if abs(plan.delta_quantity) > policy.target_churn_max_quantity_delta:
+            return False
+        if plan.target_percent == 0 or str(plan.reason or "").strip().lower() == "exit":
+            return False
+        if plan.current_price is None or plan.current_price <= 0:
+            return False
+
+        currency = currency_for_symbol(plan.allocation.symbol)
+        threshold = max(
+            policy.min_order_notional,
+            plan.current_price * policy.target_churn_lot_fraction,
+            target_value_by_currency.get(currency, 0.0) * policy.target_churn_equity_bps / 10_000.0,
+        )
+        drift_notional = abs(plan.desired_value - plan.current_value)
+        return drift_notional <= threshold + 1e-9
 
     def _reused_target_churn_noise(
         self,
@@ -240,14 +391,27 @@ class OrderSizingEngine:
         if plan.current_price is None or plan.current_price <= 0:
             return False
 
-        currency = currency_for_symbol(plan.allocation.symbol)
-        threshold = max(
-            policy.min_order_notional,
-            plan.current_price * policy.reused_target_churn_lot_fraction,
-            target_value_by_currency.get(currency, 0.0) * policy.reused_target_churn_equity_bps / 10_000.0,
+        threshold = self._reused_target_churn_threshold(
+            plan,
+            target_value_by_currency=target_value_by_currency,
         )
         drift_notional = abs(plan.desired_value - plan.current_value)
         return drift_notional <= threshold + 1e-9
+
+    def _reused_target_churn_threshold(
+        self,
+        plan: OrderSizingPlan,
+        *,
+        target_value_by_currency: Mapping[str, float],
+    ) -> float:
+        policy = self.rebalance_policy
+        if plan.current_price is None or plan.current_price <= 0:
+            return 0.0
+        currency = currency_for_symbol(plan.allocation.symbol)
+        return max(
+            plan.current_price * policy.reused_target_churn_lot_fraction,
+            target_value_by_currency.get(currency, 0.0) * policy.reused_target_churn_equity_bps / 10_000.0,
+        )
 
     def _optimize_lots(
         self,
@@ -361,6 +525,7 @@ def _sizing_plan(
     context: OrderSizingContext,
     allocation: PortfolioAllocationTarget,
     *,
+    rebalance_policy: RebalancePolicy,
     source_plan: PortfolioTargetPlan | None,
     target_value_by_currency: Mapping[str, float],
 ) -> OrderSizingPlan:
@@ -373,6 +538,13 @@ def _sizing_plan(
         rounded_value = current_quantity * (price or 0.0)
     else:
         target_quantity = _quantity_for_desired_value(desired_value, price)
+        if (
+            target_quantity == 0
+            and current_quantity == 0
+            and desired_value > 0
+            and _desired_lot_fraction(desired_value, price) >= rebalance_policy.whole_share_entry_floor_min_fraction
+        ):
+            target_quantity = 1
         rounded_value = target_quantity * price
     return OrderSizingPlan(
         allocation=allocation,
@@ -394,6 +566,12 @@ def _quantity_for_desired_value(desired_value: float, price: float) -> int:
     if desired_value >= 0:
         return int(desired_value // price)
     return -int(abs(desired_value) // price)
+
+
+def _desired_lot_fraction(desired_value: float, price: float) -> float:
+    if price <= 0:
+        return 0.0
+    return abs(desired_value) / price
 
 
 def _plans_by_symbol(batch: PortfolioTargetBatch) -> dict[str, PortfolioTargetPlan]:
@@ -422,3 +600,52 @@ def _target_reason(target: PortfolioAllocationTarget) -> str:
     if target.target_percent == 0:
         return "exit"
     return "target"
+
+
+def _plan_noise_detail(plan: OrderSizingPlan, *, threshold: float) -> dict[str, Any]:
+    return {
+        "symbol": plan.allocation.symbol.key,
+        "current_quantity": plan.current_quantity,
+        "target_quantity": plan.target_quantity,
+        "delta_quantity": plan.delta_quantity,
+        "current_price": plan.current_price,
+        "delta_notional": abs(plan.delta_quantity) * plan.current_price if plan.current_price is not None else None,
+        "current_value": plan.current_value,
+        "desired_value": plan.desired_value,
+        "drift_notional": abs(plan.desired_value - plan.current_value),
+        "threshold_notional": threshold,
+        "target_percent": plan.target_percent,
+        "reason": plan.reason,
+        "tag": plan.allocation.tag,
+    }
+
+
+def _min_notional_detail(plan: OrderSizingPlan, *, threshold: float) -> dict[str, Any]:
+    detail = _plan_noise_detail(plan, threshold=threshold)
+    detail["delta_notional"] = (
+        None if plan.current_price is None else abs(plan.delta_quantity) * plan.current_price
+    )
+    detail["is_entry"] = plan.is_entry
+    detail["is_exit"] = plan.is_exit
+    return detail
+
+
+def _is_urgent_or_forced_tag(tag: str) -> bool:
+    text = str(tag or "").strip().lower()
+    return any(
+        token in text
+        for token in (
+            "hard_exit",
+            "urgent",
+            "risk:",
+            "risk_exit",
+            "symbol_guard",
+            "stop",
+            "trailing",
+            "force_exit",
+            "forced_exit",
+            "manual_override",
+            "operator_override",
+            "operator:force",
+        )
+    )

@@ -249,6 +249,7 @@ def _build_fast_report_payload(
     order_batch = _read_json(order_batch_path)
     orders = _orders_for_sleeve(order_batch, sleeve_id)
     price_by_symbol = _latest_price_by_symbol(framework_state, orders)
+    price_by_symbol.update(_latest_quote_price_by_symbol(config, config_payload))
     order_runtime_summary = _order_runtime_summary_for_sleeve(order_status_payload, sleeve_id)
     currency = _default_currency_for_sleeve(config_payload, sleeve_id, order_runtime_summary)
     current = _current_portfolio_snapshot(
@@ -274,9 +275,12 @@ def _build_fast_report_payload(
         current=current,
     )
     return {
+        "sleeve_id": sleeve_id,
+        "generated_at": datetime.now().isoformat(),
         "report_source": {
             "mode": mode,
             "generated_at": datetime.now().isoformat(),
+            "sleeve_id": sleeve_id,
             "config": str(config),
             "account_store_path": str(account_store_path),
             "framework_state_path": str(framework_state_path) if framework_state_path is not None else None,
@@ -435,6 +439,61 @@ def _latest_price_by_symbol(
     return prices
 
 
+def _latest_quote_price_by_symbol(config: Path, config_payload: Mapping[str, Any]) -> dict[str, float]:
+    store_path = _market_data_snapshot_store_path(config, config_payload)
+    if store_path is None or not store_path.exists():
+        return {}
+    latest = _latest_jsonl_object(store_path)
+    snapshot = latest.get("snapshot") if isinstance(latest.get("snapshot"), Mapping) else latest
+    prices: dict[str, float] = {}
+    for bar in snapshot.get("bars", []) or []:
+        if not isinstance(bar, Mapping):
+            continue
+        symbol = _symbol_key_from_holding(bar)
+        price = _float_or_none(bar.get("close"))
+        if symbol and price is not None and price > 0:
+            prices[symbol] = price
+    return prices
+
+
+def _market_data_snapshot_store_path(config: Path, config_payload: Mapping[str, Any]) -> Path | None:
+    market_data = config_payload.get("market_data") if isinstance(config_payload.get("market_data"), Mapping) else {}
+    raw_path = market_data.get("snapshot_store_path")
+    if raw_path:
+        return _resolve_config_path(config, Path(str(raw_path)))
+    runtime_id = str(config_payload.get("runtime_id") or "").strip()
+    if not runtime_id:
+        return None
+    return ROOT / "data" / "market-data-snapshots" / f"{runtime_id}.jsonl"
+
+
+def _latest_jsonl_object(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            position = handle.tell()
+            buffer = bytearray()
+            while position > 0:
+                position -= 1
+                handle.seek(position)
+                char = handle.read(1)
+                if char == b"\n" and buffer:
+                    break
+                buffer.extend(char)
+    except OSError:
+        return {}
+    if not buffer:
+        return {}
+    line = bytes(reversed(buffer)).decode("utf-8", errors="replace").strip()
+    if not line:
+        return {}
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _order_runtime_summary_for_sleeve(
     order_status_payload: Mapping[str, Any],
     sleeve_id: str,
@@ -529,6 +588,8 @@ def _current_portfolio_snapshot(
     exposure = sum(float(item.get("market_value") or 0.0) for item in holdings)
     equity = cash + exposure
     result = {
+        "sleeve_id": sleeve_id,
+        "as_of": datetime.now().isoformat(),
         "currency": currency,
         "cash": cash,
         "cash_by_currency": cash_by_currency or ({currency: cash} if currency else {}),

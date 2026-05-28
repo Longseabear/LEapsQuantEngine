@@ -244,3 +244,40 @@ def test_runtime_model_state_view_object_helpers_build_state_patches():
     store.apply_patches((view.object_delete(namespace="stop", symbol_key="KRX:005930", reason="closed"),))
 
     assert view.object_get(namespace="stop", symbol_key="KRX:005930", default={"missing": True}) == {"missing": True}
+
+
+def test_runtime_model_state_scope_binds_model_namespace_symbol_and_position():
+    store = InMemoryRuntimeStateStore()
+    view = RuntimeModelStateView(store=store, default_sleeve_id="LEaps")
+    scope = view.scope(
+        model_id="volatility_trailing_stop",
+        namespace="trailing_stop",
+    ).for_symbol("KRX:005930").for_position("pos-1")
+
+    store.apply_patches(
+        (
+            scope.object_set(
+                {"high_watermark_price": 84000},
+                reason="seed_trailing_stop",
+                generated_at=datetime(2026, 5, 13, 9, 0),
+            ),
+            scope.object_merge(
+                {"last_price": 83500},
+                reason="refresh_trailing_stop",
+                generated_at=datetime(2026, 5, 13, 9, 1),
+            ),
+        )
+    )
+
+    assert scope.object_get() == {"high_watermark_price": 84000, "last_price": 83500}
+    assert scope.get().key == ModelStateKey(
+        sleeve_id="LEaps",
+        model_id="volatility_trailing_stop",
+        namespace="trailing_stop",
+        symbol_key="KRX:005930",
+        position_id="pos-1",
+    )
+    assert scope.object_entries() == ({"high_watermark_price": 84000, "last_price": 83500},)
+
+    other_symbol = scope.for_symbol("KRX:000660")
+    assert other_symbol.object_get(default={"missing": True}) == {"missing": True}

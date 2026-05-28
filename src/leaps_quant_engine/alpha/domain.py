@@ -216,6 +216,10 @@ class SnapshotContext:
     def allows_new_entries(self) -> bool:
         return self.quality_report is None or self.quality_report.allows_new_entries
 
+    @property
+    def allows_risk_checks(self) -> bool:
+        return self.quality_report is None or self.quality_report.allows_risk_checks
+
 
 class AlphaModel(Protocol):
     alpha_id: str
